@@ -18,7 +18,7 @@ def send_telegram(message):
     )
 
 print("CryptoSignalAI12 avviato")
-
+send_telegram("CryptoSignalAI12 collegato correttamente a Telegram!")
 while True:
     print("Sistema attivo...")
     time.sleep(60)
