@@ -1,6 +1,7 @@
-import os
-import time
+import os, time, json, threading
+from collections import deque
 import requests
+import websocket
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -11,839 +12,1151 @@ SYMBOLS = [
     "LINKUSDT", "ADAUSDT", "NEARUSDT", "UNIUSDT"
 ]
 
-BINANCE_URL = "https://fapi.binance.com/fapi/v1/klines"
+REST = "https://fapi.binance.com"
+KLINES = f"{REST}/fapi/v1/klines"
+OI_URL = f"{REST}/futures/data/openInterestHist"
+PREMIUM = f"{REST}/fapi/v1/premiumIndex"
 
-LEVERAGE_STEPS = [
+# Binance USD-M 2026: nuova architettura WebSocket.
+# Prima /market, poi fallback /public.
+LIQ_WS_URLS = [
+    "wss://fstream.binance.com/market/ws/!forceOrder@arr",
+    "wss://fstream.binance.com/public/ws/!forceOrder@arr",
+]
+
+SCAN_SECONDS = 60
+LIQ_WINDOW = 15 * 60
+FUNDING_BLOCK = 0.0005
+FUNDING_AGGR = 0.0003
+ATR_MIN_PCT = 0.10
+ATR_MAX_PCT = 5.00
+ATR_AGGR_MAX_PCT = 2.50
+OI_CONFIRM_MIN = -0.25
+OI_AGGR_MIN = 0.15
+LEVERAGE_SAFETY = 0.35
+
+LEV_STEPS = [
     1, 2, 3, 5, 10, 15, 20,
     25, 30, 40, 50, 75, 100
 ]
 
-LEVERAGE_SAFETY_FACTOR = 0.40
+state = {}
+liq_events = deque()
+liq_lock = threading.Lock()
 
-signal_state = {}
 
-
-def send_telegram(message):
+def send_telegram(text):
     if not BOT_TOKEN or not CHAT_ID:
         print("Telegram non configurato")
         return
 
-    url = (
-        f"https://api.telegram.org/"
-        f"bot{BOT_TOKEN}/sendMessage"
-    )
-
     try:
-        response = requests.post(
-            url,
+        r = requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
             data={
                 "chat_id": CHAT_ID,
-                "text": message
+                "text": text
             },
-            timeout=20
+            timeout=20,
         )
-
-        response.raise_for_status()
+        r.raise_for_status()
 
     except Exception as e:
         print("Errore Telegram:", e)
 
 
-def get_klines(
-    symbol,
-    interval,
-    limit=120
-):
-    response = requests.get(
-        BINANCE_URL,
-        params={
+def get_json(url, params=None, timeout=15):
+    r = requests.get(
+        url,
+        params=params,
+        timeout=timeout
+    )
+
+    r.raise_for_status()
+    return r.json()
+
+
+def get_klines(symbol, interval, limit=120):
+    return get_json(
+        KLINES,
+        {
             "symbol": symbol,
             "interval": interval,
             "limit": limit
-        },
-        timeout=15
-    )
-
-    response.raise_for_status()
-
-    return response.json()
-
-
-def parse_candles(raw):
-    candles = []
-
-    for c in raw:
-        candles.append({
-            "open": float(c[1]),
-            "high": float(c[2]),
-            "low": float(c[3]),
-            "close": float(c[4]),
-            "volume": float(c[5])
-        })
-
-    return candles
-
-
-def ema(
-    values,
-    period
-):
-    if len(values) < period:
-        return None
-
-    multiplier = (
-        2 / (period + 1)
-    )
-
-    value = (
-        sum(values[:period])
-        / period
-    )
-
-    for price in values[period:]:
-        value = (
-            (price - value)
-            * multiplier
-        ) + value
-
-    return value
-
-
-def atr(
-    candles,
-    period=14
-):
-    if len(candles) < period + 1:
-        return None
-
-    ranges = []
-
-    for i in range(
-        1,
-        len(candles)
-    ):
-        high = (
-            candles[i]["high"]
-        )
-
-        low = (
-            candles[i]["low"]
-        )
-
-        previous_close = (
-            candles[i - 1]["close"]
-        )
-
-        true_range = max(
-            high - low,
-            abs(
-                high
-                - previous_close
-            ),
-            abs(
-                low
-                - previous_close
-            )
-        )
-
-        ranges.append(
-            true_range
-        )
-
-    return (
-        sum(ranges[-period:])
-        / period
+        }
     )
 
 
-def volume_ratio(
-    candles,
-    period=20
-):
-    if len(candles) < period + 2:
-        return 0
-
-    current_volume = (
-        candles[-2]["volume"]
-    )
-
-    previous = [
-        c["volume"]
-        for c in
-        candles[
-            -(period + 2):-2
-        ]
+def candles(raw):
+    return [
+        {
+            "o": float(c[1]),
+            "h": float(c[2]),
+            "l": float(c[3]),
+            "c": float(c[4]),
+            "v": float(c[5]),
+            "t": int(c[0])
+        }
+        for c in raw
     ]
-
-    average = (
-        sum(previous)
-        / len(previous)
-    )
-
-    if average == 0:
-        return 0
-
-    return (
-        current_volume
-        / average
-    )
 
 
 def market_data(symbol):
     return {
-        "15m": parse_candles(
-            get_klines(
-                symbol,
-                "15m"
-            )
+        "15m": candles(
+            get_klines(symbol, "15m")
         ),
-
-        "1h": parse_candles(
-            get_klines(
-                symbol,
-                "1h"
-            )
+        "1h": candles(
+            get_klines(symbol, "1h")
         ),
-
-        "4h": parse_candles(
-            get_klines(
-                symbol,
-                "4h"
-            )
-        )
+        "4h": candles(
+            get_klines(symbol, "4h")
+        ),
     }
 
 
-def leverage_cap_from_score(
-    score
-):
-    if score >= 8:
+def ema(values, period):
+    if len(values) < period:
+        return None
+
+    k = 2 / (period + 1)
+    x = sum(values[:period]) / period
+
+    for p in values[period:]:
+        x = (p - x) * k + x
+
+    return x
+
+
+def atr(cs, period=14):
+    if len(cs) < period + 1:
+        return None
+
+    tr = []
+
+    for i in range(1, len(cs)):
+        h = cs[i]["h"]
+        l = cs[i]["l"]
+        pc = cs[i - 1]["c"]
+
+        tr.append(
+            max(
+                h - l,
+                abs(h - pc),
+                abs(l - pc)
+            )
+        )
+
+    return sum(tr[-period:]) / period
+
+
+def volume_ratio(cs, period=20):
+    if len(cs) < period + 2:
+        return 0.0
+
+    cur = cs[-2]["v"]
+
+    prev = [
+        x["v"]
+        for x in cs[-(period + 2):-2]
+    ]
+
+    avg = sum(prev) / len(prev)
+
+    return cur / avg if avg > 0 else 0.0
+
+
+def candle_strength(c, direction):
+    rng = c["h"] - c["l"]
+
+    if rng <= 0:
+        return False
+
+    body = abs(
+        c["c"] - c["o"]
+    ) / rng
+
+    pos = (
+        c["c"] - c["l"]
+    ) / rng
+
+    if direction == "LONG":
+        return (
+            c["c"] > c["o"]
+            and body >= 0.55
+            and pos >= 0.70
+        )
+
+    return (
+        c["c"] < c["o"]
+        and body >= 0.55
+        and pos <= 0.30
+    )
+
+
+def derivatives(symbol):
+    oi = None
+    funding = None
+
+    try:
+        d = get_json(
+            OI_URL,
+            {
+                "symbol": symbol,
+                "period": "15m",
+                "limit": 3
+            }
+        )
+
+        if len(d) >= 2:
+            a = float(
+                d[-2]["sumOpenInterestValue"]
+            )
+
+            b = float(
+                d[-1]["sumOpenInterestValue"]
+            )
+
+            if a > 0:
+                oi = (
+                    (b - a)
+                    / a
+                    * 100
+                )
+
+    except Exception as e:
+        print(
+            symbol,
+            "OI ERRORE:",
+            e
+        )
+
+    try:
+        d = get_json(
+            PREMIUM,
+            {"symbol": symbol}
+        )
+
+        funding = float(
+            d["lastFundingRate"]
+        )
+
+    except Exception as e:
+        print(
+            symbol,
+            "FUNDING ERRORE:",
+            e
+        )
+
+    return oi, funding
+
+
+def store_liq(payload):
+    if (
+        isinstance(payload, dict)
+        and "data" in payload
+    ):
+        payload = payload["data"]
+
+    items = (
+        payload
+        if isinstance(payload, list)
+        else [payload]
+    )
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+
+        o = item.get("o", item)
+        symbol = o.get("s")
+
+        if symbol not in SYMBOLS:
+            continue
+
+        qty = float(
+            o.get("z")
+            or o.get("q")
+            or 0
+        )
+
+        price = float(
+            o.get("ap")
+            or o.get("p")
+            or 0
+        )
+
+        notional = qty * price
+
+        if notional <= 0:
+            continue
+
+        side = o.get("S")
+
+        kind = (
+            "LONG_LIQ"
+            if side == "SELL"
+            else "SHORT_LIQ"
+        )
+
+        ts = int(
+            o.get("T")
+            or item.get("E")
+            or time.time() * 1000
+        ) / 1000
+
+        with liq_lock:
+            liq_events.append({
+                "s": symbol,
+                "k": kind,
+                "n": notional,
+                "t": ts
+            })
+
+
+def ws_message(ws, message):
+    try:
+        store_liq(
+            json.loads(message)
+        )
+
+    except Exception as e:
+        print(
+            "LIQ parse error:",
+            e
+        )
+
+
+def ws_error(ws, error):
+    print(
+        "LIQ WS error:",
+        error
+    )
+
+
+def ws_open(ws):
+    print(
+        "LIQ WS connesso"
+    )
+
+
+def ws_loop():
+    i = 0
+
+    while True:
+        url = LIQ_WS_URLS[
+            i % len(LIQ_WS_URLS)
+        ]
+
+        print(
+            "LIQ WS connessione:",
+            url
+        )
+
+        try:
+            ws = websocket.WebSocketApp(
+                url,
+                on_open=ws_open,
+                on_message=ws_message,
+                on_error=ws_error
+            )
+
+            ws.run_forever(
+                ping_interval=120,
+                ping_timeout=30
+            )
+
+        except Exception as e:
+            print(
+                "LIQ WS restart:",
+                e
+            )
+
+        i += 1
+        time.sleep(5)
+
+
+def liq_metrics(symbol):
+    cutoff = (
+        time.time()
+        - LIQ_WINDOW
+    )
+
+    long_liq = 0.0
+    short_liq = 0.0
+
+    with liq_lock:
+        while (
+            liq_events
+            and liq_events[0]["t"]
+            < cutoff
+        ):
+            liq_events.popleft()
+
+        for x in liq_events:
+            if x["s"] != symbol:
+                continue
+
+            if x["k"] == "LONG_LIQ":
+                long_liq += x["n"]
+            else:
+                short_liq += x["n"]
+
+    return long_liq, short_liq
+
+
+def fmt_price(v):
+    if v >= 1000:
+        return f"{v:.2f}"
+
+    if v >= 1:
+        return f"{v:.4f}"
+
+    return f"{v:.6f}"
+
+
+def fmt_money(v):
+    if v >= 1_000_000:
+        return (
+            f"${v / 1_000_000:.2f}M"
+        )
+
+    if v >= 1_000:
+        return (
+            f"${v / 1_000:.1f}K"
+        )
+
+    return f"${v:.0f}"
+
+
+def leverage_cap(q):
+    if q >= 12:
         return 100
 
-    if score >= 7:
+    if q >= 11:
+        return 75
+
+    if q >= 10:
         return 50
 
-    if score >= 6:
+    if q >= 9:
         return 30
 
-    if score >= 5:
+    if q >= 8:
+        return 25
+
+    if q >= 7:
         return 20
 
     return 15
 
 
-def calculate_leverage(
+def calc_leverage(
     entry,
     stop,
-    score
+    quality,
+    aggressive_ok
 ):
     if entry <= 0:
         return 1
 
-    stop_distance = abs(
-        entry - stop
-    )
-
     stop_pct = (
-        stop_distance
+        abs(entry - stop)
         / entry
     )
 
     if stop_pct <= 0:
         return 1
 
-    raw_leverage = int(
-        LEVERAGE_SAFETY_FACTOR
+    raw = int(
+        LEVERAGE_SAFETY
         / stop_pct
     )
 
-    max_by_score = (
-        leverage_cap_from_score(
-            score
-        )
+    cap = leverage_cap(
+        quality
     )
 
+    if not aggressive_ok:
+        cap = min(
+            cap,
+            15
+        )
+
     allowed = min(
-        raw_leverage,
-        max_by_score,
+        raw,
+        cap,
         100
     )
 
-    if allowed < 1:
-        allowed = 1
+    out = 1
 
-    selected = 1
-
-    for step in LEVERAGE_STEPS:
-        if step <= allowed:
-            selected = step
-
+    for x in LEV_STEPS:
+        if x <= allowed:
+            out = x
         else:
             break
 
-    return selected
+    return out
 
 
-def analyze_symbol(
-    symbol,
-    data
-):
-    c15 = data["15m"]
-    c1h = data["1h"]
-    c4h = data["4h"]
+def btc_bias(data):
+    c1 = data["1h"]
+    c4 = data["4h"]
 
-    last15 = c15[-2]
-    last1h = c1h[-2]
-
-    closes1h = [
-        c["close"]
-        for c in c1h[:-1]
+    a1 = [
+        x["c"]
+        for x in c1[:-1]
     ]
 
-    closes4h = [
-        c["close"]
-        for c in c4h[:-1]
+    a4 = [
+        x["c"]
+        for x in c4[:-1]
     ]
 
-    ema20_1h = ema(
-        closes1h,
-        20
-    )
+    e20_1 = ema(a1, 20)
+    e50_1 = ema(a1, 50)
 
-    ema50_1h = ema(
-        closes1h,
-        50
-    )
-
-    ema20_4h = ema(
-        closes4h,
-        20
-    )
-
-    ema50_4h = ema(
-        closes4h,
-        50
-    )
-
-    current_atr = atr(
-        c1h[:-1],
-        14
-    )
-
-    vol_ratio = (
-        volume_ratio(c1h)
-    )
+    e20_4 = ema(a4, 20)
+    e50_4 = ema(a4, 50)
 
     if None in (
-        ema20_1h,
-        ema50_1h,
-        ema20_4h,
-        ema50_4h,
-        current_atr
+        e20_1,
+        e50_1,
+        e20_4,
+        e50_4
     ):
-        return None
+        return "NEUTRAL"
 
-    previous_20 = (
-        c1h[-22:-2]
-    )
-
-    resistance = max(
-        c["high"]
-        for c in previous_20
-    )
-
-    support = min(
-        c["low"]
-        for c in previous_20
-    )
-
-    price = (
-        last1h["close"]
-    )
-
-    trend1h_long = (
-        price > ema20_1h
-        and ema20_1h
-        > ema50_1h
-    )
-
-    trend1h_short = (
-        price < ema20_1h
-        and ema20_1h
-        < ema50_1h
-    )
-
-    trend4h_long = (
-        ema20_4h
-        > ema50_4h
-    )
-
-    trend4h_short = (
-        ema20_4h
-        < ema50_4h
-    )
-
-    breakout_long = (
-        price > resistance
-    )
-
-    breakout_short = (
-        price < support
-    )
-
-    distance_res = abs(
-        resistance
-        - last15["close"]
-    )
-
-    distance_sup = abs(
-        last15["close"]
-        - support
-    )
-
-    near_long = (
-        last15["close"]
-        <= resistance
-
-        and distance_res
-        <= current_atr * 0.25
-    )
-
-    near_short = (
-        last15["close"]
-        >= support
-
-        and distance_sup
-        <= current_atr * 0.25
-    )
-
-    long_score = 0
-    short_score = 0
-
-    if trend1h_long:
-        long_score += 2
-
-    if trend1h_short:
-        short_score += 2
-
-    if trend4h_long:
-        long_score += 1
-
-    if trend4h_short:
-        short_score += 1
-
-    if vol_ratio >= 1.5:
-        long_score += 1
-        short_score += 1
-
-    if breakout_long:
-        long_score += 3
-
-    if breakout_short:
-        short_score += 3
-
-    if near_long:
-        long_score += 1
-
-    if near_short:
-        short_score += 1
-
-
-    # CONFERMATO LONG
+    p1 = c1[-2]["c"]
+    p4 = c4[-2]["c"]
 
     if (
-        breakout_long
-        and trend1h_long
-        and vol_ratio >= 1.5
-        and long_score >= 6
+        p1 > e20_1 > e50_1
+        and p4 > e20_4 > e50_4
     ):
-        entry_low = (
-            price
-            - current_atr * 0.15
-        )
-
-        entry_high = (
-            price
-            + current_atr * 0.10
-        )
-
-        stop = (
-            price
-            - current_atr * 1.2
-        )
-
-        risk = (
-            price - stop
-        )
-
-        entry_mid = (
-            entry_low
-            + entry_high
-        ) / 2
-
-        leverage = (
-            calculate_leverage(
-                entry_mid,
-                stop,
-                long_score
-            )
-        )
-
-        return {
-            "type":
-                "CONFIRMED",
-
-            "direction":
-                "LONG",
-
-            "price":
-                price,
-
-            "entry_low":
-                entry_low,
-
-            "entry_high":
-                entry_high,
-
-            "sl":
-                stop,
-
-            "tp1":
-                price + risk,
-
-            "tp2":
-                price
-                + risk * 2,
-
-            "tp3":
-                price
-                + risk * 3,
-
-            "level":
-                resistance,
-
-            "score":
-                long_score,
-
-            "volume":
-                vol_ratio,
-
-            "atr":
-                current_atr,
-
-            "leverage":
-                leverage
-        }
-
-
-    # CONFERMATO SHORT
+        return "LONG"
 
     if (
-        breakout_short
-        and trend1h_short
-        and vol_ratio >= 1.5
-        and short_score >= 6
+        p1 < e20_1 < e50_1
+        and p4 < e20_4 < e50_4
     ):
-        entry_low = (
-            price
-            - current_atr * 0.10
-        )
+        return "SHORT"
 
-        entry_high = (
-            price
-            + current_atr * 0.15
-        )
-
-        stop = (
-            price
-            + current_atr * 1.2
-        )
-
-        risk = (
-            stop - price
-        )
-
-        entry_mid = (
-            entry_low
-            + entry_high
-        ) / 2
-
-        leverage = (
-            calculate_leverage(
-                entry_mid,
-                stop,
-                short_score
-            )
-        )
-
-        return {
-            "type":
-                "CONFIRMED",
-
-            "direction":
-                "SHORT",
-
-            "price":
-                price,
-
-            "entry_low":
-                entry_low,
-
-            "entry_high":
-                entry_high,
-
-            "sl":
-                stop,
-
-            "tp1":
-                price - risk,
-
-            "tp2":
-                price
-                - risk * 2,
-
-            "tp3":
-                price
-                - risk * 3,
-
-            "level":
-                support,
-
-            "score":
-                short_score,
-
-            "volume":
-                vol_ratio,
-
-            "atr":
-                current_atr,
-
-            "leverage":
-                leverage
-        }
+    return "NEUTRAL"
 
 
-    # PRE LONG
-
-    if (
-        near_long
-        and trend1h_long
-        and vol_ratio >= 1.2
-        and long_score >= 4
-    ):
-        invalidation = (
-            resistance
-            - current_atr * 0.5
-        )
-
-        leverage = (
-            calculate_leverage(
-                last15["close"],
-                invalidation,
-                long_score
-            )
-        )
-
-        return {
-            "type":
-                "PRE",
-
-            "direction":
-                "LONG",
-
-            "price":
-                last15["close"],
-
-            "level":
-                resistance,
-
-            "score":
-                long_score,
-
-            "volume":
-                vol_ratio,
-
-            "atr":
-                current_atr,
-
-            "invalidation":
-                invalidation,
-
-            "leverage":
-                leverage
-        }
-
-
-    # PRE SHORT
-
-    if (
-        near_short
-        and trend1h_short
-        and vol_ratio >= 1.2
-        and short_score >= 4
-    ):
-        invalidation = (
-            support
-            + current_atr * 0.5
-        )
-
-        leverage = (
-            calculate_leverage(
-                last15["close"],
-                invalidation,
-                short_score
-            )
-        )
-
-        return {
-            "type":
-                "PRE",
-
-            "direction":
-                "SHORT",
-
-            "price":
-                last15["close"],
-
-            "level":
-                support,
-
-            "score":
-                short_score,
-
-            "volume":
-                vol_ratio,
-
-            "atr":
-                current_atr,
-
-            "invalidation":
-                invalidation,
-
-            "leverage":
-                leverage
-        }
-
-    return None
-
-
-def confirmation_grade(
-    score
-):
-    if score >= 7:
+def grade(q):
+    if q >= 10:
         return "ALTO"
 
-    if score >= 5:
+    if q >= 8:
         return "MEDIO-ALTO"
 
     return "MEDIO"
 
 
-def fmt(value):
-    if value >= 1000:
-        return (
-            f"{value:.2f}"
-        )
+def analyze(
+    symbol,
+    data,
+    btc
+):
+    c15 = data["15m"]
+    c1 = data["1h"]
+    c4 = data["4h"]
 
-    if value >= 1:
-        return (
-            f"{value:.4f}"
-        )
+    l15 = c15[-2]
+    l1 = c1[-2]
+    l4 = c4[-2]
 
-    return (
-        f"{value:.6f}"
+    a1 = [
+        x["c"]
+        for x in c1[:-1]
+    ]
+
+    a4 = [
+        x["c"]
+        for x in c4[:-1]
+    ]
+
+    e20_1 = ema(a1, 20)
+    e50_1 = ema(a1, 50)
+
+    e20_4 = ema(a4, 20)
+    e50_4 = ema(a4, 50)
+
+    at = atr(
+        c1[:-1],
+        14
     )
+
+    vol = volume_ratio(c1)
+
+    if None in (
+        e20_1,
+        e50_1,
+        e20_4,
+        e50_4,
+        at
+    ):
+        return None
+
+    prev20 = c1[-22:-2]
+
+    res = max(
+        x["h"]
+        for x in prev20
+    )
+
+    sup = min(
+        x["l"]
+        for x in prev20
+    )
+
+    p1 = l1["c"]
+    p15 = l15["c"]
+
+    t1_long = (
+        p1 > e20_1 > e50_1
+    )
+
+    t1_short = (
+        p1 < e20_1 < e50_1
+    )
+
+    t4_long = (
+        l4["c"]
+        > e20_4
+        > e50_4
+    )
+
+    t4_short = (
+        l4["c"]
+        < e20_4
+        < e50_4
+    )
+
+    br_long = (
+        p1 > res
+    )
+
+    br_short = (
+        p1 < sup
+    )
+
+    atr_pct = (
+        at
+        / p1
+        * 100
+    )
+
+    vol_ok = (
+        ATR_MIN_PCT
+        <= atr_pct
+        <= ATR_MAX_PCT
+    )
+
+    window = c15[-4:-1]
+
+    tol = (
+        at * 0.12
+    )
+
+    ret_long = any(
+        x["l"] <= res + tol
+        and x["c"] > res
+        for x in window
+    )
+
+    ret_short = any(
+        x["h"] >= sup - tol
+        and x["c"] < sup
+        for x in window
+    )
+
+    not_ext_long = (
+        p15
+        <= res + at * 0.80
+    )
+
+    not_ext_short = (
+        p15
+        >= sup - at * 0.80
+    )
+
+    strong_long = (
+        candle_strength(
+            l1,
+            "LONG"
+        )
+    )
+
+    strong_short = (
+        candle_strength(
+            l1,
+            "SHORT"
+        )
+    )
+
+    near_long = (
+        p15 <= res
+        and abs(res - p15)
+        <= at * 0.25
+        and t1_long
+    )
+
+    near_short = (
+        p15 >= sup
+        and abs(p15 - sup)
+        <= at * 0.25
+        and t1_short
+    )
+
+    prelim_long = (
+        br_long
+        and t1_long
+        and vol >= 1.5
+        and ret_long
+        and strong_long
+        and not_ext_long
+        and vol_ok
+        and not t4_short
+    )
+
+    prelim_short = (
+        br_short
+        and t1_short
+        and vol >= 1.5
+        and ret_short
+        and strong_short
+        and not_ext_short
+        and vol_ok
+        and not t4_long
+    )
+
+    # PRE-SEGNALI
+    if (
+        not prelim_long
+        and not prelim_short
+    ):
+
+        if (
+            near_long
+            and vol >= 1.2
+        ):
+            inv = (
+                res
+                - at * 0.5
+            )
+
+            q = (
+                5
+                + (
+                    1
+                    if t4_long
+                    else 0
+                )
+            )
+
+            lev = calc_leverage(
+                p15,
+                inv,
+                q,
+                False
+            )
+
+            return {
+                "type": "PRE",
+                "direction": "LONG",
+                "price": p15,
+                "level": res,
+                "invalidation": inv,
+                "volume": vol,
+                "atr_pct": atr_pct,
+                "quality": q,
+                "leverage": lev
+            }
+
+        if (
+            near_short
+            and vol >= 1.2
+        ):
+            inv = (
+                sup
+                + at * 0.5
+            )
+
+            q = (
+                5
+                + (
+                    1
+                    if t4_short
+                    else 0
+                )
+            )
+
+            lev = calc_leverage(
+                p15,
+                inv,
+                q,
+                False
+            )
+
+            return {
+                "type": "PRE",
+                "direction": "SHORT",
+                "price": p15,
+                "level": sup,
+                "invalidation": inv,
+                "volume": vol,
+                "atr_pct": atr_pct,
+                "quality": q,
+                "leverage": lev
+            }
+
+        return None
+
+    oi, funding = derivatives(
+        symbol
+    )
+
+    if (
+        oi is None
+        or funding is None
+    ):
+        return None
+
+    long_liq, short_liq = (
+        liq_metrics(symbol)
+    )
+
+    liq_available = (
+        long_liq
+        + short_liq
+        > 0
+    )
+
+    # LONG
+    if prelim_long:
+        direction = "LONG"
+        level = res
+
+        funding_ok = (
+            funding
+            <= FUNDING_BLOCK
+        )
+
+        funding_aggr = (
+            funding
+            <= FUNDING_AGGR
+        )
+
+        oi_ok = (
+            oi
+            >= OI_CONFIRM_MIN
+        )
+
+        oi_aggr = (
+            oi
+            >= OI_AGGR_MIN
+        )
+
+        btc_conflict = (
+            symbol != "BTCUSDT"
+            and btc == "SHORT"
+        )
+
+        btc_aligned = (
+            symbol == "BTCUSDT"
+            or btc == "LONG"
+        )
+
+        liq_support = (
+            liq_available
+            and short_liq
+            >= max(
+                long_liq * 1.25,
+                10000
+            )
+        )
+
+        liq_against = (
+            liq_available
+            and long_liq
+            >= max(
+                short_liq * 1.75,
+                25000
+            )
+        )
+
+        if (
+            not funding_ok
+            or not oi_ok
+            or btc_conflict
+            or liq_against
+        ):
+            return None
+
+        entry = p15
+
+        stop = min(
+            min(
+                x["l"]
+                for x in window
+            ),
+            res - at * 0.25
+        )
+
+        stop -= (
+            at * 0.10
+        )
+
+        if stop >= entry:
+            return None
+
+        risk = (
+            entry - stop
+        )
+
+        q = 7
+
+        q += int(t4_long)
+        q += int(oi_aggr)
+        q += int(funding_aggr)
+        q += int(btc_aligned)
+        q += int(liq_support)
+
+        q += int(
+            atr_pct
+            <= ATR_AGGR_MAX_PCT
+        )
+
+        aggr_ok = (
+            t4_long
+            and funding_aggr
+            and oi_aggr
+            and atr_pct
+            <= ATR_AGGR_MAX_PCT
+            and btc_aligned
+            and (
+                liq_support
+                or not liq_available
+            )
+        )
+
+    # SHORT
+    else:
+        direction = "SHORT"
+        level = sup
+
+        funding_ok = (
+            funding
+            >= -FUNDING_BLOCK
+        )
+
+        funding_aggr = (
+            funding
+            >= -FUNDING_AGGR
+        )
+
+        oi_ok = (
+            oi
+            >= OI_CONFIRM_MIN
+        )
+
+        oi_aggr = (
+            oi
+            >= OI_AGGR_MIN
+        )
+
+        btc_conflict = (
+            symbol != "BTCUSDT"
+            and btc == "LONG"
+        )
+
+        btc_aligned = (
+            symbol == "BTCUSDT"
+            or btc == "SHORT"
+        )
+
+        liq_support = (
+            liq_available
+            and long_liq
+            >= max(
+                short_liq * 1.25,
+                10000
+            )
+        )
+
+        liq_against = (
+            liq_available
+            and short_liq
+            >= max(
+                long_liq * 1.75,
+                25000
+            )
+        )
+
+        if (
+            not funding_ok
+            or not oi_ok
+            or btc_conflict
+            or liq_against
+        ):
+            return None
+
+        entry = p15
+
+        stop = max(
+            max(
+                x["h"]
+                for x in window
+            ),
+            sup + at * 0.25
+        )
+
+        stop += (
+            at * 0.10
+        )
+
+        if stop <= entry:
+            return None
+
+        risk = (
+            stop - entry
+        )
+
+        q = 7
+
+        q += int(t4_short)
+        q += int(oi_aggr)
+        q += int(funding_aggr)
+        q += int(btc_aligned)
+        q += int(liq_support)
+
+        q += int(
+            atr_pct
+            <= ATR_AGGR_MAX_PCT
+        )
+
+        aggr_ok = (
+            t4_short
+            and funding_aggr
+            and oi_aggr
+            and atr_pct
+            <= ATR_AGGR_MAX_PCT
+            and btc_aligned
+            and (
+                liq_support
+                or not liq_available
+            )
+        )
+
+    entry_low = (
+        entry
+        - at * 0.08
+    )
+
+    entry_high = (
+        entry
+        + at * 0.08
+    )
+
+    lev = calc_leverage(
+        entry,
+        stop,
+        q,
+        aggr_ok
+    )
+
+    if direction == "LONG":
+        tp1 = entry + risk
+        tp2 = entry + 2 * risk
+        tp3 = entry + 3 * risk
+
+    else:
+        tp1 = entry - risk
+        tp2 = entry - 2 * risk
+        tp3 = entry - 3 * risk
+
+    return {
+        "type": "CONFIRMED",
+        "direction": direction,
+        "price": entry,
+        "entry_low": entry_low,
+        "entry_high": entry_high,
+        "sl": stop,
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp3": tp3,
+        "level": level,
+        "volume": vol,
+        "atr_pct": atr_pct,
+        "quality": q,
+        "leverage": lev,
+        "oi": oi,
+        "funding": funding,
+        "btc": btc,
+        "long_liq": long_liq,
+        "short_liq": short_liq,
+        "liq_available": liq_available,
+        "aggressive": (
+            lev >= 20
+            and aggr_ok
+        )
+    }
 
 
 def build_message(
     symbol,
-    signal
+    s
 ):
-    pair = (
-        symbol.replace(
-            "USDT",
-            "/USDT"
-        )
+    pair = symbol.replace(
+        "USDT",
+        "/USDT"
     )
 
-    grade = (
-        confirmation_grade(
-            signal["score"]
-        )
+    g = grade(
+        s["quality"]
     )
-
-    leverage = (
-        signal["leverage"]
-    )
-
 
     # PRE
-
-    if signal["type"] == "PRE":
-
-        direction = (
-            signal["direction"]
-        )
-
-        if direction == "LONG":
-            missing = (
-                "Chiusura 1H sopra "
-                "il livello chiave "
-                "con volume forte"
-            )
-
-        else:
-            missing = (
-                "Chiusura 1H sotto "
-                "il livello chiave "
-                "con volume forte"
-            )
-
+    if s["type"] == "PRE":
         return (
             "🟠 PRE-SEGNALE\n"
 
             f"{pair} — "
-            f"{direction}\n\n"
+            f"{s['direction']}\n\n"
 
             f"Livello chiave: "
-            f"{fmt(signal['level'])}\n"
+            f"{fmt_price(s['level'])}\n"
 
             f"Prezzo attuale: "
-            f"{fmt(signal['price'])}\n"
+            f"{fmt_price(s['price'])}\n"
 
             "Possibile ENTRY: "
-            "solo dopo conferma "
-            "del livello\n"
-
-            f"Volume 1H: "
-            f"{signal['volume']:.2f}"
-            "x media\n"
-
-            f"Manca: "
-            f"{missing}\n"
+            "solo dopo conferma\n"
 
             f"Invalidazione: "
-            f"{fmt(signal['invalidation'])}\n"
+            f"{fmt_price(s['invalidation'])}\n"
+
+            f"Volume 1H: "
+            f"{s['volume']:.2f}x media\n"
+
+            f"ATR 1H: "
+            f"{s['atr_pct']:.2f}%\n"
 
             f"Leva potenziale: "
-            f"{leverage}x "
-            "(solo dopo conferma)\n"
+            f"{s['leverage']}x\n"
 
             "Timeframe: "
             "15m / 1H\n"
 
             f"Grado conferma: "
-            f"{grade}"
+            f"{g}"
         )
 
-
-    # CONFERMATO
-
-    direction = (
-        signal["direction"]
-    )
-
-    if leverage >= 20:
+    if s["aggressive"]:
         title = (
             "🔥 SEGNALE CONFERMATO "
             "AGGRESSIVO"
@@ -854,158 +1167,186 @@ def build_message(
             "🟢 SEGNALE CONFERMATO"
         )
 
-
-    entry_mid = (
-        signal["entry_low"]
-        + signal["entry_high"]
-    ) / 2
-
-
-    stop_pct = (
-        abs(
-            entry_mid
-            - signal["sl"]
-        )
-        / entry_mid
+    funding_pct = (
+        s["funding"]
         * 100
     )
 
+    if s["direction"] == "LONG":
+        fav = s["short_liq"]
+        against = s["long_liq"]
+
+    else:
+        fav = s["long_liq"]
+        against = s["short_liq"]
+
+    if s["liq_available"]:
+        liq_txt = (
+            f"Favorevoli "
+            f"{fmt_money(fav)} | "
+            f"Contrarie "
+            f"{fmt_money(against)}"
+        )
+
+    else:
+        liq_txt = (
+            "In raccolta / "
+            "nessun evento recente"
+        )
 
     return (
         f"{title}\n"
 
         f"{pair} — "
-        f"{direction}\n\n"
+        f"{s['direction']}\n\n"
 
         f"ENTRY: "
-        f"{fmt(signal['entry_low'])}"
+        f"{fmt_price(s['entry_low'])}"
         " - "
-        f"{fmt(signal['entry_high'])}\n"
+        f"{fmt_price(s['entry_high'])}\n"
 
         f"SL: "
-        f"{fmt(signal['sl'])}\n"
+        f"{fmt_price(s['sl'])}\n"
 
         f"TP1: "
-        f"{fmt(signal['tp1'])}\n"
+        f"{fmt_price(s['tp1'])}\n"
 
         f"TP2: "
-        f"{fmt(signal['tp2'])}\n"
+        f"{fmt_price(s['tp2'])}\n"
 
         f"TP3: "
-        f"{fmt(signal['tp3'])}\n"
-
-        f"INVALIDAZIONE: "
-        f"{fmt(signal['sl'])}\n"
+        f"{fmt_price(s['tp3'])}\n"
 
         f"Leva indicativa: "
-        f"{leverage}x\n"
-
-        f"Distanza ENTRY-SL: "
-        f"{stop_pct:.2f}%\n"
+        f"{s['leverage']}x\n\n"
 
         f"Volume 1H: "
-        f"{signal['volume']:.2f}"
-        "x media\n"
+        f"{s['volume']:.2f}x media\n"
 
-        "Timeframe: "
-        "15m / 1H\n"
+        f"Open Interest 15m: "
+        f"{s['oi']:+.2f}%\n"
+
+        f"Funding: "
+        f"{funding_pct:+.4f}%\n"
+
+        f"ATR 1H: "
+        f"{s['atr_pct']:.2f}%\n"
+
+        "Retest: OK\n"
+
+        f"Filtro BTC: "
+        f"{s['btc']}\n"
+
+        f"Liquidazioni 15m: "
+        f"{liq_txt}\n"
 
         f"Grado conferma: "
-        f"{grade}\n"
+        f"{g}\n"
 
-        "Nota: la leva e indicativa; "
-        "la liquidazione reale dipende "
-        "anche da exchange, margine "
-        "e commissioni."
+        "Timeframe: "
+        "15m / 1H / 4H\n\n"
+
+        "Nota: leva indicativa; "
+        "con leve elevate il margine "
+        "di errore e molto ridotto."
     )
 
 
 def should_send(
     symbol,
-    signal
+    s
 ):
+    now = time.time()
+
     key = (
         f"{symbol}:"
-        f"{signal['direction']}"
+        f"{s['direction']}:"
+        f"{s['type']}"
     )
 
-    previous = (
-        signal_state.get(key)
+    sig = (
+        s["type"],
+        s["direction"],
+        round(
+            s["level"],
+            8
+        )
     )
 
-    current = (
-        signal["type"]
-    )
+    old = state.get(key)
 
-    if previous == current:
+    if (
+        old
+        and old["sig"] == sig
+        and now - old["t"]
+        < 6 * 3600
+    ):
         return False
 
-    signal_state[key] = (
-        current
-    )
+    state[key] = {
+        "sig": sig,
+        "t": now
+    }
+
+    for k in list(state):
+        if (
+            now - state[k]["t"]
+            > 12 * 3600
+        ):
+            del state[k]
 
     return True
 
 
-def reset_inactive(
-    active_keys
-):
-    for key in list(
-        signal_state.keys()
-    ):
-        if key not in active_keys:
-            del signal_state[key]
-
-
 def scan_market():
-    active_keys = set()
-    successful = 0
+    ok = 0
+
+    btc_data = market_data(
+        "BTCUSDT"
+    )
+
+    btc = btc_bias(
+        btc_data
+    )
 
     for symbol in SYMBOLS:
 
         try:
-            data = (
-                market_data(symbol)
+            if symbol == "BTCUSDT":
+                data = btc_data
+
+            else:
+                data = market_data(
+                    symbol
+                )
+
+            ok += 1
+
+            s = analyze(
+                symbol,
+                data,
+                btc
             )
 
-            successful += 1
-
-            signal = (
-                analyze_symbol(
-                    symbol,
-                    data
-                )
-            )
-
-            if signal:
-
-                key = (
-                    f"{symbol}:"
-                    f"{signal['direction']}"
-                )
-
-                active_keys.add(
-                    key
-                )
-
+            if s:
                 print(
                     symbol,
-                    signal["type"],
-                    signal["direction"],
-                    "score=",
-                    signal["score"],
+                    s["type"],
+                    s["direction"],
+                    "quality=",
+                    s["quality"],
                     "leverage=",
-                    signal["leverage"]
+                    s["leverage"]
                 )
 
                 if should_send(
                     symbol,
-                    signal
+                    s
                 ):
                     send_telegram(
                         build_message(
                             symbol,
-                            signal
+                            s
                         )
                     )
 
@@ -1016,30 +1357,31 @@ def scan_market():
                 e
             )
 
-    reset_inactive(
-        active_keys
-    )
-
     print(
-        "Scansione completata: "
-        f"{successful}/"
+        f"Scansione completata: "
+        f"{ok}/"
         f"{len(SYMBOLS)} coppie"
     )
 
 
+threading.Thread(
+    target=ws_loop,
+    daemon=True
+).start()
+
+
 print(
     "CryptoSignalAI12 avviato - "
-    "motore segnali + leva attivo"
+    "filtri avanzati attivi"
 )
 
 
 send_telegram(
     "CryptoSignalAI12 ONLINE\n"
-    "Monitor 12 perpetual attivo.\n"
-    "Scansione 15m / 1H / 4H "
-    "ogni 60 secondi.\n"
-    "Leva indicativa automatica "
-    "fino a 100x."
+    "Filtri avanzati attivi: "
+    "OI + funding + retest + "
+    "liquidazioni + BTC + volatilita.\n"
+    "Scansione ogni 60 secondi."
 )
 
 
@@ -1054,4 +1396,6 @@ while True:
             e
         )
 
-    time.sleep(60)
+    time.sleep(
+        SCAN_SECONDS
+    )
