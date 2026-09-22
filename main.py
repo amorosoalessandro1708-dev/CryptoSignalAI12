@@ -39,13 +39,17 @@ LIQ_WS_URLS = [
 SCAN_SECONDS = 60
 LIQ_WINDOW_SECONDS = 15 * 60
 
+# PRE invariati
 PRE_VOL_MIN = 1.20
-CONFIRM_VOL_MIN = 1.50
 
-# Se non c'è retest, per il confermato normale
-# chiediamo un breakout molto più forte.
-STRONG_BREAKOUT_VOL = 1.80
+# CONFERMATI NORMALI leggermente più permissivi
+CONFIRM_VOL_MIN = 1.35
 
+# Se non c'è retest serve comunque
+# un breakout forte
+STRONG_BREAKOUT_VOL = 1.60
+
+# Filtri derivati invariati
 FUNDING_BLOCK = 0.0005
 FUNDING_AGGRESSIVE = 0.0003
 
@@ -77,9 +81,7 @@ liq_lock = threading.Lock()
 def send_telegram(text):
 
     if not BOT_TOKEN or not CHAT_ID:
-        print(
-            "Telegram non configurato"
-        )
+        print("Telegram non configurato")
         return
 
     try:
@@ -228,13 +230,8 @@ def atr(
         len(candles)
     ):
 
-        high = (
-            candles[i]["h"]
-        )
-
-        low = (
-            candles[i]["l"]
-        )
+        high = candles[i]["h"]
+        low = candles[i]["l"]
 
         previous_close = (
             candles[i - 1]["c"]
@@ -243,12 +240,10 @@ def atr(
         ranges.append(
             max(
                 high - low,
-
                 abs(
                     high
                     - previous_close
                 ),
-
                 abs(
                     low
                     - previous_close
@@ -608,9 +603,7 @@ def liquidation_metrics(
 
         while (
             liquidation_events
-
-            and
-            liquidation_events[0][
+            and liquidation_events[0][
                 "time"
             ] < cutoff
         ):
@@ -670,13 +663,11 @@ def fmt_price(value):
 def fmt_money(value):
 
     if value >= 1_000_000:
-
         return (
             f"${value / 1_000_000:.2f}M"
         )
 
     if value >= 1_000:
-
         return (
             f"${value / 1_000:.1f}K"
         )
@@ -742,8 +733,8 @@ def calculate_leverage(
         )
     )
 
-    # Se non supera i filtri aggressivi,
-    # il segnale rimane sotto 20x.
+    # Confermati normali:
+    # massimo 15x.
     if not aggressive_ok:
 
         quality_cap = min(
@@ -1109,10 +1100,10 @@ def analyze_symbol(
 
 
     # ==========================
-    # CONFERMATO NORMALE
+    # CONFERMATI NORMALI
     #
-    # Retest OPPURE breakout
-    # molto forte.
+    # Retest oppure breakout
+    # forte.
     # ==========================
 
     normal_trigger_long = (
@@ -1200,6 +1191,7 @@ def analyze_symbol(
 
         if (
             near_long
+
             and vol_ratio
             >= PRE_VOL_MIN
         ):
@@ -1226,37 +1218,22 @@ def analyze_symbol(
             )
 
             return {
-                "type":
-                    "PRE",
-
-                "direction":
-                    "LONG",
-
-                "price":
-                    price15,
-
-                "level":
-                    resistance,
-
+                "type": "PRE",
+                "direction": "LONG",
+                "price": price15,
+                "level": resistance,
                 "invalidation":
                     invalidation,
-
-                "volume":
-                    vol_ratio,
-
-                "atr_pct":
-                    atr_pct,
-
-                "quality":
-                    quality,
-
-                "leverage":
-                    leverage
+                "volume": vol_ratio,
+                "atr_pct": atr_pct,
+                "quality": quality,
+                "leverage": leverage
             }
 
 
         if (
             near_short
+
             and vol_ratio
             >= PRE_VOL_MIN
         ):
@@ -1283,32 +1260,16 @@ def analyze_symbol(
             )
 
             return {
-                "type":
-                    "PRE",
-
-                "direction":
-                    "SHORT",
-
-                "price":
-                    price15,
-
-                "level":
-                    support,
-
+                "type": "PRE",
+                "direction": "SHORT",
+                "price": price15,
+                "level": support,
                 "invalidation":
                     invalidation,
-
-                "volume":
-                    vol_ratio,
-
-                "atr_pct":
-                    atr_pct,
-
-                "quality":
-                    quality,
-
-                "leverage":
-                    leverage
+                "volume": vol_ratio,
+                "atr_pct": atr_pct,
+                "quality": quality,
+                "leverage": leverage
             }
 
         return None
@@ -1504,10 +1465,8 @@ def analyze_symbol(
         )
 
 
-        # IMPORTANTE:
-        # per 20x+ il retest
-        # resta obbligatorio.
-
+        # 20x+:
+        # filtri severi invariati.
         aggressive_ok = (
             used_retest
 
@@ -1524,7 +1483,6 @@ def analyze_symbol(
 
             and (
                 liq_support
-
                 or not liq_available
             )
         )
@@ -1706,7 +1664,6 @@ def analyze_symbol(
 
             and (
                 liq_support
-
                 or not liq_available
             )
         )
@@ -1773,75 +1730,32 @@ def analyze_symbol(
 
 
     return {
-        "type":
-            "CONFIRMED",
-
-        "direction":
-            direction,
-
-        "price":
-            entry,
-
-        "entry_low":
-            entry_low,
-
-        "entry_high":
-            entry_high,
-
-        "sl":
-            stop,
-
-        "tp1":
-            tp1,
-
-        "tp2":
-            tp2,
-
-        "tp3":
-            tp3,
-
-        "level":
-            level,
-
-        "volume":
-            vol_ratio,
-
-        "atr_pct":
-            atr_pct,
-
-        "quality":
-            quality,
-
-        "leverage":
-            leverage,
-
-        "oi":
-            oi_change,
-
-        "funding":
-            funding,
-
-        "btc":
-            btc_bias,
-
-        "long_liq":
-            long_liq,
-
-        "short_liq":
-            short_liq,
-
+        "type": "CONFIRMED",
+        "direction": direction,
+        "price": entry,
+        "entry_low": entry_low,
+        "entry_high": entry_high,
+        "sl": stop,
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp3": tp3,
+        "level": level,
+        "volume": vol_ratio,
+        "atr_pct": atr_pct,
+        "quality": quality,
+        "leverage": leverage,
+        "oi": oi_change,
+        "funding": funding,
+        "btc": btc_bias,
+        "long_liq": long_liq,
+        "short_liq": short_liq,
         "liq_available":
             liq_available,
-
-        "retest":
-            used_retest,
-
-        "aggressive":
-            (
-                leverage >= 20
-
-                and aggressive_ok
-            )
+        "retest": used_retest,
+        "aggressive": (
+            leverage >= 20
+            and aggressive_ok
+        )
     }
 
 
@@ -2086,11 +2000,8 @@ def should_send(
 
 
     signal_state[key] = {
-        "signature":
-            signature,
-
-        "time":
-            now
+        "signature": signature,
+        "time": now
     }
 
 
@@ -2218,17 +2129,17 @@ threading.Thread(
 
 print(
     "CryptoSignalAI12 avviato - "
-    "modalita bilanciata attiva"
+    "modalita bilanciata v2 attiva"
 )
 
 
 send_telegram(
     "CryptoSignalAI12 ONLINE\n"
-    "Modalita bilanciata attiva.\n"
-    "Confermati normali: retest oppure "
-    "breakout forte.\n"
-    "Aggressivi 20x+: retest obbligatorio "
-    "+ filtri avanzati.\n"
+    "Modalita bilanciata v2 attiva.\n"
+    "Confermati normali: volume 1.35x, "
+    "retest oppure breakout forte 1.60x.\n"
+    "Aggressivi 20x+: filtri severi "
+    "invariati e retest obbligatorio.\n"
     "Scansione ogni 60 secondi."
 )
 
