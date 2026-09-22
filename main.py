@@ -37,31 +37,39 @@ LIQ_WINDOW_SECONDS = 15 * 60
 
 
 # ==========================================================
-# NUOVA LOGICA "EARLY"
+# LOGICA "EARLY"
 # ==========================================================
 
-# Struttura PRE:
-# 6 candele 15m = circa 90 minuti.
 PRE_STRUCTURE_BARS = 6
-
-# PRE: volume abbastanza permissivo.
 PRE_VOL_15M_MIN = 0.90
-
-# Un PRE può scattare anche poco PRIMA della rottura.
 PRE_NEAR_ATR15 = 0.30
 
-# Confermato normale:
 CONFIRM_VOL_15M_MIN = 1.05
-
-# Movimento minimo della candela 15m rispetto all'ATR 15m.
 CONFIRM_BODY_ATR_MIN = 0.20
-
-# OI: non richiediamo per forza crescita.
-# Blocchiamo solo deterioramenti più importanti.
 OI_CONFIRM_MIN = -1.00
-
-# Funding massimo consentito per un normale.
 FUNDING_BLOCK = 0.0008
+
+
+# ==========================================================
+# FILTRO BTC CONFERMATI
+# ==========================================================
+
+# Per tutte le altcoin:
+# LONG  -> BTC deve essere LONG oppure NEUTRAL
+# SHORT -> BTC deve essere SHORT oppure NEUTRAL
+#
+# BTC chiaramente contrario = niente CONFERMATO.
+# I PRE non vengono bloccati da questo filtro.
+REQUIRE_BTC_NOT_OPPOSITE = True
+
+
+# ==========================================================
+# DIAGNOSTICA
+# ==========================================================
+
+# Mostra nei Deploy Logs perché un possibile segnale
+# non è riuscito a diventare CONFERMATO.
+DIAGNOSTIC_LOGS = True
 
 
 # ==========================================================
@@ -69,13 +77,8 @@ FUNDING_BLOCK = 0.0008
 # ==========================================================
 
 AGGRESSIVE_VOL_15M_MIN = 1.20
-
-# Per 20x+ preferiamo OI almeno stabile.
 OI_AGGRESSIVE_MIN = 0.00
-
 FUNDING_AGGRESSIVE = 0.0005
-
-# ATR 1H troppo elevato = niente leva aggressiva.
 ATR_AGGRESSIVE_MAX_PCT = 3.00
 
 
@@ -91,12 +94,7 @@ ATR_MAX_PCT = 6.00
 # ANTI-INVERSIONE / ANTI-INSEGUIMENTO
 # ==========================================================
 
-# Se la candela live 15m restituisce più del 45%
-# del movimento dal suo estremo, evitiamo un nuovo confermato.
 MAX_LIVE_RETRACE = 0.45
-
-# Non inseguiamo il prezzo se è già troppo lontano
-# dal livello rotto.
 MAX_EXTENSION_ATR15 = 1.20
 
 
@@ -909,6 +907,37 @@ def get_btc_bias(data):
     return "NEUTRAL"
 
 
+def btc_allows_confirmed(
+    symbol,
+    direction,
+    btc_bias
+):
+
+    # BTC non deve filtrare se stesso.
+    if symbol == "BTCUSDT":
+        return True
+
+    if not REQUIRE_BTC_NOT_OPPOSITE:
+        return True
+
+    if btc_bias == "NEUTRAL":
+        return True
+
+    if (
+        direction == "LONG"
+        and btc_bias == "LONG"
+    ):
+        return True
+
+    if (
+        direction == "SHORT"
+        and btc_bias == "SHORT"
+    ):
+        return True
+
+    return False
+
+
 # ==========================================================
 # GRADO CONFERMA
 # ==========================================================
@@ -922,6 +951,28 @@ def confirmation_grade(quality):
         return "MEDIO-ALTO"
 
     return "MEDIO"
+
+
+# ==========================================================
+# DIAGNOSTICA CONFERMATI
+# ==========================================================
+
+def log_no_confirm(
+    symbol,
+    direction,
+    reasons
+):
+
+    if not DIAGNOSTIC_LOGS:
+        return
+
+    if not reasons:
+        return
+
+    print(
+        f"{symbol} NO CONFIRM {direction}: "
+        + ", ".join(reasons)
+    )
 
 
 # ==========================================================
@@ -996,9 +1047,6 @@ def analyze_symbol(
 
     # ------------------------------------------------------
     # STRUTTURA RECENTE 15M
-    #
-    # NON PIU MASSIMO/MINIMO 20 ORE.
-    #
     # 6 candele 15m = circa 90 minuti.
     # ------------------------------------------------------
 
@@ -1019,14 +1067,8 @@ def analyze_symbol(
     )
 
     price = live15["c"]
-
-    closed_price15 = (
-        last15["c"]
-    )
-
-    price1h = (
-        last1h["c"]
-    )
+    closed_price15 = last15["c"]
+    price1h = last1h["c"]
 
     # ------------------------------------------------------
     # TREND
@@ -1110,45 +1152,33 @@ def analyze_symbol(
 
     near_long = (
         distance_long >= 0
-
         and
-
         distance_long
-        <= atr15
-        * PRE_NEAR_ATR15
+        <= atr15 * PRE_NEAR_ATR15
     )
 
     near_short = (
         distance_short >= 0
-
         and
-
         distance_short
-        <= atr15
-        * PRE_NEAR_ATR15
+        <= atr15 * PRE_NEAR_ATR15
     )
 
     early_break_long = (
         price > resistance
-
         and
-
         price <= (
             resistance
-            + atr15
-            * MAX_EXTENSION_ATR15
+            + atr15 * MAX_EXTENSION_ATR15
         )
     )
 
     early_break_short = (
         price < support
-
         and
-
         price >= (
             support
-            - atr15
-            * MAX_EXTENSION_ATR15
+            - atr15 * MAX_EXTENSION_ATR15
         )
     )
 
@@ -1168,20 +1198,15 @@ def analyze_symbol(
 
     # ------------------------------------------------------
     # PRE
-    #
-    # Il 4H NON blocca.
     # ------------------------------------------------------
 
     pre_long = (
         trend1h_long
-
         and bullish15
-
         and (
             near_long
             or early_break_long
         )
-
         and (
             vol15
             >= PRE_VOL_15M_MIN
@@ -1190,14 +1215,11 @@ def analyze_symbol(
 
     pre_short = (
         trend1h_short
-
         and bearish15
-
         and (
             near_short
             or early_break_short
         )
-
         and (
             vol15
             >= PRE_VOL_15M_MIN
@@ -1297,39 +1319,149 @@ def analyze_symbol(
 
     candidate_long = (
         breakout_long
-
         and trend1h_long
-
-        and vol15
-        >= CONFIRM_VOL_15M_MIN
-
-        and body_atr
-        >= CONFIRM_BODY_ATR_MIN
-
+        and vol15 >= CONFIRM_VOL_15M_MIN
+        and body_atr >= CONFIRM_BODY_ATR_MIN
         and volatility_ok
-
         and not reversing_long
-
         and not_extended_long
     )
 
     candidate_short = (
         breakout_short
-
         and trend1h_short
-
-        and vol15
-        >= CONFIRM_VOL_15M_MIN
-
-        and body_atr
-        >= CONFIRM_BODY_ATR_MIN
-
+        and vol15 >= CONFIRM_VOL_15M_MIN
+        and body_atr >= CONFIRM_BODY_ATR_MIN
         and volatility_ok
-
         and not reversing_short
-
         and not_extended_short
     )
+
+    # ------------------------------------------------------
+    # LOG DIAGNOSTICO PRIMA DEI DERIVATI
+    #
+    # Lo stampiamo soltanto se c'è un breakout chiuso
+    # oppure un early break live, per evitare 12 righe
+    # inutili ogni minuto.
+    # ------------------------------------------------------
+
+    attempt_long = (
+        breakout_long
+        or early_break_long
+    )
+
+    attempt_short = (
+        breakout_short
+        or early_break_short
+    )
+
+    if (
+        attempt_long
+        and not candidate_long
+    ):
+
+        reasons = []
+
+        if not breakout_long:
+            reasons.append(
+                "breakout15m non ancora chiuso"
+            )
+
+        if not trend1h_long:
+            reasons.append(
+                "trend1H non LONG"
+            )
+
+        if (
+            vol15
+            < CONFIRM_VOL_15M_MIN
+        ):
+            reasons.append(
+                f"volume15 {vol15:.2f}x"
+            )
+
+        if (
+            body_atr
+            < CONFIRM_BODY_ATR_MIN
+        ):
+            reasons.append(
+                f"body/ATR {body_atr:.2f}"
+            )
+
+        if not volatility_ok:
+            reasons.append(
+                f"ATR1H {atr_pct:.2f}%"
+            )
+
+        if reversing_long:
+            reasons.append(
+                "inversione live"
+            )
+
+        if not not_extended_long:
+            reasons.append(
+                "prezzo troppo esteso"
+            )
+
+        log_no_confirm(
+            symbol,
+            "LONG",
+            reasons
+        )
+
+    if (
+        attempt_short
+        and not candidate_short
+    ):
+
+        reasons = []
+
+        if not breakout_short:
+            reasons.append(
+                "breakout15m non ancora chiuso"
+            )
+
+        if not trend1h_short:
+            reasons.append(
+                "trend1H non SHORT"
+            )
+
+        if (
+            vol15
+            < CONFIRM_VOL_15M_MIN
+        ):
+            reasons.append(
+                f"volume15 {vol15:.2f}x"
+            )
+
+        if (
+            body_atr
+            < CONFIRM_BODY_ATR_MIN
+        ):
+            reasons.append(
+                f"body/ATR {body_atr:.2f}"
+            )
+
+        if not volatility_ok:
+            reasons.append(
+                f"ATR1H {atr_pct:.2f}%"
+            )
+
+        if reversing_short:
+            reasons.append(
+                "inversione live"
+            )
+
+        if not not_extended_short:
+            reasons.append(
+                "prezzo troppo esteso"
+            )
+
+        log_no_confirm(
+            symbol,
+            "SHORT",
+            reasons
+        )
 
     # ------------------------------------------------------
     # SE NON CONFERMATO -> PRE
@@ -1447,6 +1579,46 @@ def analyze_symbol(
         return None
 
     # ======================================================
+    # FILTRO BTC PER TUTTI I CONFERMATI
+    # ======================================================
+
+    if candidate_long:
+
+        if not btc_allows_confirmed(
+            symbol,
+            "LONG",
+            btc_bias
+        ):
+
+            log_no_confirm(
+                symbol,
+                "LONG",
+                [
+                    f"BTC contrario ({btc_bias})"
+                ]
+            )
+
+            return None
+
+    if candidate_short:
+
+        if not btc_allows_confirmed(
+            symbol,
+            "SHORT",
+            btc_bias
+        ):
+
+            log_no_confirm(
+                symbol,
+                "SHORT",
+                [
+                    f"BTC contrario ({btc_bias})"
+                ]
+            )
+
+            return None
+
+    # ======================================================
     # DERIVATI SOLO PER CONFERMATI
     # ======================================================
 
@@ -1460,12 +1632,53 @@ def analyze_symbol(
         oi_change is None
         or funding is None
     ):
+
+        reasons = []
+
+        if oi_change is None:
+            reasons.append(
+                "OI non disponibile"
+            )
+
+        if funding is None:
+            reasons.append(
+                "funding non disponibile"
+            )
+
+        direction = (
+            "LONG"
+            if candidate_long
+            else "SHORT"
+        )
+
+        log_no_confirm(
+            symbol,
+            direction,
+            reasons
+        )
+
         return None
 
     if (
         oi_change
         < OI_CONFIRM_MIN
     ):
+
+        direction = (
+            "LONG"
+            if candidate_long
+            else "SHORT"
+        )
+
+        log_no_confirm(
+            symbol,
+            direction,
+            [
+                f"OI {oi_change:+.2f}% "
+                f"< {OI_CONFIRM_MIN:+.2f}%"
+            ]
+        )
+
         return None
 
     long_liq, short_liq = (
@@ -1515,9 +1728,7 @@ def analyze_symbol(
 
         liq_support = (
             liq_available
-
             and
-
             short_liq >= max(
                 long_liq * 1.25,
                 10000
@@ -1526,19 +1737,36 @@ def analyze_symbol(
 
         severe_liq_against = (
             liq_available
-
             and
-
             long_liq >= max(
                 short_liq * 3.0,
                 50000
             )
         )
 
-        if (
-            not funding_ok
-            or severe_liq_against
-        ):
+        if not funding_ok:
+
+            log_no_confirm(
+                symbol,
+                "LONG",
+                [
+                    f"funding troppo alto "
+                    f"{funding * 100:+.4f}%"
+                ]
+            )
+
+            return None
+
+        if severe_liq_against:
+
+            log_no_confirm(
+                symbol,
+                "LONG",
+                [
+                    "liquidazioni fortemente contrarie"
+                ]
+            )
+
             return None
 
         entry = price
@@ -1554,6 +1782,15 @@ def analyze_symbol(
         )
 
         if stop >= entry:
+
+            log_no_confirm(
+                symbol,
+                "LONG",
+                [
+                    "stop non valido"
+                ]
+            )
+
             return None
 
         risk = (
@@ -1590,30 +1827,16 @@ def analyze_symbol(
             strong15_long
         )
 
-        # ----------------------------------------------
-        # 20X+
-        #
-        # Più filtrato del normale,
-        # ma senza aspettare 4H + retest obbligatorio.
-        # ----------------------------------------------
-
         aggressive_ok = (
             vol15
             >= AGGRESSIVE_VOL_15M_MIN
-
             and oi_aggressive
-
             and funding_aggressive
-
             and atr_pct
             <= ATR_AGGRESSIVE_MAX_PCT
-
             and strong15_long
-
             and not reversing_long
-
             and not severe_liq_against
-
             and (
                 btc_aligned
                 or btc_bias == "NEUTRAL"
@@ -1655,9 +1878,7 @@ def analyze_symbol(
 
         liq_support = (
             liq_available
-
             and
-
             long_liq >= max(
                 short_liq * 1.25,
                 10000
@@ -1666,19 +1887,36 @@ def analyze_symbol(
 
         severe_liq_against = (
             liq_available
-
             and
-
             short_liq >= max(
                 long_liq * 3.0,
                 50000
             )
         )
 
-        if (
-            not funding_ok
-            or severe_liq_against
-        ):
+        if not funding_ok:
+
+            log_no_confirm(
+                symbol,
+                "SHORT",
+                [
+                    f"funding troppo basso "
+                    f"{funding * 100:+.4f}%"
+                ]
+            )
+
+            return None
+
+        if severe_liq_against:
+
+            log_no_confirm(
+                symbol,
+                "SHORT",
+                [
+                    "liquidazioni fortemente contrarie"
+                ]
+            )
+
             return None
 
         entry = price
@@ -1694,6 +1932,15 @@ def analyze_symbol(
         )
 
         if stop <= entry:
+
+            log_no_confirm(
+                symbol,
+                "SHORT",
+                [
+                    "stop non valido"
+                ]
+            )
+
             return None
 
         risk = (
@@ -1733,20 +1980,13 @@ def analyze_symbol(
         aggressive_ok = (
             vol15
             >= AGGRESSIVE_VOL_15M_MIN
-
             and oi_aggressive
-
             and funding_aggressive
-
             and atr_pct
             <= ATR_AGGRESSIVE_MAX_PCT
-
             and strong15_short
-
             and not reversing_short
-
             and not severe_liq_against
-
             and (
                 btc_aligned
                 or btc_bias == "NEUTRAL"
@@ -1871,12 +2111,8 @@ def build_message(symbol, signal):
 
         setup = (
             "prima rottura struttura 15m"
-
             if signal["early_break"]
-
-            else (
-                "avvicinamento struttura 15m"
-            )
+            else "avvicinamento struttura 15m"
         )
 
         return (
@@ -1918,9 +2154,7 @@ def build_message(symbol, signal):
 
     title = (
         "🔥 SEGNALE CONFERMATO AGGRESSIVO"
-
         if signal["aggressive"]
-
         else "🟢 SEGNALE CONFERMATO"
     )
 
@@ -2053,10 +2287,8 @@ def should_send(symbol, signal):
 
     if (
         previous
-
         and previous["signature"]
         == signature
-
         and now
         - previous["time"]
         < 6 * 3600
@@ -2107,15 +2339,17 @@ def scan_market():
         )
     )
 
+    print(
+        f"BTC bias corrente: {btc_bias}"
+    )
+
     for symbol in SYMBOLS:
 
         try:
 
             data = (
                 btc_data
-
                 if symbol == "BTCUSDT"
-
                 else market_data(
                     symbol
                 )
@@ -2184,15 +2418,17 @@ threading.Thread(
 
 print(
     "CryptoSignalAI12 avviato - "
-    "modalita EARLY v5 attiva"
+    "modalita EARLY v5.1 attiva"
 )
 
 
 send_telegram(
     "CryptoSignalAI12 ONLINE\n"
-    "Modalita EARLY v5 attiva.\n"
+    "Modalita EARLY v5.1 attiva.\n"
     "PRE basati sulla struttura recente 15m.\n"
-    "Confermati senza attendere breakout 20H.\n"
+    "Confermati: BTC allineato o neutrale.\n"
+    "BTC contrario blocca il confermato.\n"
+    "Diagnostica NO CONFIRM attiva.\n"
     "Filtro anti-inversione live attivo.\n"
     "20x+ con conferme aggiuntive.\n"
     "Protezione Binance 429 attiva."
