@@ -37,7 +37,7 @@ LIQ_WINDOW_SECONDS = 15 * 60
 
 
 # ==========================================================
-# LOGICA "EARLY"
+# LOGICA EARLY
 # ==========================================================
 
 PRE_STRUCTURE_BARS = 6
@@ -46,20 +46,29 @@ PRE_NEAR_ATR15 = 0.30
 
 CONFIRM_VOL_15M_MIN = 1.05
 CONFIRM_BODY_ATR_MIN = 0.20
-OI_CONFIRM_MIN = 0.20
+OI_CONFIRM_MIN = -1.00
 FUNDING_BLOCK = 0.0008
 
 
 # ==========================================================
-# FILTRO BTC CONFERMATI
+# FILTRO BTC CONFERMATI - V5.2
 # ==========================================================
 
-# Per tutte le altcoin:
-# LONG  -> BTC deve essere LONG oppure NEUTRAL
-# SHORT -> BTC deve essere SHORT oppure NEUTRAL
+# CONFERMATO NORMALE:
+# BTC può essere:
+# - fortemente allineato
+# - leggermente allineato
+# - neutrale
 #
-# BTC chiaramente contrario = niente CONFERMATO.
+# BTC chiaramente contrario blocca il segnale.
+#
+# CONFERMATO AGGRESSIVO 20X+:
+# BTC deve essere FORTEMENTE allineato.
+#
+# BTCUSDT non viene naturalmente bloccato da se stesso.
+
 REQUIRE_BTC_NOT_OPPOSITE = True
+REQUIRE_STRONG_BTC_FOR_AGGRESSIVE = True
 
 
 # ==========================================================
@@ -861,7 +870,7 @@ def calculate_leverage(
 
 
 # ==========================================================
-# BTC BIAS
+# BTC BIAS V5.2
 # ==========================================================
 
 def get_btc_bias(data):
@@ -873,6 +882,9 @@ def get_btc_bias(data):
         for c in c1h[:-1]
     ]
 
+    if len(closes) < 51:
+        return "NEUTRAL"
+
     e20 = ema(
         closes,
         20
@@ -883,25 +895,163 @@ def get_btc_bias(data):
         50
     )
 
+    # EMA20 della candela precedente.
+    previous_closes = closes[:-1]
+
+    e20_prev = ema(
+        previous_closes,
+        20
+    )
+
     if None in (
         e20,
-        e50
+        e50,
+        e20_prev
     ):
         return "NEUTRAL"
 
-    price = c1h[-2]["c"]
+    last = c1h[-2]
 
-    if (
-        price > e20 > e50
+    price = last["c"]
+    open_price = last["o"]
+
+    bullish_candle = (
+        price > open_price
+    )
+
+    bearish_candle = (
+        price < open_price
+    )
+
+    ema20_rising = (
+        e20 > e20_prev
+    )
+
+    ema20_falling = (
+        e20 < e20_prev
+    )
+
+    # ------------------------------------------------------
+    # BTC FORTE
+    #
+    # Per LONG:
+    # - candela 1H chiusa verde
+    # - prezzo sopra EMA20
+    # - EMA20 sopra EMA50
+    # - EMA20 in salita
+    #
+    # Per SHORT il contrario.
+    # ------------------------------------------------------
+
+    strong_long = (
+        bullish_candle
+        and price > e20
+        and e20 > e50
+        and ema20_rising
+    )
+
+    strong_short = (
+        bearish_candle
+        and price < e20
+        and e20 < e50
+        and ema20_falling
+    )
+
+    if strong_long:
+        return "LONG_STRONG"
+
+    if strong_short:
+        return "SHORT_STRONG"
+
+    # ------------------------------------------------------
+    # BTC LEGGERMENTE ALLINEATO
+    #
+    # Non richiede ancora l'intera struttura EMA20 > EMA50.
+    # Serve però una direzione reale:
+    #
+    # LONG_LIGHT:
+    # candela 1H verde + prezzo sopra EMA20
+    # oppure EMA20 già inclinata verso l'alto e candela verde.
+    #
+    # SHORT_LIGHT:
+    # condizione speculare.
+    # ------------------------------------------------------
+
+    light_long = (
+        bullish_candle
+        and (
+            price > e20
+            or ema20_rising
+        )
+    )
+
+    light_short = (
+        bearish_candle
+        and (
+            price < e20
+            or ema20_falling
+        )
+    )
+
+    if light_long:
+        return "LONG_LIGHT"
+
+    if light_short:
+        return "SHORT_LIGHT"
+
+    return "NEUTRAL"
+
+
+def btc_direction(btc_bias):
+
+    if btc_bias in (
+        "LONG_LIGHT",
+        "LONG_STRONG"
     ):
         return "LONG"
 
-    if (
-        price < e20 < e50
+    if btc_bias in (
+        "SHORT_LIGHT",
+        "SHORT_STRONG"
     ):
         return "SHORT"
 
     return "NEUTRAL"
+
+
+def btc_is_strong(
+    btc_bias,
+    direction
+):
+
+    if direction == "LONG":
+
+        return (
+            btc_bias
+            == "LONG_STRONG"
+        )
+
+    return (
+        btc_bias
+        == "SHORT_STRONG"
+    )
+
+
+def btc_is_aligned(
+    btc_bias,
+    direction
+):
+
+    direction_btc = (
+        btc_direction(
+            btc_bias
+        )
+    )
+
+    return (
+        direction_btc
+        == direction
+    )
 
 
 def btc_allows_confirmed(
@@ -916,22 +1066,46 @@ def btc_allows_confirmed(
     if not REQUIRE_BTC_NOT_OPPOSITE:
         return True
 
-    if btc_bias == "NEUTRAL":
+    direction_btc = (
+        btc_direction(
+            btc_bias
+        )
+    )
+
+    # BTC neutrale: il normale confermato può passare.
+    if direction_btc == "NEUTRAL":
         return True
 
-    if (
-        direction == "LONG"
-        and btc_bias == "LONG"
-    ):
+    # BTC almeno leggermente nella stessa direzione.
+    if direction_btc == direction:
         return True
 
-    if (
-        direction == "SHORT"
-        and btc_bias == "SHORT"
-    ):
-        return True
-
+    # BTC chiaramente nella direzione opposta.
     return False
+
+
+def btc_allows_aggressive(
+    symbol,
+    direction,
+    btc_bias
+):
+
+    # BTC non deve autobloccare il proprio segnale.
+    if symbol == "BTCUSDT":
+        return True
+
+    if not REQUIRE_STRONG_BTC_FOR_AGGRESSIVE:
+
+        return btc_allows_confirmed(
+            symbol,
+            direction,
+            btc_bias
+        )
+
+    return btc_is_strong(
+        btc_bias,
+        direction
+    )
 
 
 # ==========================================================
@@ -1458,7 +1632,7 @@ def analyze_symbol(
     # ------------------------------------------------------
     # SE NON CONFERMATO -> PRE
     # I PRE RESTANO CALCOLATI INTERNAMENTE.
-    # NON VERRANNO INVIATI SU TELEGRAM.
+    # NON VENGONO INVIATI SU TELEGRAM.
     # ------------------------------------------------------
 
     if (
@@ -1717,7 +1891,26 @@ def analyze_symbol(
 
         btc_aligned = (
             symbol == "BTCUSDT"
-            or btc_bias == "LONG"
+            or btc_is_aligned(
+                btc_bias,
+                "LONG"
+            )
+        )
+
+        btc_strong = (
+            symbol == "BTCUSDT"
+            or btc_is_strong(
+                btc_bias,
+                "LONG"
+            )
+        )
+
+        btc_aggressive_ok = (
+            btc_allows_aggressive(
+                symbol,
+                "LONG",
+                btc_bias
+            )
         )
 
         liq_support = (
@@ -1809,8 +2002,16 @@ def analyze_symbol(
             funding_aggressive
         )
 
+        # BTC leggermente o fortemente allineato:
+        # +1 punto qualità.
         quality += int(
             btc_aligned
+        )
+
+        # BTC fortemente allineato:
+        # ulteriore +1.
+        quality += int(
+            btc_strong
         )
 
         quality += int(
@@ -1831,10 +2032,7 @@ def analyze_symbol(
             and strong15_long
             and not reversing_long
             and not severe_liq_against
-            and (
-                btc_aligned
-                or btc_bias == "NEUTRAL"
-            )
+            and btc_aggressive_ok
         )
 
     # ======================================================
@@ -1867,7 +2065,26 @@ def analyze_symbol(
 
         btc_aligned = (
             symbol == "BTCUSDT"
-            or btc_bias == "SHORT"
+            or btc_is_aligned(
+                btc_bias,
+                "SHORT"
+            )
+        )
+
+        btc_strong = (
+            symbol == "BTCUSDT"
+            or btc_is_strong(
+                btc_bias,
+                "SHORT"
+            )
+        )
+
+        btc_aggressive_ok = (
+            btc_allows_aggressive(
+                symbol,
+                "SHORT",
+                btc_bias
+            )
         )
 
         liq_support = (
@@ -1964,6 +2181,10 @@ def analyze_symbol(
         )
 
         quality += int(
+            btc_strong
+        )
+
+        quality += int(
             liq_support
         )
 
@@ -1981,10 +2202,7 @@ def analyze_symbol(
             and strong15_short
             and not reversing_short
             and not severe_liq_against
-            and (
-                btc_aligned
-                or btc_bias == "NEUTRAL"
-            )
+            and btc_aggressive_ok
         )
 
     # ======================================================
@@ -2374,10 +2592,9 @@ def scan_market():
                 )
 
                 # ==========================================
-                # MODIFICA:
-                # Telegram riceve SOLO i CONFERMATI.
-                # I PRE continuano a essere calcolati
-                # e restano visibili nei Deploy Logs.
+                # TELEGRAM:
+                # SOLO SEGNALI CONFERMATI.
+                # PRE SOLO INTERNI / DEPLOY LOGS.
                 # ==========================================
 
                 if (
@@ -2424,20 +2641,21 @@ threading.Thread(
 
 print(
     "CryptoSignalAI12 avviato - "
-    "modalita EARLY v5.1 CONFIRMED ONLY attiva"
+    "modalita EARLY v5.2 BTC DYNAMIC CONFIRMED ONLY attiva"
 )
 
 
 send_telegram(
     "CryptoSignalAI12 ONLINE\n"
-    "Modalita EARLY v5.1 CONFIRMED ONLY attiva.\n"
+    "Modalita EARLY v5.2 BTC DYNAMIC CONFIRMED ONLY attiva.\n"
     "PRE calcolati internamente, notifiche disattivate.\n"
     "Telegram invia solo SEGNALI CONFERMATI.\n"
-    "Confermati: BTC allineato o neutrale.\n"
+    "Confermato normale: BTC leggermente allineato, forte o neutrale.\n"
     "BTC contrario blocca il confermato.\n"
+    "Aggressivo 20x+: BTC fortemente allineato.\n"
+    "BTC analizzato sulla candela 1H chiusa + EMA20/EMA50.\n"
     "Diagnostica NO CONFIRM attiva.\n"
     "Filtro anti-inversione live attivo.\n"
-    "20x+ con conferme aggiuntive.\n"
     "Protezione Binance 429 attiva."
 )
 
