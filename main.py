@@ -59,7 +59,6 @@ FUNDING_BLOCK = 0.0008
 # SHORT -> BTC deve essere SHORT oppure NEUTRAL
 #
 # BTC chiaramente contrario = niente CONFERMATO.
-# I PRE non vengono bloccati da questo filtro.
 REQUIRE_BTC_NOT_OPPOSITE = True
 
 
@@ -67,8 +66,6 @@ REQUIRE_BTC_NOT_OPPOSITE = True
 # DIAGNOSTICA
 # ==========================================================
 
-# Mostra nei Deploy Logs perché un possibile segnale
-# non è riuscito a diventare CONFERMATO.
 DIAGNOSTIC_LOGS = True
 
 
@@ -913,7 +910,6 @@ def btc_allows_confirmed(
     btc_bias
 ):
 
-    # BTC non deve filtrare se stesso.
     if symbol == "BTCUSDT":
         return True
 
@@ -1339,10 +1335,6 @@ def analyze_symbol(
 
     # ------------------------------------------------------
     # LOG DIAGNOSTICO PRIMA DEI DERIVATI
-    #
-    # Lo stampiamo soltanto se c'è un breakout chiuso
-    # oppure un early break live, per evitare 12 righe
-    # inutili ogni minuto.
     # ------------------------------------------------------
 
     attempt_long = (
@@ -1465,6 +1457,8 @@ def analyze_symbol(
 
     # ------------------------------------------------------
     # SE NON CONFERMATO -> PRE
+    # I PRE RESTANO CALCOLATI INTERNAMENTE.
+    # NON VERRANNO INVIATI SU TELEGRAM.
     # ------------------------------------------------------
 
     if (
@@ -2107,6 +2101,8 @@ def build_message(symbol, signal):
         )
     )
 
+    # Questo blocco resta disponibile internamente,
+    # ma i PRE non vengono inviati a Telegram.
     if signal["type"] == "PRE":
 
         setup = (
@@ -2377,9 +2373,19 @@ def scan_market():
                     signal["leverage"],
                 )
 
-                if should_send(
-                    symbol,
-                    signal
+                # ==========================================
+                # MODIFICA:
+                # Telegram riceve SOLO i CONFERMATI.
+                # I PRE continuano a essere calcolati
+                # e restano visibili nei Deploy Logs.
+                # ==========================================
+
+                if (
+                    signal["type"] == "CONFIRMED"
+                    and should_send(
+                        symbol,
+                        signal
+                    )
                 ):
 
                     send_telegram(
@@ -2418,14 +2424,15 @@ threading.Thread(
 
 print(
     "CryptoSignalAI12 avviato - "
-    "modalita EARLY v5.1 attiva"
+    "modalita EARLY v5.1 CONFIRMED ONLY attiva"
 )
 
 
 send_telegram(
     "CryptoSignalAI12 ONLINE\n"
-    "Modalita EARLY v5.1 attiva.\n"
-    "PRE basati sulla struttura recente 15m.\n"
+    "Modalita EARLY v5.1 CONFIRMED ONLY attiva.\n"
+    "PRE calcolati internamente, notifiche disattivate.\n"
+    "Telegram invia solo SEGNALI CONFERMATI.\n"
     "Confermati: BTC allineato o neutrale.\n"
     "BTC contrario blocca il confermato.\n"
     "Diagnostica NO CONFIRM attiva.\n"
