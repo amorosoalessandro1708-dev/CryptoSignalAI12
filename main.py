@@ -37,33 +37,76 @@ LIQ_WINDOW_SECONDS = 15 * 60
 
 
 # ==========================================================
-# LOGICA EARLY V5.6 - ANTI FALSE BREAKOUT
+# V6 SCORE - STRUTTURA
 # ==========================================================
 
 PRE_STRUCTURE_BARS = 6
+
 PRE_VOL_15M_MIN = 0.90
 PRE_NEAR_ATR15 = 0.30
 
-# Confermati normali
-CONFIRM_VOL_15M_MIN = 1.40
-CONFIRM_VOL_1H_MIN = 0.30
-CONFIRM_BODY_ATR_MIN = 0.15
-OI_CONFIRM_MIN = 0.05
-FUNDING_BLOCK = 0.0008
+# ----------------------------------------------------------
+# CONFERMATI NORMALI
+#
+# 1.15x = PAVIMENTO, non conferma automatica.
+# Sopra il pavimento il volume contribuisce allo SCORE.
+# ----------------------------------------------------------
 
-# Follow-through
+CONFIRM_VOL_15M_FLOOR = 1.15
+CONFIRM_VOL_1H_FLOOR = 0.30
+
+CONFIRM_BODY_ATR_FLOOR = 0.15
 FOLLOW_THROUGH_MIN_ATR15 = 0.08
 
-# Anti falso-breakout
+# Score minimo per un confermato normale
+CONFIRM_SCORE_MIN = 7
+
+# OI:
+# sotto -0.10% blocco;
+# da qui in poi contribuisce allo score.
+OI_HARD_FLOOR = -0.10
+OI_SCORE_POSITIVE = 0.05
+OI_SCORE_STRONG = 0.20
+
+FUNDING_BLOCK = 0.0008
+FUNDING_GOOD = 0.0005
+
+
+# ==========================================================
+# VOLUME SCORE
+# ==========================================================
+
+VOL15_SCORE_MEDIUM = 1.30
+VOL15_SCORE_STRONG = 1.50
+VOL15_SCORE_VERY_STRONG = 2.00
+
+VOL1H_SCORE_MEDIUM = 0.60
+VOL1H_SCORE_STRONG = 1.00
+
+
+# ==========================================================
+# HOLD ANTI FALSE-BREAKOUT
+# ==========================================================
+
 BREAKOUT_HOLD_SECONDS = 3 * 60
+
+# Durante HOLD tolleriamo un rientro massimo di 0.05 ATR15.
 BREAKOUT_RETEST_TOLERANCE_ATR15 = 0.05
 
+# Alla fine dell'HOLD il prezzo deve essere tornato
+# dalla parte corretta del livello.
+REQUIRE_PRICE_BEYOND_LEVEL_AFTER_HOLD = True
+
 
 # ==========================================================
-# FILTRO BTC
+# BTC
 # ==========================================================
 
+# Per i normali BTC contrario NON viene trattato come
+# semplice punto negativo: resta un filtro di sicurezza.
 REQUIRE_BTC_NOT_OPPOSITE = True
+
+# Per aggressivi altcoin richiediamo BTC STRONG allineato.
 REQUIRE_STRONG_BTC_FOR_AGGRESSIVE = True
 
 
@@ -85,14 +128,8 @@ OI_AGGRESSIVE_MIN = 0.20
 FUNDING_AGGRESSIVE = 0.0005
 ATR_AGGRESSIVE_MAX_PCT = 3.00
 
-
-# ==========================================================
-# TARGET
-# ==========================================================
-
-TP1_R = 0.60
-TP2_R = 1.20
-TP3_R = 2.00
+# Un aggressivo deve avere anche score elevato.
+AGGRESSIVE_SCORE_MIN = 11
 
 
 # ==========================================================
@@ -112,6 +149,43 @@ MAX_EXTENSION_ATR15 = 1.20
 
 
 # ==========================================================
+# STOP LOSS INTELLIGENTE
+# ==========================================================
+
+# Lo stop viene costruito con:
+# - struttura
+# - candela breakout
+# - ATR15
+#
+# Poi viene impedito che sia eccessivamente stretto/largo.
+
+SL_STRUCTURE_BUFFER_ATR15 = 0.10
+
+SL_MIN_DISTANCE_ATR15 = 0.45
+SL_MAX_DISTANCE_ATR15 = 1.35
+
+
+# ==========================================================
+# TAKE PROFIT INTELLIGENTI
+# ==========================================================
+
+# Base
+TP1_R_BASE = 0.60
+TP2_R_BASE = 1.20
+TP3_R_BASE = 2.00
+
+# Setup di qualità alta
+TP1_R_HIGH = 0.70
+TP2_R_HIGH = 1.40
+TP3_R_HIGH = 2.40
+
+# Setup aggressivo molto forte
+TP1_R_AGGRESSIVE = 0.75
+TP2_R_AGGRESSIVE = 1.50
+TP3_R_AGGRESSIVE = 2.70
+
+
+# ==========================================================
 # LEVA
 # ==========================================================
 
@@ -124,7 +198,7 @@ LEVERAGE_STEPS = [
 
 
 # ==========================================================
-# PROTEZIONE BINANCE 429
+# PROTEZIONE BINANCE
 # ==========================================================
 
 MIN_REST_GAP_SECONDS = 0.18
@@ -138,7 +212,7 @@ last_rest_request = 0.0
 
 signal_state = {}
 
-# Stato V5.6 per i candidati in HOLD
+# Stato persistente dei breakout in HOLD.
 breakout_hold_state = {}
 
 liquidation_events = deque()
@@ -156,6 +230,7 @@ def send_telegram(text):
         return
 
     try:
+
         r = requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
             data={
@@ -216,7 +291,9 @@ def get_json(url, params=None, timeout=15):
 
                 try:
                     wait = float(retry_after)
+
                 except (TypeError, ValueError):
+
                     wait = RETRY_FALLBACK_SECONDS[
                         min(
                             attempt,
@@ -322,10 +399,19 @@ def ema(values, period):
         return None
 
     k = 2 / (period + 1)
-    value = sum(values[:period]) / period
+
+    value = (
+        sum(values[:period])
+        / period
+    )
 
     for price in values[period:]:
-        value = (price - value) * k + value
+
+        value = (
+            (price - value)
+            * k
+            + value
+        )
 
     return value
 
@@ -351,7 +437,10 @@ def atr(candles, period=14):
             )
         )
 
-    return sum(ranges[-period:]) / period
+    return (
+        sum(ranges[-period:])
+        / period
+    )
 
 
 def volume_ratio_closed(candles, period=20):
@@ -366,28 +455,41 @@ def volume_ratio_closed(candles, period=20):
         for c in candles[-(period + 2):-2]
     ]
 
-    avg = sum(previous) / len(previous)
+    avg = (
+        sum(previous)
+        / len(previous)
+    )
 
     if avg <= 0:
         return 0.0
 
-    return current_volume / avg
+    return (
+        current_volume
+        / avg
+    )
 
 
 def candle_strength(candle, direction):
 
-    rng = candle["h"] - candle["l"]
+    rng = (
+        candle["h"]
+        - candle["l"]
+    )
 
     if rng <= 0:
         return False
 
     body = (
-        abs(candle["c"] - candle["o"])
+        abs(
+            candle["c"]
+            - candle["o"]
+        )
         / rng
     )
 
     close_pos = (
-        candle["c"] - candle["l"]
+        candle["c"]
+        - candle["l"]
     ) / rng
 
     if direction == "LONG":
@@ -411,7 +513,10 @@ def candle_strength(candle, direction):
 
 def live_reversal(candle, direction):
 
-    rng = candle["h"] - candle["l"]
+    rng = (
+        candle["h"]
+        - candle["l"]
+    )
 
     if rng <= 0:
         return False
@@ -419,10 +524,14 @@ def live_reversal(candle, direction):
     if direction == "LONG":
 
         retrace = (
-            candle["h"] - candle["c"]
+            candle["h"]
+            - candle["c"]
         ) / rng
 
-        bearish = candle["c"] < candle["o"]
+        bearish = (
+            candle["c"]
+            < candle["o"]
+        )
 
         return (
             bearish
@@ -430,10 +539,14 @@ def live_reversal(candle, direction):
         )
 
     retrace = (
-        candle["c"] - candle["l"]
+        candle["c"]
+        - candle["l"]
     ) / rng
 
-    bullish = candle["c"] > candle["o"]
+    bullish = (
+        candle["c"]
+        > candle["o"]
+    )
 
     return (
         bullish
@@ -472,6 +585,7 @@ def get_derivatives(symbol):
             )
 
             if prev > 0:
+
                 oi_change = (
                     (curr - prev)
                     / prev
@@ -539,7 +653,9 @@ def store_liquidation(payload):
             or 0
         )
 
-        notional = qty * price
+        notional = (
+            qty * price
+        )
 
         if notional <= 0:
             continue
@@ -571,12 +687,17 @@ def store_liquidation(payload):
 def ws_message(ws, message):
 
     try:
+
         store_liquidation(
             json.loads(message)
         )
 
     except Exception as e:
-        print("LIQ parse error:", e)
+
+        print(
+            "LIQ parse error:",
+            e
+        )
 
 
 def ws_error(ws, error):
@@ -597,7 +718,10 @@ def ws_loop():
             index % len(LIQ_WS_URLS)
         ]
 
-        print("LIQ WS connessione:", url)
+        print(
+            "LIQ WS connessione:",
+            url
+        )
 
         try:
 
@@ -614,7 +738,11 @@ def ws_loop():
             )
 
         except Exception as e:
-            print("LIQ WS restart:", e)
+
+            print(
+                "LIQ WS restart:",
+                e
+            )
 
         index += 1
         time.sleep(5)
@@ -645,6 +773,7 @@ def liquidation_metrics(symbol):
 
             if event["kind"] == "LONG_LIQ":
                 long_liq += event["notional"]
+
             else:
                 short_liq += event["notional"]
 
@@ -724,7 +853,9 @@ def calculate_leverage(
         / stop_pct
     )
 
-    cap = leverage_cap(quality)
+    cap = leverage_cap(
+        quality
+    )
 
     if not aggressive_ok:
         cap = min(cap, 15)
@@ -741,6 +872,7 @@ def calculate_leverage(
 
         if step <= allowed:
             selected = step
+
         else:
             break
 
@@ -748,92 +880,164 @@ def calculate_leverage(
 
 
 # ==========================================================
-# BTC BIAS
+# BTC REGIME V6
 # ==========================================================
 
 def get_btc_bias(data):
 
+    c15 = data["15m"]
     c1h = data["1h"]
+    c4h = data["4h"]
 
-    closes = [
+    closes1h = [
         c["c"]
         for c in c1h[:-1]
     ]
 
-    if len(closes) < 51:
-        return "NEUTRAL"
+    closes4h = [
+        c["c"]
+        for c in c4h[:-1]
+    ]
 
-    e20 = ema(closes, 20)
-    e50 = ema(closes, 50)
+    if (
+        len(closes1h) < 51
+        or len(closes4h) < 51
+    ):
+        return "NEUTRAL_STABLE"
 
-    previous_closes = closes[:-1]
+    e20_1h = ema(
+        closes1h,
+        20
+    )
+
+    e50_1h = ema(
+        closes1h,
+        50
+    )
+
+    e20_4h = ema(
+        closes4h,
+        20
+    )
+
+    e50_4h = ema(
+        closes4h,
+        50
+    )
+
+    previous_closes = (
+        closes1h[:-1]
+    )
 
     e20_prev = ema(
         previous_closes,
         20
     )
 
+    atr15 = atr(
+        c15[:-1],
+        14
+    )
+
+    atr1h = atr(
+        c1h[:-1],
+        14
+    )
+
     if None in (
-        e20,
-        e50,
-        e20_prev
+        e20_1h,
+        e50_1h,
+        e20_4h,
+        e50_4h,
+        e20_prev,
+        atr15,
+        atr1h
     ):
-        return "NEUTRAL"
+        return "NEUTRAL_STABLE"
 
-    last = c1h[-2]
+    last1h = c1h[-2]
+    last4h = c4h[-2]
+    live15 = c15[-1]
 
-    price = last["c"]
-    open_price = last["o"]
+    price1h = last1h["c"]
 
-    bullish_candle = price > open_price
-    bearish_candle = price < open_price
+    ema20_rising = (
+        e20_1h > e20_prev
+    )
 
-    ema20_rising = e20 > e20_prev
-    ema20_falling = e20 < e20_prev
+    ema20_falling = (
+        e20_1h < e20_prev
+    )
 
-    strong_long = (
-        bullish_candle
-        and price > e20
-        and e20 > e50
+    long_1h = (
+        price1h > e20_1h
+    )
+
+    short_1h = (
+        price1h < e20_1h
+    )
+
+    strong_long_1h = (
+        price1h
+        > e20_1h
+        > e50_1h
         and ema20_rising
     )
 
-    strong_short = (
-        bearish_candle
-        and price < e20
-        and e20 < e50
+    strong_short_1h = (
+        price1h
+        < e20_1h
+        < e50_1h
         and ema20_falling
     )
 
-    if strong_long:
+    long_4h = (
+        last4h["c"] > e20_4h
+    )
+
+    short_4h = (
+        last4h["c"] < e20_4h
+    )
+
+    live_range = (
+        live15["h"]
+        - live15["l"]
+    )
+
+    volatile_live = (
+        atr15 > 0
+        and live_range
+        >= atr15 * 1.40
+    )
+
+    if (
+        strong_long_1h
+        and long_4h
+    ):
         return "LONG_STRONG"
 
-    if strong_short:
+    if (
+        strong_short_1h
+        and short_4h
+    ):
         return "SHORT_STRONG"
 
-    light_long = (
-        bullish_candle
-        and (
-            price > e20
-            or ema20_rising
-        )
-    )
-
-    light_short = (
-        bearish_candle
-        and (
-            price < e20
-            or ema20_falling
-        )
-    )
-
-    if light_long:
+    if (
+        long_1h
+        and ema20_rising
+    ):
         return "LONG_LIGHT"
 
-    if light_short:
+    if (
+        short_1h
+        and ema20_falling
+    ):
         return "SHORT_LIGHT"
 
-    return "NEUTRAL"
+    if volatile_live:
+        return "NEUTRAL_VOLATILE"
+
+    return "NEUTRAL_STABLE"
 
 
 def btc_direction(btc_bias):
@@ -859,9 +1063,15 @@ def btc_is_strong(
 ):
 
     if direction == "LONG":
-        return btc_bias == "LONG_STRONG"
+        return (
+            btc_bias
+            == "LONG_STRONG"
+        )
 
-    return btc_bias == "SHORT_STRONG"
+    return (
+        btc_bias
+        == "SHORT_STRONG"
+    )
 
 
 def btc_is_aligned(
@@ -887,14 +1097,17 @@ def btc_allows_confirmed(
     if not REQUIRE_BTC_NOT_OPPOSITE:
         return True
 
-    direction_btc = btc_direction(
-        btc_bias
+    direction_btc = (
+        btc_direction(btc_bias)
     )
 
     if direction_btc == "NEUTRAL":
         return True
 
-    return direction_btc == direction
+    return (
+        direction_btc
+        == direction
+    )
 
 
 def btc_allows_aggressive(
@@ -925,6 +1138,9 @@ def btc_allows_aggressive(
 # ==========================================================
 
 def confirmation_grade(quality):
+
+    if quality >= 12:
+        return "MOLTO ALTO"
 
     if quality >= 10:
         return "ALTO"
@@ -958,7 +1174,38 @@ def log_no_confirm(
 
 
 # ==========================================================
-# V5.6 - CONTROLLO TENUTA BREAKOUT
+# SCORE VOLUME
+# ==========================================================
+
+def volume_score(
+    vol15,
+    vol1h
+):
+
+    score = 0
+
+    # 15m
+    if vol15 >= VOL15_SCORE_VERY_STRONG:
+        score += 3
+
+    elif vol15 >= VOL15_SCORE_STRONG:
+        score += 2
+
+    elif vol15 >= VOL15_SCORE_MEDIUM:
+        score += 1
+
+    # 1H
+    if vol1h >= VOL1H_SCORE_STRONG:
+        score += 2
+
+    elif vol1h >= VOL1H_SCORE_MEDIUM:
+        score += 1
+
+    return score
+
+
+# ==========================================================
+# HOLD V6 CORRETTO
 # ==========================================================
 
 def breakout_hold_check(
@@ -972,29 +1219,44 @@ def breakout_hold_check(
 
     now = time.time()
 
-    key = f"{symbol}:{direction}"
+    key = (
+        f"{symbol}:{direction}"
+    )
 
     tolerance = (
         atr15
         * BREAKOUT_RETEST_TOLERANCE_ATR15
     )
 
+    # ------------------------------------------------------
+    # Validità corrente
+    # ------------------------------------------------------
+
     if direction == "LONG":
 
-        invalidated = (
+        beyond_level = (
+            price >= level
+        )
+
+        deeply_invalidated = (
             price < level - tolerance
         )
 
     else:
 
-        invalidated = (
+        beyond_level = (
+            price <= level
+        )
+
+        deeply_invalidated = (
             price > level + tolerance
         )
 
-    # Se il breakout viene riassorbito oltre
-    # la tolleranza consentita, il candidato
-    # viene cancellato.
-    if invalidated:
+    # ------------------------------------------------------
+    # Breakout realmente riassorbito
+    # ------------------------------------------------------
+
+    if deeply_invalidated:
 
         if key in breakout_hold_state:
             del breakout_hold_state[key]
@@ -1002,31 +1264,54 @@ def breakout_hold_check(
         if DIAGNOSTIC_LOGS:
 
             print(
-                f"{symbol} HOLD {direction} ANNULLATO: "
-                "breakout riassorbito"
+                f"{symbol} HOLD {direction} "
+                "ANNULLATO: breakout riassorbito"
             )
 
         return False
 
-    state = breakout_hold_state.get(key)
+    state = (
+        breakout_hold_state.get(key)
+    )
 
-    # Primo rilevamento del candidato oppure
-    # nuova candela/livello di breakout.
-    if (
-        state is None
-        or state["candle_time"] != breakout_candle_time
-        or abs(
-            state["level"] - level
-        ) > max(
+    same_breakout = (
+        state is not None
+        and state["candle_time"]
+        == breakout_candle_time
+        and abs(
+            state["level"]
+            - level
+        )
+        <= max(
             atr15 * 0.02,
             1e-12
         )
-    ):
+    )
+
+    # ------------------------------------------------------
+    # Nuovo breakout:
+    # il timer parte soltanto se il prezzo è davvero
+    # dalla parte corretta del livello.
+    # ------------------------------------------------------
+
+    if not same_breakout:
+
+        if not beyond_level:
+
+            if DIAGNOSTIC_LOGS:
+
+                print(
+                    f"{symbol} HOLD {direction} "
+                    "NON AVVIATO: prezzo rientrato nel livello"
+                )
+
+            return False
 
         breakout_hold_state[key] = {
             "start": now,
             "level": level,
-            "candle_time": breakout_candle_time
+            "candle_time": breakout_candle_time,
+            "passed": False
         }
 
         if DIAGNOSTIC_LOGS:
@@ -1039,6 +1324,33 @@ def breakout_hold_check(
 
         return False
 
+    # ------------------------------------------------------
+    # Se questo stesso breakout ha già superato HOLD,
+    # non ripartiamo da zero ad ogni scansione.
+    # ------------------------------------------------------
+
+    if state.get("passed", False):
+
+        # Se resta entro tolleranza lo manteniamo valido.
+        # Ma per l'invio finale vogliamo comunque prezzo
+        # dalla parte corretta del livello.
+
+        if (
+            REQUIRE_PRICE_BEYOND_LEVEL_AFTER_HOLD
+            and not beyond_level
+        ):
+
+            if DIAGNOSTIC_LOGS:
+
+                print(
+                    f"{symbol} HOLD {direction} "
+                    "SUPERATO MA PREZZO NON OLTRE LIVELLO"
+                )
+
+            return False
+
+        return True
+
     elapsed = (
         now - state["start"]
     )
@@ -1049,7 +1361,8 @@ def breakout_hold_check(
 
             remaining = max(
                 0,
-                BREAKOUT_HOLD_SECONDS - elapsed
+                BREAKOUT_HOLD_SECONDS
+                - elapsed
             )
 
             print(
@@ -1059,8 +1372,26 @@ def breakout_hold_check(
 
         return False
 
-    # Breakout mantenuto per almeno 3 minuti.
-    del breakout_hold_state[key]
+    # ------------------------------------------------------
+    # Alla fine dei 3 minuti:
+    # deve essere ancora/nuovamente oltre il livello.
+    # ------------------------------------------------------
+
+    if (
+        REQUIRE_PRICE_BEYOND_LEVEL_AFTER_HOLD
+        and not beyond_level
+    ):
+
+        if DIAGNOSTIC_LOGS:
+
+            print(
+                f"{symbol} HOLD {direction} "
+                "NON CONFERMATO: prezzo dentro struttura"
+            )
+
+        return False
+
+    state["passed"] = True
 
     if DIAGNOSTIC_LOGS:
 
@@ -1069,6 +1400,164 @@ def breakout_hold_check(
         )
 
     return True
+
+
+# ==========================================================
+# STOP LOSS INTELLIGENTE
+# ==========================================================
+
+def intelligent_stop(
+    direction,
+    entry,
+    level,
+    breakout_candle,
+    atr15
+):
+
+    if atr15 <= 0:
+        return None
+
+    min_distance = (
+        atr15
+        * SL_MIN_DISTANCE_ATR15
+    )
+
+    max_distance = (
+        atr15
+        * SL_MAX_DISTANCE_ATR15
+    )
+
+    buffer_value = (
+        atr15
+        * SL_STRUCTURE_BUFFER_ATR15
+    )
+
+    if direction == "LONG":
+
+        # Stop tecnico sotto:
+        # - minimo candela breakout
+        # - livello rotto con buffer
+        technical_stop = min(
+            breakout_candle["l"],
+            level - buffer_value
+        )
+
+        distance = (
+            entry - technical_stop
+        )
+
+        # Mai troppo stretto.
+        distance = max(
+            distance,
+            min_distance
+        )
+
+        # Mai eccessivamente largo.
+        distance = min(
+            distance,
+            max_distance
+        )
+
+        stop = (
+            entry - distance
+        )
+
+        if stop >= entry:
+            return None
+
+        return stop
+
+    technical_stop = max(
+        breakout_candle["h"],
+        level + buffer_value
+    )
+
+    distance = (
+        technical_stop
+        - entry
+    )
+
+    distance = max(
+        distance,
+        min_distance
+    )
+
+    distance = min(
+        distance,
+        max_distance
+    )
+
+    stop = (
+        entry + distance
+    )
+
+    if stop <= entry:
+        return None
+
+    return stop
+
+
+# ==========================================================
+# TARGET INTELLIGENTI
+# ==========================================================
+
+def intelligent_targets(
+    direction,
+    entry,
+    stop,
+    quality,
+    aggressive_ok
+):
+
+    risk = abs(
+        entry - stop
+    )
+
+    if risk <= 0:
+        return None
+
+    # Setup aggressivo molto forte.
+    if (
+        aggressive_ok
+        and quality >= AGGRESSIVE_SCORE_MIN
+    ):
+
+        r1 = TP1_R_AGGRESSIVE
+        r2 = TP2_R_AGGRESSIVE
+        r3 = TP3_R_AGGRESSIVE
+
+    # Setup normale di qualità elevata.
+    elif quality >= 10:
+
+        r1 = TP1_R_HIGH
+        r2 = TP2_R_HIGH
+        r3 = TP3_R_HIGH
+
+    else:
+
+        r1 = TP1_R_BASE
+        r2 = TP2_R_BASE
+        r3 = TP3_R_BASE
+
+    if direction == "LONG":
+
+        return (
+            entry + risk * r1,
+            entry + risk * r2,
+            entry + risk * r3,
+            r1,
+            r2,
+            r3
+        )
+
+    return (
+        entry - risk * r1,
+        entry - risk * r2,
+        entry - risk * r3,
+        r1,
+        r2,
+        r3
+    )
 
 
 # ==========================================================
@@ -1101,10 +1590,25 @@ def analyze_symbol(
         for c in c4h[:-1]
     ]
 
-    e20_1h = ema(closes1h, 20)
-    e50_1h = ema(closes1h, 50)
-    e20_4h = ema(closes4h, 20)
-    e50_4h = ema(closes4h, 50)
+    e20_1h = ema(
+        closes1h,
+        20
+    )
+
+    e50_1h = ema(
+        closes1h,
+        50
+    )
+
+    e20_4h = ema(
+        closes4h,
+        20
+    )
+
+    e50_4h = ema(
+        closes4h,
+        50
+    )
 
     atr15 = atr(
         c15[:-1],
@@ -1142,9 +1646,21 @@ def analyze_symbol(
         for c in structure
     )
 
-    price = live15["c"]
-    closed_price15 = last15["c"]
-    price1h = last1h["c"]
+    price = (
+        live15["c"]
+    )
+
+    closed_price15 = (
+        last15["c"]
+    )
+
+    price1h = (
+        last1h["c"]
+    )
+
+    # ------------------------------------------------------
+    # TREND
+    # ------------------------------------------------------
 
     trend1h_long = (
         price1h > e20_1h
@@ -1175,11 +1691,16 @@ def analyze_symbol(
     )
 
     # ------------------------------------------------------
-    # VOLUME / VOLATILITA
+    # VOLUME / VOLATILITÀ
     # ------------------------------------------------------
 
-    vol15 = volume_ratio_closed(c15)
-    vol1h = volume_ratio_closed(c1h)
+    vol15 = (
+        volume_ratio_closed(c15)
+    )
+
+    vol1h = (
+        volume_ratio_closed(c1h)
+    )
 
     atr_pct = (
         atr1h
@@ -1194,7 +1715,7 @@ def analyze_symbol(
     )
 
     # ------------------------------------------------------
-    # STRUTTURA EARLY
+    # EARLY / PRE
     # ------------------------------------------------------
 
     distance_long = (
@@ -1221,7 +1742,8 @@ def analyze_symbol(
         price > resistance
         and price <= (
             resistance
-            + atr15 * MAX_EXTENSION_ATR15
+            + atr15
+            * MAX_EXTENSION_ATR15
         )
     )
 
@@ -1229,16 +1751,19 @@ def analyze_symbol(
         price < support
         and price >= (
             support
-            - atr15 * MAX_EXTENSION_ATR15
+            - atr15
+            * MAX_EXTENSION_ATR15
         )
     )
 
     bullish15 = (
-        last15["c"] > last15["o"]
+        last15["c"]
+        > last15["o"]
     )
 
     bearish15 = (
-        last15["c"] < last15["o"]
+        last15["c"]
+        < last15["o"]
     )
 
     pre_long = (
@@ -1262,15 +1787,17 @@ def analyze_symbol(
     )
 
     # ------------------------------------------------------
-    # BREAKOUT
+    # BREAKOUT CHIUSO
     # ------------------------------------------------------
 
     breakout_long = (
-        closed_price15 > resistance
+        closed_price15
+        > resistance
     )
 
     breakout_short = (
-        closed_price15 < support
+        closed_price15
+        < support
     )
 
     body15 = abs(
@@ -1281,27 +1808,35 @@ def analyze_symbol(
     body_atr = (
         body15 / atr15
         if atr15 > 0
-        else 0
+        else 0.0
     )
 
-    strong15_long = candle_strength(
-        last15,
-        "LONG"
+    strong15_long = (
+        candle_strength(
+            last15,
+            "LONG"
+        )
     )
 
-    strong15_short = candle_strength(
-        last15,
-        "SHORT"
+    strong15_short = (
+        candle_strength(
+            last15,
+            "SHORT"
+        )
     )
 
-    reversing_long = live_reversal(
-        live15,
-        "LONG"
+    reversing_long = (
+        live_reversal(
+            live15,
+            "LONG"
+        )
     )
 
-    reversing_short = live_reversal(
-        live15,
-        "SHORT"
+    reversing_short = (
+        live_reversal(
+            live15,
+            "SHORT"
+        )
     )
 
     extension_long = (
@@ -1314,49 +1849,55 @@ def analyze_symbol(
 
     not_extended_long = (
         extension_long
-        <= atr15 * MAX_EXTENSION_ATR15
+        <= atr15
+        * MAX_EXTENSION_ATR15
     )
 
     not_extended_short = (
         extension_short
-        <= atr15 * MAX_EXTENSION_ATR15
+        <= atr15
+        * MAX_EXTENSION_ATR15
     )
 
-    # ======================================================
-    # V5.6 - FOLLOW THROUGH DEL BREAKOUT
-    # ======================================================
+    # ------------------------------------------------------
+    # FOLLOW THROUGH
+    # ------------------------------------------------------
 
     breakout_depth_long = (
-        closed_price15 - resistance
+        closed_price15
+        - resistance
     )
 
     breakout_depth_short = (
-        support - closed_price15
+        support
+        - closed_price15
     )
 
     follow_through_long = (
         bullish15
         and breakout_depth_long
-        >= atr15 * FOLLOW_THROUGH_MIN_ATR15
+        >= atr15
+        * FOLLOW_THROUGH_MIN_ATR15
     )
 
     follow_through_short = (
         bearish15
         and breakout_depth_short
-        >= atr15 * FOLLOW_THROUGH_MIN_ATR15
+        >= atr15
+        * FOLLOW_THROUGH_MIN_ATR15
     )
 
-    # ======================================================
-    # CANDIDATI V5.6
-    # ======================================================
+    # ------------------------------------------------------
+    # REQUISITI STRUTTURALI
+    # ------------------------------------------------------
 
     candidate_long = (
         breakout_long
         and follow_through_long
         and trend1h_long
-        and vol15 >= CONFIRM_VOL_15M_MIN
-        and vol1h >= CONFIRM_VOL_1H_MIN
-        and body_atr >= CONFIRM_BODY_ATR_MIN
+        and vol15 >= CONFIRM_VOL_15M_FLOOR
+        and vol1h >= CONFIRM_VOL_1H_FLOOR
+        and body_atr >= CONFIRM_BODY_ATR_FLOOR
         and volatility_ok
         and not reversing_long
         and not_extended_long
@@ -1366,9 +1907,9 @@ def analyze_symbol(
         breakout_short
         and follow_through_short
         and trend1h_short
-        and vol15 >= CONFIRM_VOL_15M_MIN
-        and vol1h >= CONFIRM_VOL_1H_MIN
-        and body_atr >= CONFIRM_BODY_ATR_MIN
+        and vol15 >= CONFIRM_VOL_15M_FLOOR
+        and vol1h >= CONFIRM_VOL_1H_FLOOR
+        and body_atr >= CONFIRM_BODY_ATR_FLOOR
         and volatility_ok
         and not reversing_short
         and not_extended_short
@@ -1385,10 +1926,13 @@ def analyze_symbol(
     )
 
     # ------------------------------------------------------
-    # DIAGNOSTICA LONG
+    # DIAGNOSTICA BASE
     # ------------------------------------------------------
 
-    if attempt_long and not candidate_long:
+    if (
+        attempt_long
+        and not candidate_long
+    ):
 
         reasons = []
 
@@ -1411,7 +1955,7 @@ def analyze_symbol(
             and not follow_through_long
         ):
             reasons.append(
-                f"follow-through insufficiente "
+                f"follow-through "
                 f"{breakout_depth_long / atr15:.2f} ATR"
             )
 
@@ -1420,17 +1964,18 @@ def analyze_symbol(
                 "trend1H non LONG"
             )
 
-        if vol15 < CONFIRM_VOL_15M_MIN:
+        if vol15 < CONFIRM_VOL_15M_FLOOR:
             reasons.append(
-                f"volume15 {vol15:.2f}x"
+                f"volume15 {vol15:.2f}x "
+                f"< floor {CONFIRM_VOL_15M_FLOOR:.2f}x"
             )
 
-        if vol1h < CONFIRM_VOL_1H_MIN:
+        if vol1h < CONFIRM_VOL_1H_FLOOR:
             reasons.append(
                 f"volume1H {vol1h:.2f}x"
             )
 
-        if body_atr < CONFIRM_BODY_ATR_MIN:
+        if body_atr < CONFIRM_BODY_ATR_FLOOR:
             reasons.append(
                 f"body/ATR {body_atr:.2f}"
             )
@@ -1456,11 +2001,10 @@ def analyze_symbol(
             reasons
         )
 
-    # ------------------------------------------------------
-    # DIAGNOSTICA SHORT
-    # ------------------------------------------------------
-
-    if attempt_short and not candidate_short:
+    if (
+        attempt_short
+        and not candidate_short
+    ):
 
         reasons = []
 
@@ -1483,7 +2027,7 @@ def analyze_symbol(
             and not follow_through_short
         ):
             reasons.append(
-                f"follow-through insufficiente "
+                f"follow-through "
                 f"{breakout_depth_short / atr15:.2f} ATR"
             )
 
@@ -1492,17 +2036,18 @@ def analyze_symbol(
                 "trend1H non SHORT"
             )
 
-        if vol15 < CONFIRM_VOL_15M_MIN:
+        if vol15 < CONFIRM_VOL_15M_FLOOR:
             reasons.append(
-                f"volume15 {vol15:.2f}x"
+                f"volume15 {vol15:.2f}x "
+                f"< floor {CONFIRM_VOL_15M_FLOOR:.2f}x"
             )
 
-        if vol1h < CONFIRM_VOL_1H_MIN:
+        if vol1h < CONFIRM_VOL_1H_FLOOR:
             reasons.append(
                 f"volume1H {vol1h:.2f}x"
             )
 
-        if body_atr < CONFIRM_BODY_ATR_MIN:
+        if body_atr < CONFIRM_BODY_ATR_FLOOR:
             reasons.append(
                 f"body/ATR {body_atr:.2f}"
             )
@@ -1566,11 +2111,13 @@ def analyze_symbol(
                 early_break_long
             )
 
-            leverage = calculate_leverage(
-                price,
-                invalidation,
-                quality,
-                False
+            leverage = (
+                calculate_leverage(
+                    price,
+                    invalidation,
+                    quality,
+                    False
+                )
             )
 
             return {
@@ -1616,11 +2163,13 @@ def analyze_symbol(
                 early_break_short
             )
 
-            leverage = calculate_leverage(
-                price,
-                invalidation,
-                quality,
-                False
+            leverage = (
+                calculate_leverage(
+                    price,
+                    invalidation,
+                    quality,
+                    False
+                )
             )
 
             return {
@@ -1640,7 +2189,7 @@ def analyze_symbol(
         return None
 
     # ======================================================
-    # V5.6 - ANTI FALSE BREAKOUT / HOLD 3 MINUTI
+    # HOLD 3 MINUTI
     # ======================================================
 
     if candidate_long:
@@ -1657,7 +2206,7 @@ def analyze_symbol(
         if not hold_ok:
             return None
 
-    elif candidate_short:
+    else:
 
         hold_ok = breakout_hold_check(
             symbol=symbol,
@@ -1672,51 +2221,37 @@ def analyze_symbol(
             return None
 
     # ======================================================
-    # FILTRO BTC
+    # BTC
     # ======================================================
 
-    if candidate_long:
+    direction = (
+        "LONG"
+        if candidate_long
+        else "SHORT"
+    )
 
-        if not btc_allows_confirmed(
+    if not btc_allows_confirmed(
+        symbol,
+        direction,
+        btc_bias
+    ):
+
+        log_no_confirm(
             symbol,
-            "LONG",
-            btc_bias
-        ):
+            direction,
+            [
+                f"BTC contrario ({btc_bias})"
+            ]
+        )
 
-            log_no_confirm(
-                symbol,
-                "LONG",
-                [
-                    f"BTC contrario ({btc_bias})"
-                ]
-            )
-
-            return None
-
-    if candidate_short:
-
-        if not btc_allows_confirmed(
-            symbol,
-            "SHORT",
-            btc_bias
-        ):
-
-            log_no_confirm(
-                symbol,
-                "SHORT",
-                [
-                    f"BTC contrario ({btc_bias})"
-                ]
-            )
-
-            return None
+        return None
 
     # ======================================================
     # DERIVATI
     # ======================================================
 
-    oi_change, funding = get_derivatives(
-        symbol
+    oi_change, funding = (
+        get_derivatives(symbol)
     )
 
     if (
@@ -1736,12 +2271,6 @@ def analyze_symbol(
                 "funding non disponibile"
             )
 
-        direction = (
-            "LONG"
-            if candidate_long
-            else "SHORT"
-        )
-
         log_no_confirm(
             symbol,
             direction,
@@ -1750,24 +2279,52 @@ def analyze_symbol(
 
         return None
 
-    if oi_change < OI_CONFIRM_MIN:
-
-        direction = (
-            "LONG"
-            if candidate_long
-            else "SHORT"
-        )
+    # OI molto negativo = blocco.
+    if oi_change < OI_HARD_FLOOR:
 
         log_no_confirm(
             symbol,
             direction,
             [
-                f"OI {oi_change:+.2f}% "
-                f"< {OI_CONFIRM_MIN:+.2f}%"
+                f"OI troppo debole "
+                f"{oi_change:+.2f}%"
             ]
         )
 
         return None
+
+    # ------------------------------------------------------
+    # FUNDING HARD BLOCK
+    # ------------------------------------------------------
+
+    if direction == "LONG":
+
+        funding_ok = (
+            funding <= FUNDING_BLOCK
+        )
+
+    else:
+
+        funding_ok = (
+            funding >= -FUNDING_BLOCK
+        )
+
+    if not funding_ok:
+
+        log_no_confirm(
+            symbol,
+            direction,
+            [
+                f"funding estremo "
+                f"{funding * 100:+.4f}%"
+            ]
+        )
+
+        return None
+
+    # ======================================================
+    # LIQUIDAZIONI
+    # ======================================================
 
     long_liq, short_liq = (
         liquidation_metrics(symbol)
@@ -1779,58 +2336,12 @@ def analyze_symbol(
         > 0
     )
 
-    # ======================================================
-    # LONG
-    # ======================================================
-
-    if candidate_long:
-
-        direction = "LONG"
-        level = resistance
-
-        funding_ok = (
-            funding <= FUNDING_BLOCK
-        )
-
-        funding_aggressive = (
-            funding <= FUNDING_AGGRESSIVE
-        )
-
-        oi_positive = (
-            oi_change >= 0.0
-        )
-
-        oi_aggressive = (
-            oi_change >= OI_AGGRESSIVE_MIN
-        )
-
-        btc_aligned = (
-            symbol == "BTCUSDT"
-            or btc_is_aligned(
-                btc_bias,
-                "LONG"
-            )
-        )
-
-        btc_strong = (
-            symbol == "BTCUSDT"
-            or btc_is_strong(
-                btc_bias,
-                "LONG"
-            )
-        )
-
-        btc_aggressive_ok = (
-            btc_allows_aggressive(
-                symbol,
-                "LONG",
-                btc_bias
-            )
-        )
+    if direction == "LONG":
 
         liq_support = (
             liq_available
-            and short_liq >= max(
+            and short_liq
+            >= max(
                 long_liq * 1.25,
                 10000
             )
@@ -1838,157 +2349,19 @@ def analyze_symbol(
 
         severe_liq_against = (
             liq_available
-            and long_liq >= max(
+            and long_liq
+            >= max(
                 short_liq * 3.0,
                 50000
             )
         )
 
-        if not funding_ok:
-
-            log_no_confirm(
-                symbol,
-                "LONG",
-                [
-                    f"funding troppo alto "
-                    f"{funding * 100:+.4f}%"
-                ]
-            )
-
-            return None
-
-        if severe_liq_against:
-
-            log_no_confirm(
-                symbol,
-                "LONG",
-                [
-                    "liquidazioni fortemente contrarie"
-                ]
-            )
-
-            return None
-
-        entry = price
-
-        stop = min(
-            last15["l"],
-            resistance
-            - atr15 * 0.35
-        )
-
-        stop -= atr15 * 0.10
-
-        if stop >= entry:
-
-            log_no_confirm(
-                symbol,
-                "LONG",
-                ["stop non valido"]
-            )
-
-            return None
-
-        risk = entry - stop
-
-        quality = 7
-
-        quality += int(
-            strong_trend1h_long
-        )
-
-        quality += int(
-            trend4h_long
-        )
-
-        quality += int(
-            oi_positive
-        )
-
-        quality += int(
-            funding_aggressive
-        )
-
-        quality += int(
-            btc_aligned
-        )
-
-        quality += int(
-            btc_strong
-        )
-
-        quality += int(
-            liq_support
-        )
-
-        quality += int(
-            strong15_long
-        )
-
-        aggressive_ok = (
-            vol15 >= AGGRESSIVE_VOL_15M_MIN
-            and vol1h >= AGGRESSIVE_VOL_1H_MIN
-            and oi_aggressive
-            and funding_aggressive
-            and atr_pct <= ATR_AGGRESSIVE_MAX_PCT
-            and strong15_long
-            and not reversing_long
-            and not severe_liq_against
-            and btc_aggressive_ok
-        )
-
-    # ======================================================
-    # SHORT
-    # ======================================================
-
     else:
-
-        direction = "SHORT"
-        level = support
-
-        funding_ok = (
-            funding >= -FUNDING_BLOCK
-        )
-
-        funding_aggressive = (
-            funding >= -FUNDING_AGGRESSIVE
-        )
-
-        oi_positive = (
-            oi_change >= 0.0
-        )
-
-        oi_aggressive = (
-            oi_change >= OI_AGGRESSIVE_MIN
-        )
-
-        btc_aligned = (
-            symbol == "BTCUSDT"
-            or btc_is_aligned(
-                btc_bias,
-                "SHORT"
-            )
-        )
-
-        btc_strong = (
-            symbol == "BTCUSDT"
-            or btc_is_strong(
-                btc_bias,
-                "SHORT"
-            )
-        )
-
-        btc_aggressive_ok = (
-            btc_allows_aggressive(
-                symbol,
-                "SHORT",
-                btc_bias
-            )
-        )
 
         liq_support = (
             liq_available
-            and long_liq >= max(
+            and long_liq
+            >= max(
                 short_liq * 1.25,
                 10000
             )
@@ -1996,181 +2369,412 @@ def analyze_symbol(
 
         severe_liq_against = (
             liq_available
-            and short_liq >= max(
+            and short_liq
+            >= max(
                 long_liq * 3.0,
                 50000
             )
         )
 
-        if not funding_ok:
+    if severe_liq_against:
 
-            log_no_confirm(
-                symbol,
-                "SHORT",
-                [
-                    f"funding troppo basso "
-                    f"{funding * 100:+.4f}%"
-                ]
-            )
-
-            return None
-
-        if severe_liq_against:
-
-            log_no_confirm(
-                symbol,
-                "SHORT",
-                [
-                    "liquidazioni fortemente contrarie"
-                ]
-            )
-
-            return None
-
-        entry = price
-
-        stop = max(
-            last15["h"],
-            support
-            + atr15 * 0.35
+        log_no_confirm(
+            symbol,
+            direction,
+            [
+                "liquidazioni fortemente contrarie"
+            ]
         )
 
-        stop += atr15 * 0.10
-
-        if stop <= entry:
-
-            log_no_confirm(
-                symbol,
-                "SHORT",
-                ["stop non valido"]
-            )
-
-            return None
-
-        risk = stop - entry
-
-        quality = 7
-
-        quality += int(
-            strong_trend1h_short
-        )
-
-        quality += int(
-            trend4h_short
-        )
-
-        quality += int(
-            oi_positive
-        )
-
-        quality += int(
-            funding_aggressive
-        )
-
-        quality += int(
-            btc_aligned
-        )
-
-        quality += int(
-            btc_strong
-        )
-
-        quality += int(
-            liq_support
-        )
-
-        quality += int(
-            strong15_short
-        )
-
-        aggressive_ok = (
-            vol15 >= AGGRESSIVE_VOL_15M_MIN
-            and vol1h >= AGGRESSIVE_VOL_1H_MIN
-            and oi_aggressive
-            and funding_aggressive
-            and atr_pct <= ATR_AGGRESSIVE_MAX_PCT
-            and strong15_short
-            and not reversing_short
-            and not severe_liq_against
-            and btc_aggressive_ok
-        )
+        return None
 
     # ======================================================
-    # ENTRY / LEVA / TARGET
+    # SCORE V6
     # ======================================================
 
-    entry_low = (
-        entry
-        - atr15 * 0.10
+    score = 0
+
+    score_breakdown = []
+
+    # ------------------------------------------------------
+    # 1) Volume
+    # ------------------------------------------------------
+
+    vol_score = (
+        volume_score(
+            vol15,
+            vol1h
+        )
     )
 
-    entry_high = (
-        entry
-        + atr15 * 0.10
-    )
+    score += vol_score
 
-    leverage = calculate_leverage(
-        entry,
-        stop,
-        quality,
-        aggressive_ok
-    )
-
-    if direction == "LONG":
-
-        tp1 = (
-            entry + risk * TP1_R
+    if vol_score > 0:
+        score_breakdown.append(
+            f"VOL +{vol_score}"
         )
 
-        tp2 = (
-            entry + risk * TP2_R
-        )
+    # ------------------------------------------------------
+    # 2) Trend 1H forte
+    # ------------------------------------------------------
 
-        tp3 = (
-            entry + risk * TP3_R
+    strong_trend = (
+        strong_trend1h_long
+        if direction == "LONG"
+        else strong_trend1h_short
+    )
+
+    if strong_trend:
+
+        score += 2
+
+        score_breakdown.append(
+            "TREND1H +2"
         )
 
     else:
 
-        tp1 = (
-            entry - risk * TP1_R
+        # Il trend 1H base è già obbligatorio.
+        score += 1
+
+        score_breakdown.append(
+            "TREND1H +1"
         )
 
-        tp2 = (
-            entry - risk * TP2_R
+    # ------------------------------------------------------
+    # 3) Trend 4H
+    # ------------------------------------------------------
+
+    trend4h_aligned = (
+        trend4h_long
+        if direction == "LONG"
+        else trend4h_short
+    )
+
+    if trend4h_aligned:
+
+        score += 1
+
+        score_breakdown.append(
+            "4H +1"
         )
 
-        tp3 = (
-            entry - risk * TP3_R
+    # ------------------------------------------------------
+    # 4) OI
+    # ------------------------------------------------------
+
+    if oi_change >= OI_SCORE_STRONG:
+
+        score += 2
+
+        score_breakdown.append(
+            "OI +2"
         )
+
+    elif oi_change >= OI_SCORE_POSITIVE:
+
+        score += 1
+
+        score_breakdown.append(
+            "OI +1"
+        )
+
+    # ------------------------------------------------------
+    # 5) Funding
+    # ------------------------------------------------------
+
+    if direction == "LONG":
+
+        funding_good = (
+            funding
+            <= FUNDING_GOOD
+        )
+
+    else:
+
+        funding_good = (
+            funding
+            >= -FUNDING_GOOD
+        )
+
+    if funding_good:
+
+        score += 1
+
+        score_breakdown.append(
+            "FUNDING +1"
+        )
+
+    # ------------------------------------------------------
+    # 6) BTC
+    # ------------------------------------------------------
+
+    btc_aligned = (
+        symbol == "BTCUSDT"
+        or btc_is_aligned(
+            btc_bias,
+            direction
+        )
+    )
+
+    btc_strong = (
+        symbol == "BTCUSDT"
+        or btc_is_strong(
+            btc_bias,
+            direction
+        )
+    )
+
+    if btc_strong:
+
+        score += 2
+
+        score_breakdown.append(
+            "BTC +2"
+        )
+
+    elif btc_aligned:
+
+        score += 1
+
+        score_breakdown.append(
+            "BTC +1"
+        )
+
+    # ------------------------------------------------------
+    # 7) Candela breakout
+    # ------------------------------------------------------
+
+    strong15 = (
+        strong15_long
+        if direction == "LONG"
+        else strong15_short
+    )
+
+    if strong15:
+
+        score += 1
+
+        score_breakdown.append(
+            "CANDLE +1"
+        )
+
+    # ------------------------------------------------------
+    # 8) Follow-through extra
+    # ------------------------------------------------------
+
+    follow_atr = (
+        breakout_depth_long / atr15
+        if direction == "LONG"
+        else breakout_depth_short / atr15
+    )
+
+    if follow_atr >= 0.15:
+
+        score += 1
+
+        score_breakdown.append(
+            "FOLLOW +1"
+        )
+
+    # ------------------------------------------------------
+    # 9) Liquidazioni
+    # ------------------------------------------------------
+
+    if liq_support:
+
+        score += 1
+
+        score_breakdown.append(
+            "LIQ +1"
+        )
+
+    # ------------------------------------------------------
+    # SCORE MINIMO
+    # ------------------------------------------------------
+
+    if score < CONFIRM_SCORE_MIN:
+
+        log_no_confirm(
+            symbol,
+            direction,
+            [
+                f"score {score}/"
+                f"{CONFIRM_SCORE_MIN}",
+                " | ".join(
+                    score_breakdown
+                )
+            ]
+        )
+
+        return None
+
+    # ======================================================
+    # AGGRESSIVO
+    # ======================================================
+
+    btc_aggressive_ok = (
+        btc_allows_aggressive(
+            symbol,
+            direction,
+            btc_bias
+        )
+    )
+
+    funding_aggressive = (
+        funding <= FUNDING_AGGRESSIVE
+        if direction == "LONG"
+        else funding >= -FUNDING_AGGRESSIVE
+    )
+
+    oi_aggressive = (
+        oi_change
+        >= OI_AGGRESSIVE_MIN
+    )
+
+    aggressive_ok = (
+        score >= AGGRESSIVE_SCORE_MIN
+        and vol15 >= AGGRESSIVE_VOL_15M_MIN
+        and vol1h >= AGGRESSIVE_VOL_1H_MIN
+        and oi_aggressive
+        and funding_aggressive
+        and atr_pct <= ATR_AGGRESSIVE_MAX_PCT
+        and strong15
+        and btc_aggressive_ok
+        and not severe_liq_against
+    )
+
+    # ======================================================
+    # STOP LOSS INTELLIGENTE
+    # ======================================================
+
+    level = (
+        resistance
+        if direction == "LONG"
+        else support
+    )
+
+    entry = price
+
+    stop = intelligent_stop(
+        direction=direction,
+        entry=entry,
+        level=level,
+        breakout_candle=last15,
+        atr15=atr15
+    )
+
+    if stop is None:
+
+        log_no_confirm(
+            symbol,
+            direction,
+            [
+                "stop intelligente non valido"
+            ]
+        )
+
+        return None
+
+    risk = abs(
+        entry - stop
+    )
+
+    if risk <= 0:
+        return None
+
+    # ======================================================
+    # LEVA
+    # ======================================================
+
+    leverage = (
+        calculate_leverage(
+            entry,
+            stop,
+            score,
+            aggressive_ok
+        )
+    )
+
+    # ======================================================
+    # TARGET INTELLIGENTI
+    # ======================================================
+
+    target_data = (
+        intelligent_targets(
+            direction=direction,
+            entry=entry,
+            stop=stop,
+            quality=score,
+            aggressive_ok=aggressive_ok
+        )
+    )
+
+    if target_data is None:
+        return None
+
+    (
+        tp1,
+        tp2,
+        tp3,
+        tp1_r,
+        tp2_r,
+        tp3_r
+    ) = target_data
+
+    # Entry range proporzionato all'ATR15.
+    entry_low = (
+        entry
+        - atr15 * 0.08
+    )
+
+    entry_high = (
+        entry
+        + atr15 * 0.08
+    )
 
     return {
         "type": "CONFIRMED",
         "direction": direction,
+
         "price": entry,
+
         "entry_low": entry_low,
         "entry_high": entry_high,
+
         "sl": stop,
+
         "tp1": tp1,
         "tp2": tp2,
         "tp3": tp3,
+
+        "tp1_r": tp1_r,
+        "tp2_r": tp2_r,
+        "tp3_r": tp3_r,
+
         "level": level,
+
         "volume1h": vol1h,
         "volume15": vol15,
+
         "atr_pct": atr_pct,
-        "quality": quality,
+
+        "quality": score,
+        "score_breakdown": score_breakdown,
+
         "leverage": leverage,
+
         "oi": oi_change,
         "funding": funding,
+
         "btc": btc_bias,
+
         "long_liq": long_liq,
         "short_liq": short_liq,
         "liq_available": liq_available,
-        "follow_through_atr": (
-            breakout_depth_long / atr15
-            if direction == "LONG"
-            else breakout_depth_short / atr15
-        ),
+
+        "follow_through_atr": follow_atr,
+
         "aggressive": (
             leverage >= 20
             and aggressive_ok
@@ -2182,15 +2786,22 @@ def analyze_symbol(
 # MESSAGGIO
 # ==========================================================
 
-def build_message(symbol, signal):
+def build_message(
+    symbol,
+    signal
+):
 
-    pair = symbol.replace(
-        "USDT",
-        "/USDT"
+    pair = (
+        symbol.replace(
+            "USDT",
+            "/USDT"
+        )
     )
 
-    grade = confirmation_grade(
-        signal["quality"]
+    grade = (
+        confirmation_grade(
+            signal["quality"]
+        )
     )
 
     if signal["type"] == "PRE":
@@ -2204,16 +2815,34 @@ def build_message(symbol, signal):
         return (
             "🟠 PRE-SEGNALE\n"
             f"{pair} — {signal['direction']}\n\n"
-            f"Livello chiave: {fmt_price(signal['level'])}\n"
-            f"Prezzo attuale: {fmt_price(signal['price'])}\n"
+
+            f"Livello chiave: "
+            f"{fmt_price(signal['level'])}\n"
+
+            f"Prezzo attuale: "
+            f"{fmt_price(signal['price'])}\n"
+
             f"Setup: {setup}\n"
+
             "Possibile ENTRY: solo dopo conferma\n"
-            f"Invalidazione: {fmt_price(signal['invalidation'])}\n"
-            f"Volume 15m: {signal['volume15']:.2f}x media\n"
-            f"Volume 1H: {signal['volume1h']:.2f}x media\n"
-            f"ATR 1H: {signal['atr_pct']:.2f}%\n"
-            f"Leva potenziale: {signal['leverage']}x\n"
+
+            f"Invalidazione: "
+            f"{fmt_price(signal['invalidation'])}\n"
+
+            f"Volume 15m: "
+            f"{signal['volume15']:.2f}x media\n"
+
+            f"Volume 1H: "
+            f"{signal['volume1h']:.2f}x media\n"
+
+            f"ATR 1H: "
+            f"{signal['atr_pct']:.2f}%\n"
+
+            f"Leva potenziale: "
+            f"{signal['leverage']}x\n"
+
             "Timeframe: 15m / 1H\n"
+
             f"Grado conferma: {grade}"
         )
 
@@ -2224,25 +2853,38 @@ def build_message(symbol, signal):
     )
 
     funding_pct = (
-        signal["funding"] * 100
+        signal["funding"]
+        * 100
     )
 
     if signal["direction"] == "LONG":
 
-        favorable_liq = signal["short_liq"]
-        adverse_liq = signal["long_liq"]
+        favorable_liq = (
+            signal["short_liq"]
+        )
+
+        adverse_liq = (
+            signal["long_liq"]
+        )
 
     else:
 
-        favorable_liq = signal["long_liq"]
-        adverse_liq = signal["short_liq"]
+        favorable_liq = (
+            signal["long_liq"]
+        )
+
+        adverse_liq = (
+            signal["short_liq"]
+        )
 
     if signal["liq_available"]:
 
         liq_text = (
-            f"Favorevoli {fmt_money(favorable_liq)}"
+            f"Favorevoli "
+            f"{fmt_money(favorable_liq)}"
             " | "
-            f"Contrarie {fmt_money(adverse_liq)}"
+            f"Contrarie "
+            f"{fmt_money(adverse_liq)}"
         )
 
     else:
@@ -2252,30 +2894,79 @@ def build_message(symbol, signal):
             "nessun evento recente"
         )
 
+    score_text = (
+        " | ".join(
+            signal["score_breakdown"]
+        )
+    )
+
     return (
         f"{title}\n"
         f"{pair} — {signal['direction']}\n\n"
-        f"ENTRY: {fmt_price(signal['entry_low'])}"
+
+        f"ENTRY: "
+        f"{fmt_price(signal['entry_low'])}"
         " - "
         f"{fmt_price(signal['entry_high'])}\n"
-        f"SL: {fmt_price(signal['sl'])}\n"
-        f"TP1: {fmt_price(signal['tp1'])}\n"
-        f"TP2: {fmt_price(signal['tp2'])}\n"
-        f"TP3: {fmt_price(signal['tp3'])}\n"
-        f"Leva indicativa: {signal['leverage']}x\n\n"
-        f"Volume 15m: {signal['volume15']:.2f}x media\n"
-        f"Volume 1H: {signal['volume1h']:.2f}x media\n"
-        f"Open Interest 15m: {signal['oi']:+.2f}%\n"
-        f"Funding: {funding_pct:+.4f}%\n"
-        f"ATR 1H: {signal['atr_pct']:.2f}%\n"
-        f"Follow-through: {signal['follow_through_atr']:.2f} ATR15\n"
-        f"Filtro BTC: {signal['btc']}\n"
-        f"Liquidazioni 15m: {liq_text}\n"
-        f"Grado conferma: {grade}\n"
+
+        f"SL intelligente: "
+        f"{fmt_price(signal['sl'])}\n"
+
+        f"TP1: "
+        f"{fmt_price(signal['tp1'])} "
+        f"({signal['tp1_r']:.2f}R)\n"
+
+        f"TP2: "
+        f"{fmt_price(signal['tp2'])} "
+        f"({signal['tp2_r']:.2f}R)\n"
+
+        f"TP3: "
+        f"{fmt_price(signal['tp3'])} "
+        f"({signal['tp3_r']:.2f}R)\n"
+
+        f"Leva indicativa: "
+        f"{signal['leverage']}x\n\n"
+
+        f"Volume 15m: "
+        f"{signal['volume15']:.2f}x media\n"
+
+        f"Volume 1H: "
+        f"{signal['volume1h']:.2f}x media\n"
+
+        f"Open Interest 15m: "
+        f"{signal['oi']:+.2f}%\n"
+
+        f"Funding: "
+        f"{funding_pct:+.4f}%\n"
+
+        f"ATR 1H: "
+        f"{signal['atr_pct']:.2f}%\n"
+
+        f"Follow-through: "
+        f"{signal['follow_through_atr']:.2f} ATR15\n"
+
+        f"BTC: "
+        f"{signal['btc']}\n"
+
+        f"Liquidazioni 15m: "
+        f"{liq_text}\n"
+
+        f"Score V6: "
+        f"{signal['quality']}\n"
+
+        f"Componenti: "
+        f"{score_text}\n"
+
+        f"Grado conferma: "
+        f"{grade}\n"
+
+        "HOLD breakout: SUPERATO\n"
+
         "Timeframe: 15m / 1H / 4H\n\n"
-        "Nota: leva indicativa; "
-        "con leve elevate il margine "
-        "di errore e molto ridotto."
+
+        "Nota: SL, TP e leva sono calcolati "
+        "dal modello tecnico; non garantiscono "
+        "l'esito dell'operazione."
     )
 
 
@@ -2283,7 +2974,10 @@ def build_message(symbol, signal):
 # ANTI-SPAM
 # ==========================================================
 
-def should_send(symbol, signal):
+def should_send(
+    symbol,
+    signal
+):
 
     now = time.time()
 
@@ -2296,15 +2990,23 @@ def should_send(symbol, signal):
     signature = (
         signal["type"],
         signal["direction"],
-        round(signal["level"], 8)
+        round(
+            signal["level"],
+            8
+        )
     )
 
-    previous = signal_state.get(key)
+    previous = (
+        signal_state.get(key)
+    )
 
     if (
         previous
-        and previous["signature"] == signature
-        and now - previous["time"] < 6 * 3600
+        and previous["signature"]
+        == signature
+        and now
+        - previous["time"]
+        < 6 * 3600
     ):
         return False
 
@@ -2322,9 +3024,37 @@ def should_send(symbol, signal):
             - signal_state[old_key]["time"]
             > 12 * 3600
         ):
-            del signal_state[old_key]
+
+            del signal_state[
+                old_key
+            ]
 
     return True
+
+
+# ==========================================================
+# PULIZIA HOLD OBSOLETI
+# ==========================================================
+
+def cleanup_hold_state():
+
+    now = time.time()
+
+    for key in list(
+        breakout_hold_state.keys()
+    ):
+
+        state = (
+            breakout_hold_state[key]
+        )
+
+        if (
+            now
+            - state["start"]
+            > 2 * 3600
+        ):
+
+            del breakout_hold_state[key]
 
 
 # ==========================================================
@@ -2335,16 +3065,23 @@ def scan_market():
 
     successful = 0
 
-    btc_data = market_data(
-        "BTCUSDT"
+    cleanup_hold_state()
+
+    btc_data = (
+        market_data(
+            "BTCUSDT"
+        )
     )
 
-    btc_bias = get_btc_bias(
-        btc_data
+    btc_bias = (
+        get_btc_bias(
+            btc_data
+        )
     )
 
     print(
-        f"BTC bias corrente: {btc_bias}"
+        f"BTC regime corrente: "
+        f"{btc_bias}"
     )
 
     for symbol in SYMBOLS:
@@ -2359,10 +3096,12 @@ def scan_market():
 
             successful += 1
 
-            signal = analyze_symbol(
-                symbol,
-                data,
-                btc_bias
+            signal = (
+                analyze_symbol(
+                    symbol,
+                    data,
+                    btc_bias
+                )
             )
 
             if signal:
@@ -2377,10 +3116,11 @@ def scan_market():
                     signal["leverage"],
                 )
 
-                # PRE solo interni.
-                # Telegram riceve esclusivamente CONFIRMED.
+                # PRE restano interni.
+                # Telegram riceve solo confermati.
                 if (
-                    signal["type"] == "CONFIRMED"
+                    signal["type"]
+                    == "CONFIRMED"
                     and should_send(
                         symbol,
                         signal
@@ -2421,34 +3161,36 @@ threading.Thread(
 ).start()
 
 
+# ==========================================================
+# STARTUP
+# ==========================================================
+
 print(
     "CryptoSignalAI12 avviato - "
-    "modalita EARLY v5.6 ANTI FALSE-BREAKOUT attiva"
+    "modalita V6 SCORE + SMART SL/TP attiva"
 )
 
 
 send_telegram(
     "CryptoSignalAI12 ONLINE\n"
-    "Modalita EARLY v5.6 ANTI FALSE-BREAKOUT attiva.\n"
-    "PRE calcolati internamente, notifiche disattivate.\n"
+    "V6 SCORE + SMART SL/TP attiva.\n"
     "Telegram invia solo SEGNALI CONFERMATI.\n"
-    "Confermato: volume 15m minimo 1.40x media.\n"
-    "Confermato: volume 1H minimo 0.30x media.\n"
-    "Confermato: body minimo 0.15 ATR15.\n"
-    "Confermato: OI minimo 15m +0.05%.\n"
-    "Follow-through: chiusura minima 0.08 ATR15 oltre struttura.\n"
-    "Anti falso-breakout: tenuta minima 3 minuti.\n"
-    "Retest consentito: 0.05 ATR15 oltre il livello.\n"
-    "Breakout LONG deve avere candela 15m rialzista.\n"
-    "Breakout SHORT deve avere candela 15m ribassista.\n"
-    "Aggressivo 20x+: volume 15m minimo 2.00x.\n"
-    "Aggressivo 20x+: volume 1H minimo 1.00x.\n"
-    "Aggressivo 20x+: OI minimo +0.20%.\n"
-    "Target: TP1 0.60R | TP2 1.20R | TP3 2.00R.\n"
-    "BTC contrario blocca il confermato.\n"
-    "Aggressivo altcoin: BTC STRONG allineato.\n"
+    "Volume 15m: floor 1.15x, poi scoring.\n"
+    "Volume 1H: floor 0.30x, poi scoring.\n"
+    "Breakout: candela 15m chiusa obbligatoria.\n"
+    "Follow-through minimo: 0.08 ATR15.\n"
+    "Body minimo: 0.15 ATR15.\n"
+    "HOLD anti falso-breakout: 3 minuti.\n"
+    "Dopo HOLD il prezzo deve restare oltre il livello.\n"
+    "Score minimo confermato: 7.\n"
+    "Score: volume + trend1H + 4H + OI + funding + BTC + candela + follow-through + liquidazioni.\n"
+    "OI hard floor: -0.10%.\n"
+    "BTC contrario blocca il confermato altcoin.\n"
+    "Aggressivo 20x+: filtri severi separati.\n"
+    "Aggressivo: volume15 2.00x | volume1H 1.00x | OI +0.20%.\n"
+    "SL intelligente: struttura + candela breakout + ATR15.\n"
+    "TP intelligenti: adattati allo score e al rischio R.\n"
     "Diagnostica NO CONFIRM attiva.\n"
-    "Filtro anti-inversione live attivo.\n"
     "Protezione Binance 429 attiva."
 )
 
@@ -2459,7 +3201,9 @@ send_telegram(
 
 while True:
 
-    cycle_start = time.monotonic()
+    cycle_start = (
+        time.monotonic()
+    )
 
     try:
 
