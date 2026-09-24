@@ -37,7 +37,7 @@ LIQ_WINDOW_SECONDS = 15 * 60
 
 
 # ==========================================================
-# LOGICA EARLY V5.5
+# LOGICA EARLY V5.6 - ANTI FALSE BREAKOUT
 # ==========================================================
 
 PRE_STRUCTURE_BARS = 6
@@ -45,16 +45,18 @@ PRE_VOL_15M_MIN = 0.90
 PRE_NEAR_ATR15 = 0.30
 
 # Confermati normali
-CONFIRM_VOL_15M_MIN = 1.50
+CONFIRM_VOL_15M_MIN = 1.40
 CONFIRM_VOL_1H_MIN = 0.30
-CONFIRM_BODY_ATR_MIN = 0.20
+CONFIRM_BODY_ATR_MIN = 0.15
 OI_CONFIRM_MIN = 0.05
 FUNDING_BLOCK = 0.0008
 
-# V5.5 - FOLLOW THROUGH
-# La candela 15m deve chiudere oltre la struttura
-# di almeno 0.08 ATR15.
+# Follow-through
 FOLLOW_THROUGH_MIN_ATR15 = 0.08
+
+# Anti falso-breakout
+BREAKOUT_HOLD_SECONDS = 3 * 60
+BREAKOUT_RETEST_TOLERANCE_ATR15 = 0.05
 
 
 # ==========================================================
@@ -135,6 +137,9 @@ request_lock = threading.Lock()
 last_rest_request = 0.0
 
 signal_state = {}
+
+# Stato V5.6 per i candidati in HOLD
+breakout_hold_state = {}
 
 liquidation_events = deque()
 liq_lock = threading.Lock()
@@ -953,6 +958,120 @@ def log_no_confirm(
 
 
 # ==========================================================
+# V5.6 - CONTROLLO TENUTA BREAKOUT
+# ==========================================================
+
+def breakout_hold_check(
+    symbol,
+    direction,
+    level,
+    price,
+    atr15,
+    breakout_candle_time
+):
+
+    now = time.time()
+
+    key = f"{symbol}:{direction}"
+
+    tolerance = (
+        atr15
+        * BREAKOUT_RETEST_TOLERANCE_ATR15
+    )
+
+    if direction == "LONG":
+
+        invalidated = (
+            price < level - tolerance
+        )
+
+    else:
+
+        invalidated = (
+            price > level + tolerance
+        )
+
+    # Se il breakout viene riassorbito oltre
+    # la tolleranza consentita, il candidato
+    # viene cancellato.
+    if invalidated:
+
+        if key in breakout_hold_state:
+            del breakout_hold_state[key]
+
+        if DIAGNOSTIC_LOGS:
+
+            print(
+                f"{symbol} HOLD {direction} ANNULLATO: "
+                "breakout riassorbito"
+            )
+
+        return False
+
+    state = breakout_hold_state.get(key)
+
+    # Primo rilevamento del candidato oppure
+    # nuova candela/livello di breakout.
+    if (
+        state is None
+        or state["candle_time"] != breakout_candle_time
+        or abs(
+            state["level"] - level
+        ) > max(
+            atr15 * 0.02,
+            1e-12
+        )
+    ):
+
+        breakout_hold_state[key] = {
+            "start": now,
+            "level": level,
+            "candle_time": breakout_candle_time
+        }
+
+        if DIAGNOSTIC_LOGS:
+
+            print(
+                f"{symbol} HOLD {direction} AVVIATO: "
+                f"attesa "
+                f"{BREAKOUT_HOLD_SECONDS // 60} minuti"
+            )
+
+        return False
+
+    elapsed = (
+        now - state["start"]
+    )
+
+    if elapsed < BREAKOUT_HOLD_SECONDS:
+
+        if DIAGNOSTIC_LOGS:
+
+            remaining = max(
+                0,
+                BREAKOUT_HOLD_SECONDS - elapsed
+            )
+
+            print(
+                f"{symbol} HOLD {direction}: "
+                f"{remaining:.0f}s rimanenti"
+            )
+
+        return False
+
+    # Breakout mantenuto per almeno 3 minuti.
+    del breakout_hold_state[key]
+
+    if DIAGNOSTIC_LOGS:
+
+        print(
+            f"{symbol} HOLD {direction} SUPERATO"
+        )
+
+    return True
+
+
+# ==========================================================
 # ANALISI PRINCIPALE
 # ==========================================================
 
@@ -1204,21 +1323,7 @@ def analyze_symbol(
     )
 
     # ======================================================
-    # V5.5 - FOLLOW THROUGH DEL BREAKOUT
-    #
-    # Non basta chiudere di pochi tick oltre il livello.
-    # Richiediamo:
-    #
-    # LONG:
-    # - candela 15m rialzista
-    # - chiusura >= resistenza + 0.08 ATR15
-    #
-    # SHORT:
-    # - candela 15m ribassista
-    # - chiusura <= supporto - 0.08 ATR15
-    #
-    # Questo NON richiede una seconda candela.
-    # Quindi non introduce 15 minuti aggiuntivi di ritardo.
+    # V5.6 - FOLLOW THROUGH DEL BREAKOUT
     # ======================================================
 
     breakout_depth_long = (
@@ -1242,7 +1347,7 @@ def analyze_symbol(
     )
 
     # ======================================================
-    # CONFERMATI V5.5
+    # CANDIDATI V5.6
     # ======================================================
 
     candidate_long = (
@@ -1533,6 +1638,38 @@ def analyze_symbol(
             }
 
         return None
+
+    # ======================================================
+    # V5.6 - ANTI FALSE BREAKOUT / HOLD 3 MINUTI
+    # ======================================================
+
+    if candidate_long:
+
+        hold_ok = breakout_hold_check(
+            symbol=symbol,
+            direction="LONG",
+            level=resistance,
+            price=price,
+            atr15=atr15,
+            breakout_candle_time=last15["t"]
+        )
+
+        if not hold_ok:
+            return None
+
+    elif candidate_short:
+
+        hold_ok = breakout_hold_check(
+            symbol=symbol,
+            direction="SHORT",
+            level=support,
+            price=price,
+            atr15=atr15,
+            breakout_candle_time=last15["t"]
+        )
+
+        if not hold_ok:
+            return None
 
     # ======================================================
     # FILTRO BTC
@@ -2286,19 +2423,22 @@ threading.Thread(
 
 print(
     "CryptoSignalAI12 avviato - "
-    "modalita EARLY v5.5 FOLLOW-THROUGH attiva"
+    "modalita EARLY v5.6 ANTI FALSE-BREAKOUT attiva"
 )
 
 
 send_telegram(
     "CryptoSignalAI12 ONLINE\n"
-    "Modalita EARLY v5.5 FOLLOW-THROUGH attiva.\n"
+    "Modalita EARLY v5.6 ANTI FALSE-BREAKOUT attiva.\n"
     "PRE calcolati internamente, notifiche disattivate.\n"
     "Telegram invia solo SEGNALI CONFERMATI.\n"
-    "Confermato: volume 15m minimo 1.50x media.\n"
+    "Confermato: volume 15m minimo 1.40x media.\n"
     "Confermato: volume 1H minimo 0.30x media.\n"
+    "Confermato: body minimo 0.15 ATR15.\n"
     "Confermato: OI minimo 15m +0.05%.\n"
     "Follow-through: chiusura minima 0.08 ATR15 oltre struttura.\n"
+    "Anti falso-breakout: tenuta minima 3 minuti.\n"
+    "Retest consentito: 0.05 ATR15 oltre il livello.\n"
     "Breakout LONG deve avere candela 15m rialzista.\n"
     "Breakout SHORT deve avere candela 15m ribassista.\n"
     "Aggressivo 20x+: volume 15m minimo 2.00x.\n"
