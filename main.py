@@ -37,19 +37,24 @@ LIQ_WINDOW_SECONDS = 15 * 60
 
 
 # ==========================================================
-# LOGICA EARLY V5.4
+# LOGICA EARLY V5.5
 # ==========================================================
 
 PRE_STRUCTURE_BARS = 6
 PRE_VOL_15M_MIN = 0.90
 PRE_NEAR_ATR15 = 0.30
 
-# Confermati normali V5.4
+# Confermati normali
 CONFIRM_VOL_15M_MIN = 1.50
 CONFIRM_VOL_1H_MIN = 0.30
 CONFIRM_BODY_ATR_MIN = 0.20
 OI_CONFIRM_MIN = 0.05
 FUNDING_BLOCK = 0.0008
+
+# V5.5 - FOLLOW THROUGH
+# La candela 15m deve chiudere oltre la struttura
+# di almeno 0.08 ATR15.
+FOLLOW_THROUGH_MIN_ATR15 = 0.08
 
 
 # ==========================================================
@@ -68,7 +73,7 @@ DIAGNOSTIC_LOGS = True
 
 
 # ==========================================================
-# AGGRESSIVI 20X+ - V5.4
+# AGGRESSIVI 20X+
 # ==========================================================
 
 AGGRESSIVE_VOL_15M_MIN = 2.00
@@ -80,7 +85,7 @@ ATR_AGGRESSIVE_MAX_PCT = 3.00
 
 
 # ==========================================================
-# TARGET V5.4
+# TARGET
 # ==========================================================
 
 TP1_R = 0.60
@@ -146,7 +151,6 @@ def send_telegram(text):
         return
 
     try:
-
         r = requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
             data={
@@ -313,16 +317,10 @@ def ema(values, period):
         return None
 
     k = 2 / (period + 1)
-
     value = sum(values[:period]) / period
 
     for price in values[period:]:
-
-        value = (
-            (price - value)
-            * k
-            + value
-        )
+        value = (price - value) * k + value
 
     return value
 
@@ -469,7 +467,6 @@ def get_derivatives(symbol):
             )
 
             if prev > 0:
-
                 oi_change = (
                     (curr - prev)
                     / prev
@@ -477,7 +474,6 @@ def get_derivatives(symbol):
                 )
 
     except Exception as e:
-
         print(symbol, "OI ERRORE:", e)
 
     try:
@@ -492,7 +488,6 @@ def get_derivatives(symbol):
         )
 
     except Exception as e:
-
         print(symbol, "FUNDING ERRORE:", e)
 
     return oi_change, funding
@@ -522,7 +517,6 @@ def store_liquidation(payload):
             continue
 
         order = item.get("o", item)
-
         symbol = order.get("s")
 
         if symbol not in SYMBOLS:
@@ -988,25 +982,10 @@ def analyze_symbol(
         for c in c4h[:-1]
     ]
 
-    e20_1h = ema(
-        closes1h,
-        20
-    )
-
-    e50_1h = ema(
-        closes1h,
-        50
-    )
-
-    e20_4h = ema(
-        closes4h,
-        20
-    )
-
-    e50_4h = ema(
-        closes4h,
-        50
-    )
+    e20_1h = ema(closes1h, 20)
+    e50_1h = ema(closes1h, 50)
+    e20_4h = ema(closes4h, 20)
+    e50_4h = ema(closes4h, 50)
 
     atr15 = atr(
         c15[:-1],
@@ -1076,6 +1055,10 @@ def analyze_symbol(
         last4h["c"] < e20_4h
     )
 
+    # ------------------------------------------------------
+    # VOLUME / VOLATILITA
+    # ------------------------------------------------------
+
     vol15 = volume_ratio_closed(c15)
     vol1h = volume_ratio_closed(c1h)
 
@@ -1090,6 +1073,10 @@ def analyze_symbol(
         <= atr_pct
         <= ATR_MAX_PCT
     )
+
+    # ------------------------------------------------------
+    # STRUTTURA EARLY
+    # ------------------------------------------------------
 
     distance_long = (
         resistance - price
@@ -1155,6 +1142,10 @@ def analyze_symbol(
         and vol15 >= PRE_VOL_15M_MIN
     )
 
+    # ------------------------------------------------------
+    # BREAKOUT
+    # ------------------------------------------------------
+
     breakout_long = (
         closed_price15 > resistance
     )
@@ -1213,11 +1204,50 @@ def analyze_symbol(
     )
 
     # ======================================================
-    # CONFERMATI V5.4
+    # V5.5 - FOLLOW THROUGH DEL BREAKOUT
+    #
+    # Non basta chiudere di pochi tick oltre il livello.
+    # Richiediamo:
+    #
+    # LONG:
+    # - candela 15m rialzista
+    # - chiusura >= resistenza + 0.08 ATR15
+    #
+    # SHORT:
+    # - candela 15m ribassista
+    # - chiusura <= supporto - 0.08 ATR15
+    #
+    # Questo NON richiede una seconda candela.
+    # Quindi non introduce 15 minuti aggiuntivi di ritardo.
+    # ======================================================
+
+    breakout_depth_long = (
+        closed_price15 - resistance
+    )
+
+    breakout_depth_short = (
+        support - closed_price15
+    )
+
+    follow_through_long = (
+        bullish15
+        and breakout_depth_long
+        >= atr15 * FOLLOW_THROUGH_MIN_ATR15
+    )
+
+    follow_through_short = (
+        bearish15
+        and breakout_depth_short
+        >= atr15 * FOLLOW_THROUGH_MIN_ATR15
+    )
+
+    # ======================================================
+    # CONFERMATI V5.5
     # ======================================================
 
     candidate_long = (
         breakout_long
+        and follow_through_long
         and trend1h_long
         and vol15 >= CONFIRM_VOL_15M_MIN
         and vol1h >= CONFIRM_VOL_1H_MIN
@@ -1229,6 +1259,7 @@ def analyze_symbol(
 
     candidate_short = (
         breakout_short
+        and follow_through_short
         and trend1h_short
         and vol15 >= CONFIRM_VOL_15M_MIN
         and vol1h >= CONFIRM_VOL_1H_MIN
@@ -1248,6 +1279,10 @@ def analyze_symbol(
         or early_break_short
     )
 
+    # ------------------------------------------------------
+    # DIAGNOSTICA LONG
+    # ------------------------------------------------------
+
     if attempt_long and not candidate_long:
 
         reasons = []
@@ -1255,6 +1290,24 @@ def analyze_symbol(
         if not breakout_long:
             reasons.append(
                 "breakout15m non ancora chiuso"
+            )
+
+        if (
+            breakout_long
+            and not bullish15
+        ):
+            reasons.append(
+                "candela breakout non rialzista"
+            )
+
+        if (
+            breakout_long
+            and bullish15
+            and not follow_through_long
+        ):
+            reasons.append(
+                f"follow-through insufficiente "
+                f"{breakout_depth_long / atr15:.2f} ATR"
             )
 
         if not trend1h_long:
@@ -1298,6 +1351,10 @@ def analyze_symbol(
             reasons
         )
 
+    # ------------------------------------------------------
+    # DIAGNOSTICA SHORT
+    # ------------------------------------------------------
+
     if attempt_short and not candidate_short:
 
         reasons = []
@@ -1305,6 +1362,24 @@ def analyze_symbol(
         if not breakout_short:
             reasons.append(
                 "breakout15m non ancora chiuso"
+            )
+
+        if (
+            breakout_short
+            and not bearish15
+        ):
+            reasons.append(
+                "candela breakout non ribassista"
+            )
+
+        if (
+            breakout_short
+            and bearish15
+            and not follow_through_short
+        ):
+            reasons.append(
+                f"follow-through insufficiente "
+                f"{breakout_depth_short / atr15:.2f} ATR"
             )
 
         if not trend1h_short:
@@ -1589,8 +1664,7 @@ def analyze_symbol(
         )
 
         oi_aggressive = (
-            oi_change
-            >= OI_AGGRESSIVE_MIN
+            oi_change >= OI_AGGRESSIVE_MIN
         )
 
         btc_aligned = (
@@ -1714,13 +1788,6 @@ def analyze_symbol(
             strong15_long
         )
 
-        # V5.4:
-        # per autorizzare 20x+ servono:
-        # volume15 >= 2.00x
-        # volume1H >= 1.00x
-        # OI >= +0.20%
-        # oltre ai filtri aggressivi precedenti.
-
         aggressive_ok = (
             vol15 >= AGGRESSIVE_VOL_15M_MIN
             and vol1h >= AGGRESSIVE_VOL_1H_MIN
@@ -1755,8 +1822,7 @@ def analyze_symbol(
         )
 
         oi_aggressive = (
-            oi_change
-            >= OI_AGGRESSIVE_MIN
+            oi_change >= OI_AGGRESSIVE_MIN
         )
 
         btc_aligned = (
@@ -1893,7 +1959,7 @@ def analyze_symbol(
         )
 
     # ======================================================
-    # ENTRY / LEVA / TARGET V5.4
+    # ENTRY / LEVA / TARGET
     # ======================================================
 
     entry_low = (
@@ -1963,6 +2029,11 @@ def analyze_symbol(
         "long_liq": long_liq,
         "short_liq": short_liq,
         "liq_available": liq_available,
+        "follow_through_atr": (
+            breakout_depth_long / atr15
+            if direction == "LONG"
+            else breakout_depth_short / atr15
+        ),
         "aggressive": (
             leverage >= 20
             and aggressive_ok
@@ -2060,6 +2131,7 @@ def build_message(symbol, signal):
         f"Open Interest 15m: {signal['oi']:+.2f}%\n"
         f"Funding: {funding_pct:+.4f}%\n"
         f"ATR 1H: {signal['atr_pct']:.2f}%\n"
+        f"Follow-through: {signal['follow_through_atr']:.2f} ATR15\n"
         f"Filtro BTC: {signal['btc']}\n"
         f"Liquidazioni 15m: {liq_text}\n"
         f"Grado conferma: {grade}\n"
@@ -2214,18 +2286,21 @@ threading.Thread(
 
 print(
     "CryptoSignalAI12 avviato - "
-    "modalita EARLY v5.4 attiva"
+    "modalita EARLY v5.5 FOLLOW-THROUGH attiva"
 )
 
 
 send_telegram(
     "CryptoSignalAI12 ONLINE\n"
-    "Modalita EARLY v5.4 attiva.\n"
+    "Modalita EARLY v5.5 FOLLOW-THROUGH attiva.\n"
     "PRE calcolati internamente, notifiche disattivate.\n"
     "Telegram invia solo SEGNALI CONFERMATI.\n"
     "Confermato: volume 15m minimo 1.50x media.\n"
     "Confermato: volume 1H minimo 0.30x media.\n"
     "Confermato: OI minimo 15m +0.05%.\n"
+    "Follow-through: chiusura minima 0.08 ATR15 oltre struttura.\n"
+    "Breakout LONG deve avere candela 15m rialzista.\n"
+    "Breakout SHORT deve avere candela 15m ribassista.\n"
     "Aggressivo 20x+: volume 15m minimo 2.00x.\n"
     "Aggressivo 20x+: volume 1H minimo 1.00x.\n"
     "Aggressivo 20x+: OI minimo +0.20%.\n"
