@@ -37,23 +37,23 @@ LIQ_WINDOW_SECONDS = 15 * 60
 
 
 # ==========================================================
-# LOGICA EARLY
+# LOGICA EARLY V5.4
 # ==========================================================
 
 PRE_STRUCTURE_BARS = 6
 PRE_VOL_15M_MIN = 0.90
 PRE_NEAR_ATR15 = 0.30
 
-# V5.3 - filtri confermati più selettivi
+# Confermati normali V5.4
 CONFIRM_VOL_15M_MIN = 1.50
-CONFIRM_VOL_1H_MIN = 0.60
+CONFIRM_VOL_1H_MIN = 0.30
 CONFIRM_BODY_ATR_MIN = 0.20
 OI_CONFIRM_MIN = 0.05
 FUNDING_BLOCK = 0.0008
 
 
 # ==========================================================
-# FILTRO BTC CONFERMATI - V5.2
+# FILTRO BTC
 # ==========================================================
 
 REQUIRE_BTC_NOT_OPPOSITE = True
@@ -68,13 +68,24 @@ DIAGNOSTIC_LOGS = True
 
 
 # ==========================================================
-# AGGRESSIVI 20X+
+# AGGRESSIVI 20X+ - V5.4
 # ==========================================================
 
-AGGRESSIVE_VOL_15M_MIN = 1.20
-OI_AGGRESSIVE_MIN = 0.00
+AGGRESSIVE_VOL_15M_MIN = 2.00
+AGGRESSIVE_VOL_1H_MIN = 1.00
+OI_AGGRESSIVE_MIN = 0.20
+
 FUNDING_AGGRESSIVE = 0.0005
 ATR_AGGRESSIVE_MAX_PCT = 3.00
+
+
+# ==========================================================
+# TARGET V5.4
+# ==========================================================
+
+TP1_R = 0.60
+TP2_R = 1.20
+TP3_R = 2.00
 
 
 # ==========================================================
@@ -738,7 +749,7 @@ def calculate_leverage(
 
 
 # ==========================================================
-# BTC BIAS V5.2
+# BTC BIAS
 # ==========================================================
 
 def get_btc_bias(data):
@@ -859,11 +870,10 @@ def btc_is_aligned(
     direction
 ):
 
-    direction_btc = btc_direction(
-        btc_bias
+    return (
+        btc_direction(btc_bias)
+        == direction
     )
-
-    return direction_btc == direction
 
 
 def btc_allows_confirmed(
@@ -885,10 +895,7 @@ def btc_allows_confirmed(
     if direction_btc == "NEUTRAL":
         return True
 
-    if direction_btc == direction:
-        return True
-
-    return False
+    return direction_btc == direction
 
 
 def btc_allows_aggressive(
@@ -930,7 +937,7 @@ def confirmation_grade(quality):
 
 
 # ==========================================================
-# DIAGNOSTICA CONFERMATI
+# DIAGNOSTICA
 # ==========================================================
 
 def log_no_confirm(
@@ -1069,10 +1076,6 @@ def analyze_symbol(
         last4h["c"] < e20_4h
     )
 
-    # ------------------------------------------------------
-    # VOLUME
-    # ------------------------------------------------------
-
     vol15 = volume_ratio_closed(c15)
     vol1h = volume_ratio_closed(c1h)
 
@@ -1171,32 +1174,24 @@ def analyze_symbol(
         else 0
     )
 
-    strong15_long = (
-        candle_strength(
-            last15,
-            "LONG"
-        )
+    strong15_long = candle_strength(
+        last15,
+        "LONG"
     )
 
-    strong15_short = (
-        candle_strength(
-            last15,
-            "SHORT"
-        )
+    strong15_short = candle_strength(
+        last15,
+        "SHORT"
     )
 
-    reversing_long = (
-        live_reversal(
-            live15,
-            "LONG"
-        )
+    reversing_long = live_reversal(
+        live15,
+        "LONG"
     )
 
-    reversing_short = (
-        live_reversal(
-            live15,
-            "SHORT"
-        )
+    reversing_short = live_reversal(
+        live15,
+        "SHORT"
     )
 
     extension_long = (
@@ -1218,10 +1213,7 @@ def analyze_symbol(
     )
 
     # ======================================================
-    # CONFERMATI
-    # NUOVI FILTRI:
-    # volume 15m >= 1.50x
-    # volume 1H >= 0.60x
+    # CONFERMATI V5.4
     # ======================================================
 
     candidate_long = (
@@ -1256,10 +1248,7 @@ def analyze_symbol(
         or early_break_short
     )
 
-    if (
-        attempt_long
-        and not candidate_long
-    ):
+    if attempt_long and not candidate_long:
 
         reasons = []
 
@@ -1278,7 +1267,6 @@ def analyze_symbol(
                 f"volume15 {vol15:.2f}x"
             )
 
-        # Nuovo controllo volume 1H
         if vol1h < CONFIRM_VOL_1H_MIN:
             reasons.append(
                 f"volume1H {vol1h:.2f}x"
@@ -1310,10 +1298,7 @@ def analyze_symbol(
             reasons
         )
 
-    if (
-        attempt_short
-        and not candidate_short
-    ):
+    if attempt_short and not candidate_short:
 
         reasons = []
 
@@ -1332,7 +1317,6 @@ def analyze_symbol(
                 f"volume15 {vol15:.2f}x"
             )
 
-        # Nuovo controllo volume 1H
         if vol1h < CONFIRM_VOL_1H_MIN:
             reasons.append(
                 f"volume1H {vol1h:.2f}x"
@@ -1402,13 +1386,11 @@ def analyze_symbol(
                 early_break_long
             )
 
-            leverage = (
-                calculate_leverage(
-                    price,
-                    invalidation,
-                    quality,
-                    False
-                )
+            leverage = calculate_leverage(
+                price,
+                invalidation,
+                quality,
+                False
             )
 
             return {
@@ -1454,13 +1436,11 @@ def analyze_symbol(
                 early_break_short
             )
 
-            leverage = (
-                calculate_leverage(
-                    price,
-                    invalidation,
-                    quality,
-                    False
-                )
+            leverage = calculate_leverage(
+                price,
+                invalidation,
+                quality,
+                False
             )
 
             return {
@@ -1523,8 +1503,8 @@ def analyze_symbol(
     # DERIVATI
     # ======================================================
 
-    oi_change, funding = (
-        get_derivatives(symbol)
+    oi_change, funding = get_derivatives(
+        symbol
     )
 
     if (
@@ -1609,7 +1589,8 @@ def analyze_symbol(
         )
 
         oi_aggressive = (
-            oi_change >= OI_AGGRESSIVE_MIN
+            oi_change
+            >= OI_AGGRESSIVE_MIN
         )
 
         btc_aligned = (
@@ -1733,8 +1714,16 @@ def analyze_symbol(
             strong15_long
         )
 
+        # V5.4:
+        # per autorizzare 20x+ servono:
+        # volume15 >= 2.00x
+        # volume1H >= 1.00x
+        # OI >= +0.20%
+        # oltre ai filtri aggressivi precedenti.
+
         aggressive_ok = (
             vol15 >= AGGRESSIVE_VOL_15M_MIN
+            and vol1h >= AGGRESSIVE_VOL_1H_MIN
             and oi_aggressive
             and funding_aggressive
             and atr_pct <= ATR_AGGRESSIVE_MAX_PCT
@@ -1766,7 +1755,8 @@ def analyze_symbol(
         )
 
         oi_aggressive = (
-            oi_change >= OI_AGGRESSIVE_MIN
+            oi_change
+            >= OI_AGGRESSIVE_MIN
         )
 
         btc_aligned = (
@@ -1892,6 +1882,7 @@ def analyze_symbol(
 
         aggressive_ok = (
             vol15 >= AGGRESSIVE_VOL_15M_MIN
+            and vol1h >= AGGRESSIVE_VOL_1H_MIN
             and oi_aggressive
             and funding_aggressive
             and atr_pct <= ATR_AGGRESSIVE_MAX_PCT
@@ -1902,11 +1893,7 @@ def analyze_symbol(
         )
 
     # ======================================================
-    # ENTRY / LEVA / TARGET V5.3
-    #
-    # TP1 = 0.75R
-    # TP2 = 1.50R
-    # TP3 = 2.50R
+    # ENTRY / LEVA / TARGET V5.4
     # ======================================================
 
     entry_low = (
@@ -1919,41 +1906,39 @@ def analyze_symbol(
         + atr15 * 0.10
     )
 
-    leverage = (
-        calculate_leverage(
-            entry,
-            stop,
-            quality,
-            aggressive_ok
-        )
+    leverage = calculate_leverage(
+        entry,
+        stop,
+        quality,
+        aggressive_ok
     )
 
     if direction == "LONG":
 
         tp1 = (
-            entry + risk * 0.75
+            entry + risk * TP1_R
         )
 
         tp2 = (
-            entry + risk * 1.50
+            entry + risk * TP2_R
         )
 
         tp3 = (
-            entry + risk * 2.50
+            entry + risk * TP3_R
         )
 
     else:
 
         tp1 = (
-            entry - risk * 0.75
+            entry - risk * TP1_R
         )
 
         tp2 = (
-            entry - risk * 1.50
+            entry - risk * TP2_R
         )
 
         tp3 = (
-            entry - risk * 2.50
+            entry - risk * TP3_R
         )
 
     return {
@@ -2183,6 +2168,8 @@ def scan_market():
                     signal["leverage"],
                 )
 
+                # PRE solo interni.
+                # Telegram riceve esclusivamente CONFIRMED.
                 if (
                     signal["type"] == "CONFIRMED"
                     and should_send(
@@ -2227,23 +2214,24 @@ threading.Thread(
 
 print(
     "CryptoSignalAI12 avviato - "
-    "modalita EARLY v5.3 VOLUME FILTER CONFIRMED ONLY attiva"
+    "modalita EARLY v5.4 attiva"
 )
 
 
 send_telegram(
     "CryptoSignalAI12 ONLINE\n"
-    "Modalita EARLY v5.3 VOLUME FILTER CONFIRMED ONLY attiva.\n"
+    "Modalita EARLY v5.4 attiva.\n"
     "PRE calcolati internamente, notifiche disattivate.\n"
     "Telegram invia solo SEGNALI CONFERMATI.\n"
-    "Volume minimo 15m: 1.50x media.\n"
-    "Volume minimo 1H: 0.60x media.\n"
-    "Open Interest minimo 15m: +0.05%.\n"
-    "Target: TP1 0.75R | TP2 1.50R | TP3 2.50R.\n"
-    "Confermato normale: BTC leggermente allineato, forte o neutrale.\n"
+    "Confermato: volume 15m minimo 1.50x media.\n"
+    "Confermato: volume 1H minimo 0.30x media.\n"
+    "Confermato: OI minimo 15m +0.05%.\n"
+    "Aggressivo 20x+: volume 15m minimo 2.00x.\n"
+    "Aggressivo 20x+: volume 1H minimo 1.00x.\n"
+    "Aggressivo 20x+: OI minimo +0.20%.\n"
+    "Target: TP1 0.60R | TP2 1.20R | TP3 2.00R.\n"
     "BTC contrario blocca il confermato.\n"
-    "Aggressivo 20x+: BTC fortemente allineato.\n"
-    "BTC analizzato sulla candela 1H chiusa + EMA20/EMA50.\n"
+    "Aggressivo altcoin: BTC STRONG allineato.\n"
     "Diagnostica NO CONFIRM attiva.\n"
     "Filtro anti-inversione live attivo.\n"
     "Protezione Binance 429 attiva."
