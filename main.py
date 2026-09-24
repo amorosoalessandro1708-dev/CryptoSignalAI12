@@ -44,7 +44,9 @@ PRE_STRUCTURE_BARS = 6
 PRE_VOL_15M_MIN = 0.90
 PRE_NEAR_ATR15 = 0.30
 
-CONFIRM_VOL_15M_MIN = 1.05
+# V5.3 - filtri confermati più selettivi
+CONFIRM_VOL_15M_MIN = 1.50
+CONFIRM_VOL_1H_MIN = 0.60
 CONFIRM_BODY_ATR_MIN = 0.20
 OI_CONFIRM_MIN = 0.05
 FUNDING_BLOCK = 0.0008
@@ -53,19 +55,6 @@ FUNDING_BLOCK = 0.0008
 # ==========================================================
 # FILTRO BTC CONFERMATI - V5.2
 # ==========================================================
-
-# CONFERMATO NORMALE:
-# BTC può essere:
-# - fortemente allineato
-# - leggermente allineato
-# - neutrale
-#
-# BTC chiaramente contrario blocca il segnale.
-#
-# CONFERMATO AGGRESSIVO 20X+:
-# BTC deve essere FORTEMENTE allineato.
-#
-# BTCUSDT non viene naturalmente bloccato da se stesso.
 
 REQUIRE_BTC_NOT_OPPOSITE = True
 REQUIRE_STRONG_BTC_FOR_AGGRESSIVE = True
@@ -123,7 +112,6 @@ LEVERAGE_STEPS = [
 MIN_REST_GAP_SECONDS = 0.18
 MAX_RETRIES = 4
 RETRY_FALLBACK_SECONDS = [3, 6, 12, 20]
-
 
 session = requests.Session()
 
@@ -204,15 +192,11 @@ def get_json(url, params=None, timeout=15):
 
             if r.status_code in (418, 429):
 
-                retry_after = r.headers.get(
-                    "Retry-After"
-                )
+                retry_after = r.headers.get("Retry-After")
 
                 try:
                     wait = float(retry_after)
-
                 except (TypeError, ValueError):
-
                     wait = RETRY_FALLBACK_SECONDS[
                         min(
                             attempt,
@@ -237,7 +221,6 @@ def get_json(url, params=None, timeout=15):
                 continue
 
             r.raise_for_status()
-
             return r.json()
 
         except requests.RequestException as e:
@@ -259,9 +242,7 @@ def get_json(url, params=None, timeout=15):
 
     raise (
         last_error
-        or RuntimeError(
-            "Errore Binance sconosciuto"
-        )
+        or RuntimeError("Errore Binance sconosciuto")
     )
 
 
@@ -299,26 +280,14 @@ def parse_candles(raw):
 def market_data(symbol):
 
     return {
-
         "15m": parse_candles(
-            get_klines(
-                symbol,
-                "15m"
-            )
+            get_klines(symbol, "15m")
         ),
-
         "1h": parse_candles(
-            get_klines(
-                symbol,
-                "1h"
-            )
+            get_klines(symbol, "1h")
         ),
-
         "4h": parse_candles(
-            get_klines(
-                symbol,
-                "4h"
-            )
+            get_klines(symbol, "4h")
         ),
     }
 
@@ -334,10 +303,7 @@ def ema(values, period):
 
     k = 2 / (period + 1)
 
-    value = (
-        sum(values[:period])
-        / period
-    )
+    value = sum(values[:period]) / period
 
     for price in values[period:]:
 
@@ -371,10 +337,7 @@ def atr(candles, period=14):
             )
         )
 
-    return (
-        sum(ranges[-period:])
-        / period
-    )
+    return sum(ranges[-period:]) / period
 
 
 def volume_ratio_closed(candles, period=20):
@@ -389,41 +352,28 @@ def volume_ratio_closed(candles, period=20):
         for c in candles[-(period + 2):-2]
     ]
 
-    avg = (
-        sum(previous)
-        / len(previous)
-    )
+    avg = sum(previous) / len(previous)
 
     if avg <= 0:
         return 0.0
 
-    return (
-        current_volume
-        / avg
-    )
+    return current_volume / avg
 
 
 def candle_strength(candle, direction):
 
-    rng = (
-        candle["h"]
-        - candle["l"]
-    )
+    rng = candle["h"] - candle["l"]
 
     if rng <= 0:
         return False
 
     body = (
-        abs(
-            candle["c"]
-            - candle["o"]
-        )
+        abs(candle["c"] - candle["o"])
         / rng
     )
 
     close_pos = (
-        candle["c"]
-        - candle["l"]
+        candle["c"] - candle["l"]
     ) / rng
 
     if direction == "LONG":
@@ -447,10 +397,7 @@ def candle_strength(candle, direction):
 
 def live_reversal(candle, direction):
 
-    rng = (
-        candle["h"]
-        - candle["l"]
-    )
+    rng = candle["h"] - candle["l"]
 
     if rng <= 0:
         return False
@@ -458,14 +405,10 @@ def live_reversal(candle, direction):
     if direction == "LONG":
 
         retrace = (
-            candle["h"]
-            - candle["c"]
+            candle["h"] - candle["c"]
         ) / rng
 
-        bearish = (
-            candle["c"]
-            < candle["o"]
-        )
+        bearish = candle["c"] < candle["o"]
 
         return (
             bearish
@@ -473,14 +416,10 @@ def live_reversal(candle, direction):
         )
 
     retrace = (
-        candle["c"]
-        - candle["l"]
+        candle["c"] - candle["l"]
     ) / rng
 
-    bullish = (
-        candle["c"]
-        > candle["o"]
-    )
+    bullish = candle["c"] > candle["o"]
 
     return (
         bullish
@@ -511,15 +450,11 @@ def get_derivatives(symbol):
         if len(data) >= 2:
 
             prev = float(
-                data[-2][
-                    "sumOpenInterestValue"
-                ]
+                data[-2]["sumOpenInterestValue"]
             )
 
             curr = float(
-                data[-1][
-                    "sumOpenInterestValue"
-                ]
+                data[-1]["sumOpenInterestValue"]
             )
 
             if prev > 0:
@@ -532,19 +467,13 @@ def get_derivatives(symbol):
 
     except Exception as e:
 
-        print(
-            symbol,
-            "OI ERRORE:",
-            e
-        )
+        print(symbol, "OI ERRORE:", e)
 
     try:
 
         data = get_json(
             PREMIUM_URL,
-            {
-                "symbol": symbol
-            }
+            {"symbol": symbol}
         )
 
         funding = float(
@@ -553,16 +482,9 @@ def get_derivatives(symbol):
 
     except Exception as e:
 
-        print(
-            symbol,
-            "FUNDING ERRORE:",
-            e
-        )
+        print(symbol, "FUNDING ERRORE:", e)
 
-    return (
-        oi_change,
-        funding
-    )
+    return oi_change, funding
 
 
 # ==========================================================
@@ -588,10 +510,7 @@ def store_liquidation(payload):
         if not isinstance(item, dict):
             continue
 
-        order = item.get(
-            "o",
-            item
-        )
+        order = item.get("o", item)
 
         symbol = order.get("s")
 
@@ -610,9 +529,7 @@ def store_liquidation(payload):
             or 0
         )
 
-        notional = (
-            qty * price
-        )
+        notional = qty * price
 
         if notional <= 0:
             continue
@@ -644,32 +561,20 @@ def store_liquidation(payload):
 def ws_message(ws, message):
 
     try:
-
         store_liquidation(
             json.loads(message)
         )
 
     except Exception as e:
-
-        print(
-            "LIQ parse error:",
-            e
-        )
+        print("LIQ parse error:", e)
 
 
 def ws_error(ws, error):
-
-    print(
-        "LIQ WS error:",
-        error
-    )
+    print("LIQ WS error:", error)
 
 
 def ws_open(ws):
-
-    print(
-        "LIQ WS connesso"
-    )
+    print("LIQ WS connesso")
 
 
 def ws_loop():
@@ -678,17 +583,11 @@ def ws_loop():
 
     while True:
 
-        url = (
-            LIQ_WS_URLS[
-                index
-                % len(LIQ_WS_URLS)
-            ]
-        )
+        url = LIQ_WS_URLS[
+            index % len(LIQ_WS_URLS)
+        ]
 
-        print(
-            "LIQ WS connessione:",
-            url
-        )
+        print("LIQ WS connessione:", url)
 
         try:
 
@@ -705,14 +604,9 @@ def ws_loop():
             )
 
         except Exception as e:
-
-            print(
-                "LIQ WS restart:",
-                e
-            )
+            print("LIQ WS restart:", e)
 
         index += 1
-
         time.sleep(5)
 
 
@@ -740,21 +634,11 @@ def liquidation_metrics(symbol):
                 continue
 
             if event["kind"] == "LONG_LIQ":
-
-                long_liq += (
-                    event["notional"]
-                )
-
+                long_liq += event["notional"]
             else:
+                short_liq += event["notional"]
 
-                short_liq += (
-                    event["notional"]
-                )
-
-    return (
-        long_liq,
-        short_liq
-    )
+    return long_liq, short_liq
 
 
 # ==========================================================
@@ -775,16 +659,10 @@ def fmt_price(value):
 def fmt_money(value):
 
     if value >= 1_000_000:
-
-        return (
-            f"${value / 1_000_000:.2f}M"
-        )
+        return f"${value / 1_000_000:.2f}M"
 
     if value >= 1_000:
-
-        return (
-            f"${value / 1_000:.1f}K"
-        )
+        return f"${value / 1_000:.1f}K"
 
     return f"${value:.0f}"
 
@@ -824,10 +702,7 @@ def calculate_leverage(
         return 1
 
     stop_pct = (
-        abs(
-            entry
-            - stop
-        )
+        abs(entry - stop)
         / entry
     )
 
@@ -839,16 +714,10 @@ def calculate_leverage(
         / stop_pct
     )
 
-    cap = leverage_cap(
-        quality
-    )
+    cap = leverage_cap(quality)
 
     if not aggressive_ok:
-
-        cap = min(
-            cap,
-            15
-        )
+        cap = min(cap, 15)
 
     allowed = min(
         raw,
@@ -862,7 +731,6 @@ def calculate_leverage(
 
         if step <= allowed:
             selected = step
-
         else:
             break
 
@@ -885,17 +753,9 @@ def get_btc_bias(data):
     if len(closes) < 51:
         return "NEUTRAL"
 
-    e20 = ema(
-        closes,
-        20
-    )
+    e20 = ema(closes, 20)
+    e50 = ema(closes, 50)
 
-    e50 = ema(
-        closes,
-        50
-    )
-
-    # EMA20 della candela precedente.
     previous_closes = closes[:-1]
 
     e20_prev = ema(
@@ -915,33 +775,11 @@ def get_btc_bias(data):
     price = last["c"]
     open_price = last["o"]
 
-    bullish_candle = (
-        price > open_price
-    )
+    bullish_candle = price > open_price
+    bearish_candle = price < open_price
 
-    bearish_candle = (
-        price < open_price
-    )
-
-    ema20_rising = (
-        e20 > e20_prev
-    )
-
-    ema20_falling = (
-        e20 < e20_prev
-    )
-
-    # ------------------------------------------------------
-    # BTC FORTE
-    #
-    # Per LONG:
-    # - candela 1H chiusa verde
-    # - prezzo sopra EMA20
-    # - EMA20 sopra EMA50
-    # - EMA20 in salita
-    #
-    # Per SHORT il contrario.
-    # ------------------------------------------------------
+    ema20_rising = e20 > e20_prev
+    ema20_falling = e20 < e20_prev
 
     strong_long = (
         bullish_candle
@@ -962,20 +800,6 @@ def get_btc_bias(data):
 
     if strong_short:
         return "SHORT_STRONG"
-
-    # ------------------------------------------------------
-    # BTC LEGGERMENTE ALLINEATO
-    #
-    # Non richiede ancora l'intera struttura EMA20 > EMA50.
-    # Serve però una direzione reale:
-    #
-    # LONG_LIGHT:
-    # candela 1H verde + prezzo sopra EMA20
-    # oppure EMA20 già inclinata verso l'alto e candela verde.
-    #
-    # SHORT_LIGHT:
-    # condizione speculare.
-    # ------------------------------------------------------
 
     light_long = (
         bullish_candle
@@ -1025,16 +849,9 @@ def btc_is_strong(
 ):
 
     if direction == "LONG":
+        return btc_bias == "LONG_STRONG"
 
-        return (
-            btc_bias
-            == "LONG_STRONG"
-        )
-
-    return (
-        btc_bias
-        == "SHORT_STRONG"
-    )
+    return btc_bias == "SHORT_STRONG"
 
 
 def btc_is_aligned(
@@ -1042,16 +859,11 @@ def btc_is_aligned(
     direction
 ):
 
-    direction_btc = (
-        btc_direction(
-            btc_bias
-        )
+    direction_btc = btc_direction(
+        btc_bias
     )
 
-    return (
-        direction_btc
-        == direction
-    )
+    return direction_btc == direction
 
 
 def btc_allows_confirmed(
@@ -1066,21 +878,16 @@ def btc_allows_confirmed(
     if not REQUIRE_BTC_NOT_OPPOSITE:
         return True
 
-    direction_btc = (
-        btc_direction(
-            btc_bias
-        )
+    direction_btc = btc_direction(
+        btc_bias
     )
 
-    # BTC neutrale: il normale confermato può passare.
     if direction_btc == "NEUTRAL":
         return True
 
-    # BTC almeno leggermente nella stessa direzione.
     if direction_btc == direction:
         return True
 
-    # BTC chiaramente nella direzione opposta.
     return False
 
 
@@ -1090,7 +897,6 @@ def btc_allows_aggressive(
     btc_bias
 ):
 
-    # BTC non deve autobloccare il proprio segnale.
     if symbol == "BTCUSDT":
         return True
 
@@ -1215,11 +1021,6 @@ def analyze_symbol(
     ):
         return None
 
-    # ------------------------------------------------------
-    # STRUTTURA RECENTE 15M
-    # 6 candele 15m = circa 90 minuti.
-    # ------------------------------------------------------
-
     structure = (
         c15[
             -(PRE_STRUCTURE_BARS + 2):-2
@@ -1239,10 +1040,6 @@ def analyze_symbol(
     price = live15["c"]
     closed_price15 = last15["c"]
     price1h = last1h["c"]
-
-    # ------------------------------------------------------
-    # TREND
-    # ------------------------------------------------------
 
     trend1h_long = (
         price1h > e20_1h
@@ -1265,34 +1062,19 @@ def analyze_symbol(
     )
 
     trend4h_long = (
-        last4h["c"]
-        > e20_4h
+        last4h["c"] > e20_4h
     )
 
     trend4h_short = (
-        last4h["c"]
-        < e20_4h
+        last4h["c"] < e20_4h
     )
 
     # ------------------------------------------------------
     # VOLUME
     # ------------------------------------------------------
 
-    vol15 = (
-        volume_ratio_closed(
-            c15
-        )
-    )
-
-    vol1h = (
-        volume_ratio_closed(
-            c1h
-        )
-    )
-
-    # ------------------------------------------------------
-    # ATR
-    # ------------------------------------------------------
+    vol15 = volume_ratio_closed(c15)
+    vol1h = volume_ratio_closed(c1h)
 
     atr_pct = (
         atr1h
@@ -1306,38 +1088,29 @@ def analyze_symbol(
         <= ATR_MAX_PCT
     )
 
-    # ------------------------------------------------------
-    # PRE: AVVICINAMENTO / PRIMA ROTTURA
-    # ------------------------------------------------------
-
     distance_long = (
-        resistance
-        - price
+        resistance - price
     )
 
     distance_short = (
-        price
-        - support
+        price - support
     )
 
     near_long = (
         distance_long >= 0
-        and
-        distance_long
+        and distance_long
         <= atr15 * PRE_NEAR_ATR15
     )
 
     near_short = (
         distance_short >= 0
-        and
-        distance_short
+        and distance_short
         <= atr15 * PRE_NEAR_ATR15
     )
 
     early_break_long = (
         price > resistance
-        and
-        price <= (
+        and price <= (
             resistance
             + atr15 * MAX_EXTENSION_ATR15
         )
@@ -1345,30 +1118,19 @@ def analyze_symbol(
 
     early_break_short = (
         price < support
-        and
-        price >= (
+        and price >= (
             support
             - atr15 * MAX_EXTENSION_ATR15
         )
     )
 
-    # ------------------------------------------------------
-    # DIREZIONE CANDELA 15M
-    # ------------------------------------------------------
-
     bullish15 = (
-        last15["c"]
-        > last15["o"]
+        last15["c"] > last15["o"]
     )
 
     bearish15 = (
-        last15["c"]
-        < last15["o"]
+        last15["c"] < last15["o"]
     )
-
-    # ------------------------------------------------------
-    # PRE
-    # ------------------------------------------------------
 
     pre_long = (
         trend1h_long
@@ -1377,10 +1139,7 @@ def analyze_symbol(
             near_long
             or early_break_long
         )
-        and (
-            vol15
-            >= PRE_VOL_15M_MIN
-        )
+        and vol15 >= PRE_VOL_15M_MIN
     )
 
     pre_short = (
@@ -1390,29 +1149,16 @@ def analyze_symbol(
             near_short
             or early_break_short
         )
-        and (
-            vol15
-            >= PRE_VOL_15M_MIN
-        )
+        and vol15 >= PRE_VOL_15M_MIN
     )
 
-    # ------------------------------------------------------
-    # BREAKOUT CONFERMATO SU 15M CHIUSO
-    # ------------------------------------------------------
-
     breakout_long = (
-        closed_price15
-        > resistance
+        closed_price15 > resistance
     )
 
     breakout_short = (
-        closed_price15
-        < support
+        closed_price15 < support
     )
-
-    # ------------------------------------------------------
-    # FORZA DELLA CANDELA
-    # ------------------------------------------------------
 
     body15 = abs(
         last15["c"]
@@ -1439,10 +1185,6 @@ def analyze_symbol(
         )
     )
 
-    # ------------------------------------------------------
-    # ANTI-INVERSIONE LIVE
-    # ------------------------------------------------------
-
     reversing_long = (
         live_reversal(
             live15,
@@ -1457,40 +1199,36 @@ def analyze_symbol(
         )
     )
 
-    # ------------------------------------------------------
-    # ANTI-INSEGUIMENTO
-    # ------------------------------------------------------
-
     extension_long = (
-        price
-        - resistance
+        price - resistance
     )
 
     extension_short = (
-        support
-        - price
+        support - price
     )
 
     not_extended_long = (
         extension_long
-        <= atr15
-        * MAX_EXTENSION_ATR15
+        <= atr15 * MAX_EXTENSION_ATR15
     )
 
     not_extended_short = (
         extension_short
-        <= atr15
-        * MAX_EXTENSION_ATR15
+        <= atr15 * MAX_EXTENSION_ATR15
     )
 
-    # ------------------------------------------------------
-    # CANDIDATI CONFERMATI
-    # ------------------------------------------------------
+    # ======================================================
+    # CONFERMATI
+    # NUOVI FILTRI:
+    # volume 15m >= 1.50x
+    # volume 1H >= 0.60x
+    # ======================================================
 
     candidate_long = (
         breakout_long
         and trend1h_long
         and vol15 >= CONFIRM_VOL_15M_MIN
+        and vol1h >= CONFIRM_VOL_1H_MIN
         and body_atr >= CONFIRM_BODY_ATR_MIN
         and volatility_ok
         and not reversing_long
@@ -1501,15 +1239,12 @@ def analyze_symbol(
         breakout_short
         and trend1h_short
         and vol15 >= CONFIRM_VOL_15M_MIN
+        and vol1h >= CONFIRM_VOL_1H_MIN
         and body_atr >= CONFIRM_BODY_ATR_MIN
         and volatility_ok
         and not reversing_short
         and not_extended_short
     )
-
-    # ------------------------------------------------------
-    # LOG DIAGNOSTICO PRIMA DEI DERIVATI
-    # ------------------------------------------------------
 
     attempt_long = (
         breakout_long
@@ -1538,18 +1273,18 @@ def analyze_symbol(
                 "trend1H non LONG"
             )
 
-        if (
-            vol15
-            < CONFIRM_VOL_15M_MIN
-        ):
+        if vol15 < CONFIRM_VOL_15M_MIN:
             reasons.append(
                 f"volume15 {vol15:.2f}x"
             )
 
-        if (
-            body_atr
-            < CONFIRM_BODY_ATR_MIN
-        ):
+        # Nuovo controllo volume 1H
+        if vol1h < CONFIRM_VOL_1H_MIN:
+            reasons.append(
+                f"volume1H {vol1h:.2f}x"
+            )
+
+        if body_atr < CONFIRM_BODY_ATR_MIN:
             reasons.append(
                 f"body/ATR {body_atr:.2f}"
             )
@@ -1592,18 +1327,18 @@ def analyze_symbol(
                 "trend1H non SHORT"
             )
 
-        if (
-            vol15
-            < CONFIRM_VOL_15M_MIN
-        ):
+        if vol15 < CONFIRM_VOL_15M_MIN:
             reasons.append(
                 f"volume15 {vol15:.2f}x"
             )
 
-        if (
-            body_atr
-            < CONFIRM_BODY_ATR_MIN
-        ):
+        # Nuovo controllo volume 1H
+        if vol1h < CONFIRM_VOL_1H_MIN:
+            reasons.append(
+                f"volume1H {vol1h:.2f}x"
+            )
+
+        if body_atr < CONFIRM_BODY_ATR_MIN:
             reasons.append(
                 f"body/ATR {body_atr:.2f}"
             )
@@ -1629,11 +1364,9 @@ def analyze_symbol(
             reasons
         )
 
-    # ------------------------------------------------------
-    # SE NON CONFERMATO -> PRE
-    # I PRE RESTANO CALCOLATI INTERNAMENTE.
-    # NON VENGONO INVIATI SU TELEGRAM.
-    # ------------------------------------------------------
+    # ======================================================
+    # PRE INTERNI
+    # ======================================================
 
     if (
         not candidate_long
@@ -1747,7 +1480,7 @@ def analyze_symbol(
         return None
 
     # ======================================================
-    # FILTRO BTC PER TUTTI I CONFERMATI
+    # FILTRO BTC
     # ======================================================
 
     if candidate_long:
@@ -1787,13 +1520,11 @@ def analyze_symbol(
             return None
 
     # ======================================================
-    # DERIVATI SOLO PER CONFERMATI
+    # DERIVATI
     # ======================================================
 
     oi_change, funding = (
-        get_derivatives(
-            symbol
-        )
+        get_derivatives(symbol)
     )
 
     if (
@@ -1827,10 +1558,7 @@ def analyze_symbol(
 
         return None
 
-    if (
-        oi_change
-        < OI_CONFIRM_MIN
-    ):
+    if oi_change < OI_CONFIRM_MIN:
 
         direction = (
             "LONG"
@@ -1850,9 +1578,7 @@ def analyze_symbol(
         return None
 
     long_liq, short_liq = (
-        liquidation_metrics(
-            symbol
-        )
+        liquidation_metrics(symbol)
     )
 
     liq_available = (
@@ -1871,13 +1597,11 @@ def analyze_symbol(
         level = resistance
 
         funding_ok = (
-            funding
-            <= FUNDING_BLOCK
+            funding <= FUNDING_BLOCK
         )
 
         funding_aggressive = (
-            funding
-            <= FUNDING_AGGRESSIVE
+            funding <= FUNDING_AGGRESSIVE
         )
 
         oi_positive = (
@@ -1885,8 +1609,7 @@ def analyze_symbol(
         )
 
         oi_aggressive = (
-            oi_change
-            >= OI_AGGRESSIVE_MIN
+            oi_change >= OI_AGGRESSIVE_MIN
         )
 
         btc_aligned = (
@@ -1915,8 +1638,7 @@ def analyze_symbol(
 
         liq_support = (
             liq_available
-            and
-            short_liq >= max(
+            and short_liq >= max(
                 long_liq * 1.25,
                 10000
             )
@@ -1924,8 +1646,7 @@ def analyze_symbol(
 
         severe_liq_against = (
             liq_available
-            and
-            long_liq >= max(
+            and long_liq >= max(
                 short_liq * 3.0,
                 50000
             )
@@ -1964,25 +1685,19 @@ def analyze_symbol(
             - atr15 * 0.35
         )
 
-        stop -= (
-            atr15 * 0.10
-        )
+        stop -= atr15 * 0.10
 
         if stop >= entry:
 
             log_no_confirm(
                 symbol,
                 "LONG",
-                [
-                    "stop non valido"
-                ]
+                ["stop non valido"]
             )
 
             return None
 
-        risk = (
-            entry - stop
-        )
+        risk = entry - stop
 
         quality = 7
 
@@ -2002,14 +1717,10 @@ def analyze_symbol(
             funding_aggressive
         )
 
-        # BTC leggermente o fortemente allineato:
-        # +1 punto qualità.
         quality += int(
             btc_aligned
         )
 
-        # BTC fortemente allineato:
-        # ulteriore +1.
         quality += int(
             btc_strong
         )
@@ -2023,12 +1734,10 @@ def analyze_symbol(
         )
 
         aggressive_ok = (
-            vol15
-            >= AGGRESSIVE_VOL_15M_MIN
+            vol15 >= AGGRESSIVE_VOL_15M_MIN
             and oi_aggressive
             and funding_aggressive
-            and atr_pct
-            <= ATR_AGGRESSIVE_MAX_PCT
+            and atr_pct <= ATR_AGGRESSIVE_MAX_PCT
             and strong15_long
             and not reversing_long
             and not severe_liq_against
@@ -2045,13 +1754,11 @@ def analyze_symbol(
         level = support
 
         funding_ok = (
-            funding
-            >= -FUNDING_BLOCK
+            funding >= -FUNDING_BLOCK
         )
 
         funding_aggressive = (
-            funding
-            >= -FUNDING_AGGRESSIVE
+            funding >= -FUNDING_AGGRESSIVE
         )
 
         oi_positive = (
@@ -2059,8 +1766,7 @@ def analyze_symbol(
         )
 
         oi_aggressive = (
-            oi_change
-            >= OI_AGGRESSIVE_MIN
+            oi_change >= OI_AGGRESSIVE_MIN
         )
 
         btc_aligned = (
@@ -2089,8 +1795,7 @@ def analyze_symbol(
 
         liq_support = (
             liq_available
-            and
-            long_liq >= max(
+            and long_liq >= max(
                 short_liq * 1.25,
                 10000
             )
@@ -2098,8 +1803,7 @@ def analyze_symbol(
 
         severe_liq_against = (
             liq_available
-            and
-            short_liq >= max(
+            and short_liq >= max(
                 long_liq * 3.0,
                 50000
             )
@@ -2138,25 +1842,19 @@ def analyze_symbol(
             + atr15 * 0.35
         )
 
-        stop += (
-            atr15 * 0.10
-        )
+        stop += atr15 * 0.10
 
         if stop <= entry:
 
             log_no_confirm(
                 symbol,
                 "SHORT",
-                [
-                    "stop non valido"
-                ]
+                ["stop non valido"]
             )
 
             return None
 
-        risk = (
-            stop - entry
-        )
+        risk = stop - entry
 
         quality = 7
 
@@ -2193,12 +1891,10 @@ def analyze_symbol(
         )
 
         aggressive_ok = (
-            vol15
-            >= AGGRESSIVE_VOL_15M_MIN
+            vol15 >= AGGRESSIVE_VOL_15M_MIN
             and oi_aggressive
             and funding_aggressive
-            and atr_pct
-            <= ATR_AGGRESSIVE_MAX_PCT
+            and atr_pct <= ATR_AGGRESSIVE_MAX_PCT
             and strong15_short
             and not reversing_short
             and not severe_liq_against
@@ -2206,7 +1902,11 @@ def analyze_symbol(
         )
 
     # ======================================================
-    # ENTRY / LEVA / TARGET
+    # ENTRY / LEVA / TARGET V5.3
+    #
+    # TP1 = 0.75R
+    # TP2 = 1.50R
+    # TP3 = 2.50R
     # ======================================================
 
     entry_low = (
@@ -2231,68 +1931,53 @@ def analyze_symbol(
     if direction == "LONG":
 
         tp1 = (
-            entry + risk
+            entry + risk * 0.75
         )
 
         tp2 = (
-            entry + risk * 2
+            entry + risk * 1.50
         )
 
         tp3 = (
-            entry + risk * 3
+            entry + risk * 2.50
         )
 
     else:
 
         tp1 = (
-            entry - risk
+            entry - risk * 0.75
         )
 
         tp2 = (
-            entry - risk * 2
+            entry - risk * 1.50
         )
 
         tp3 = (
-            entry - risk * 3
+            entry - risk * 2.50
         )
 
     return {
         "type": "CONFIRMED",
-
         "direction": direction,
-
         "price": entry,
-
         "entry_low": entry_low,
         "entry_high": entry_high,
-
         "sl": stop,
-
         "tp1": tp1,
         "tp2": tp2,
         "tp3": tp3,
-
         "level": level,
-
         "volume1h": vol1h,
         "volume15": vol15,
-
         "atr_pct": atr_pct,
-
         "quality": quality,
-
         "leverage": leverage,
-
         "oi": oi_change,
         "funding": funding,
-
         "btc": btc_bias,
-
         "long_liq": long_liq,
         "short_liq": short_liq,
-
         "liq_available": liq_available,
-
         "aggressive": (
             leverage >= 20
             and aggressive_ok
@@ -2306,21 +1991,15 @@ def analyze_symbol(
 
 def build_message(symbol, signal):
 
-    pair = (
-        symbol.replace(
-            "USDT",
-            "/USDT"
-        )
+    pair = symbol.replace(
+        "USDT",
+        "/USDT"
     )
 
-    grade = (
-        confirmation_grade(
-            signal["quality"]
-        )
+    grade = confirmation_grade(
+        signal["quality"]
     )
 
-    # Questo blocco resta disponibile internamente,
-    # ma i PRE non vengono inviati a Telegram.
     if signal["type"] == "PRE":
 
         setup = (
@@ -2331,38 +2010,17 @@ def build_message(symbol, signal):
 
         return (
             "🟠 PRE-SEGNALE\n"
-
-            f"{pair} — "
-            f"{signal['direction']}\n\n"
-
-            f"Livello chiave: "
-            f"{fmt_price(signal['level'])}\n"
-
-            f"Prezzo attuale: "
-            f"{fmt_price(signal['price'])}\n"
-
+            f"{pair} — {signal['direction']}\n\n"
+            f"Livello chiave: {fmt_price(signal['level'])}\n"
+            f"Prezzo attuale: {fmt_price(signal['price'])}\n"
             f"Setup: {setup}\n"
-
-            "Possibile ENTRY: "
-            "solo dopo conferma\n"
-
-            f"Invalidazione: "
-            f"{fmt_price(signal['invalidation'])}\n"
-
-            f"Volume 15m: "
-            f"{signal['volume15']:.2f}x media\n"
-
-            f"Volume 1H: "
-            f"{signal['volume1h']:.2f}x media\n"
-
-            f"ATR 1H: "
-            f"{signal['atr_pct']:.2f}%\n"
-
-            f"Leva potenziale: "
-            f"{signal['leverage']}x\n"
-
+            "Possibile ENTRY: solo dopo conferma\n"
+            f"Invalidazione: {fmt_price(signal['invalidation'])}\n"
+            f"Volume 15m: {signal['volume15']:.2f}x media\n"
+            f"Volume 1H: {signal['volume1h']:.2f}x media\n"
+            f"ATR 1H: {signal['atr_pct']:.2f}%\n"
+            f"Leva potenziale: {signal['leverage']}x\n"
             "Timeframe: 15m / 1H\n"
-
             f"Grado conferma: {grade}"
         )
 
@@ -2373,38 +2031,25 @@ def build_message(symbol, signal):
     )
 
     funding_pct = (
-        signal["funding"]
-        * 100
+        signal["funding"] * 100
     )
 
     if signal["direction"] == "LONG":
 
-        favorable_liq = (
-            signal["short_liq"]
-        )
-
-        adverse_liq = (
-            signal["long_liq"]
-        )
+        favorable_liq = signal["short_liq"]
+        adverse_liq = signal["long_liq"]
 
     else:
 
-        favorable_liq = (
-            signal["long_liq"]
-        )
-
-        adverse_liq = (
-            signal["short_liq"]
-        )
+        favorable_liq = signal["long_liq"]
+        adverse_liq = signal["short_liq"]
 
     if signal["liq_available"]:
 
         liq_text = (
-            f"Favorevoli "
-            f"{fmt_money(favorable_liq)}"
+            f"Favorevoli {fmt_money(favorable_liq)}"
             " | "
-            f"Contrarie "
-            f"{fmt_money(adverse_liq)}"
+            f"Contrarie {fmt_money(adverse_liq)}"
         )
 
     else:
@@ -2416,56 +2061,24 @@ def build_message(symbol, signal):
 
     return (
         f"{title}\n"
-
-        f"{pair} — "
-        f"{signal['direction']}\n\n"
-
-        f"ENTRY: "
-        f"{fmt_price(signal['entry_low'])}"
+        f"{pair} — {signal['direction']}\n\n"
+        f"ENTRY: {fmt_price(signal['entry_low'])}"
         " - "
         f"{fmt_price(signal['entry_high'])}\n"
-
-        f"SL: "
-        f"{fmt_price(signal['sl'])}\n"
-
-        f"TP1: "
-        f"{fmt_price(signal['tp1'])}\n"
-
-        f"TP2: "
-        f"{fmt_price(signal['tp2'])}\n"
-
-        f"TP3: "
-        f"{fmt_price(signal['tp3'])}\n"
-
-        f"Leva indicativa: "
-        f"{signal['leverage']}x\n\n"
-
-        f"Volume 15m: "
-        f"{signal['volume15']:.2f}x media\n"
-
-        f"Volume 1H: "
-        f"{signal['volume1h']:.2f}x media\n"
-
-        f"Open Interest 15m: "
-        f"{signal['oi']:+.2f}%\n"
-
-        f"Funding: "
-        f"{funding_pct:+.4f}%\n"
-
-        f"ATR 1H: "
-        f"{signal['atr_pct']:.2f}%\n"
-
-        f"Filtro BTC: "
-        f"{signal['btc']}\n"
-
-        f"Liquidazioni 15m: "
-        f"{liq_text}\n"
-
-        f"Grado conferma: "
-        f"{grade}\n"
-
+        f"SL: {fmt_price(signal['sl'])}\n"
+        f"TP1: {fmt_price(signal['tp1'])}\n"
+        f"TP2: {fmt_price(signal['tp2'])}\n"
+        f"TP3: {fmt_price(signal['tp3'])}\n"
+        f"Leva indicativa: {signal['leverage']}x\n\n"
+        f"Volume 15m: {signal['volume15']:.2f}x media\n"
+        f"Volume 1H: {signal['volume1h']:.2f}x media\n"
+        f"Open Interest 15m: {signal['oi']:+.2f}%\n"
+        f"Funding: {funding_pct:+.4f}%\n"
+        f"ATR 1H: {signal['atr_pct']:.2f}%\n"
+        f"Filtro BTC: {signal['btc']}\n"
+        f"Liquidazioni 15m: {liq_text}\n"
+        f"Grado conferma: {grade}\n"
         "Timeframe: 15m / 1H / 4H\n\n"
-
         "Nota: leva indicativa; "
         "con leve elevate il margine "
         "di errore e molto ridotto."
@@ -2489,23 +2102,15 @@ def should_send(symbol, signal):
     signature = (
         signal["type"],
         signal["direction"],
-        round(
-            signal["level"],
-            8
-        )
+        round(signal["level"], 8)
     )
 
-    previous = (
-        signal_state.get(key)
-    )
+    previous = signal_state.get(key)
 
     if (
         previous
-        and previous["signature"]
-        == signature
-        and now
-        - previous["time"]
-        < 6 * 3600
+        and previous["signature"] == signature
+        and now - previous["time"] < 6 * 3600
     ):
         return False
 
@@ -2520,15 +2125,10 @@ def should_send(symbol, signal):
 
         if (
             now
-            - signal_state[
-                old_key
-            ]["time"]
+            - signal_state[old_key]["time"]
             > 12 * 3600
         ):
-
-            del signal_state[
-                old_key
-            ]
+            del signal_state[old_key]
 
     return True
 
@@ -2541,16 +2141,12 @@ def scan_market():
 
     successful = 0
 
-    btc_data = (
-        market_data(
-            "BTCUSDT"
-        )
+    btc_data = market_data(
+        "BTCUSDT"
     )
 
-    btc_bias = (
-        get_btc_bias(
-            btc_data
-        )
+    btc_bias = get_btc_bias(
+        btc_data
     )
 
     print(
@@ -2564,19 +2160,15 @@ def scan_market():
             data = (
                 btc_data
                 if symbol == "BTCUSDT"
-                else market_data(
-                    symbol
-                )
+                else market_data(symbol)
             )
 
             successful += 1
 
-            signal = (
-                analyze_symbol(
-                    symbol,
-                    data,
-                    btc_bias
-                )
+            signal = analyze_symbol(
+                symbol,
+                data,
+                btc_bias
             )
 
             if signal:
@@ -2590,12 +2182,6 @@ def scan_market():
                     "leverage=",
                     signal["leverage"],
                 )
-
-                # ==========================================
-                # TELEGRAM:
-                # SOLO SEGNALI CONFERMATI.
-                # PRE SOLO INTERNI / DEPLOY LOGS.
-                # ==========================================
 
                 if (
                     signal["type"] == "CONFIRMED"
@@ -2641,15 +2227,19 @@ threading.Thread(
 
 print(
     "CryptoSignalAI12 avviato - "
-    "modalita EARLY v5.2 BTC DYNAMIC CONFIRMED ONLY attiva"
+    "modalita EARLY v5.3 VOLUME FILTER CONFIRMED ONLY attiva"
 )
 
 
 send_telegram(
     "CryptoSignalAI12 ONLINE\n"
-    "Modalita EARLY v5.2 BTC DYNAMIC CONFIRMED ONLY attiva.\n"
+    "Modalita EARLY v5.3 VOLUME FILTER CONFIRMED ONLY attiva.\n"
     "PRE calcolati internamente, notifiche disattivate.\n"
     "Telegram invia solo SEGNALI CONFERMATI.\n"
+    "Volume minimo 15m: 1.50x media.\n"
+    "Volume minimo 1H: 0.60x media.\n"
+    "Open Interest minimo 15m: +0.05%.\n"
+    "Target: TP1 0.75R | TP2 1.50R | TP3 2.50R.\n"
     "Confermato normale: BTC leggermente allineato, forte o neutrale.\n"
     "BTC contrario blocca il confermato.\n"
     "Aggressivo 20x+: BTC fortemente allineato.\n"
@@ -2666,9 +2256,7 @@ send_telegram(
 
 while True:
 
-    cycle_start = (
-        time.monotonic()
-    )
+    cycle_start = time.monotonic()
 
     try:
 
