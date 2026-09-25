@@ -1507,6 +1507,31 @@ def analyze_symbol(symbol, data, btc_bias):
         return None
 
     # ======================================================
+    # V6.2.1 - ANTI-INSEGUIMENTO DOPO HOLD
+    # ======================================================
+    # Ricontrollo l'estensione usando il prezzo LIVE attuale.
+    # Se nei 3 minuti di HOLD il prezzo e' gia corso oltre
+    # MAX_EXTENSION_ATR15 dal livello di breakout, niente ENTRY.
+
+    post_hold_extension = (
+        price - level
+        if direction == "LONG"
+        else level - price
+    )
+
+    if post_hold_extension > atr15 * MAX_EXTENSION_ATR15:
+        log_no_confirm(
+            symbol,
+            direction,
+            [
+                f"prezzo troppo esteso dopo HOLD "
+                f"({post_hold_extension / atr15:.2f} ATR15 > "
+                f"{MAX_EXTENSION_ATR15:.2f} ATR15)"
+            ]
+        )
+        return None
+
+    # ======================================================
     # BTC
     # ======================================================
 
@@ -2047,12 +2072,12 @@ threading.Thread(
 
 print(
     "CryptoSignalAI12 avviato - "
-    "modalita V6.2 LIVE CONTINUATION attiva"
+    "modalita V6.2.1 LIVE CONTINUATION attiva"
 )
 
 send_telegram(
     "CryptoSignalAI12 ONLINE\n"
-    "V6.2 LIVE CONTINUATION attiva.\n"
+    "V6.2.1 LIVE CONTINUATION attiva.\n"
     "Telegram invia solo SEGNALI CONFERMATI.\n"
     "Volume breakout 15m: floor 1.15x, poi scoring.\n"
     "Volume 1H: floor 0.30x, poi scoring.\n"
@@ -2068,6 +2093,7 @@ send_telegram(
     "Volume live: normalizzato per il tempo trascorso.\n"
     "Volume live pace minimo: 0.80x.\n"
     "Anti-inversione ricontrollata dopo HOLD.\n"
+    "Anti-inseguimento post-HOLD: max 1.20 ATR15 dal breakout.\n"
     "Score minimo confermato: 7.\n"
     "BTC LIGHT allineato: +1 | BTC STRONG allineato: +2.\n"
     "OI hard floor: -0.10%.\n"
