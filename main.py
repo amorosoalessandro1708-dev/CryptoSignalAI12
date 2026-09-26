@@ -37,7 +37,7 @@ LIQ_WINDOW_SECONDS = 15 * 60
 
 
 # ==========================================================
-# V6.2 SCORE - STRUTTURA
+# V6.3 SCORE - STRUTTURA
 # ==========================================================
 
 PRE_STRUCTURE_BARS = 6
@@ -83,12 +83,24 @@ REQUIRE_PRICE_BEYOND_LEVEL_AFTER_HOLD = True
 
 
 # ==========================================================
-# V6.2 - CONFERMA CONTINUAZIONE LIVE POST-HOLD
+# V6.3 - CONTINUAZIONE LIVE POST-HOLD
 # ==========================================================
 
 REQUIRE_LIVE_DIRECTION_AFTER_HOLD = True
-LIVE_BODY_ATR_MIN = 0.03
-FINAL_BREAKOUT_MARGIN_ATR15 = 0.02
+
+# Prima era 0.03.
+# Richiediamo una candela live leggermente più consistente.
+LIVE_BODY_ATR_MIN = 0.05
+
+# Prima era 0.02.
+# Il prezzo deve avere realmente progredito oltre il breakout.
+FINAL_BREAKOUT_MARGIN_ATR15 = 0.06
+
+# NUOVO:
+# LONG: chiusura almeno nel 60% superiore del range live.
+# SHORT: chiusura almeno nel 40% inferiore.
+LIVE_CLOSE_POSITION_MIN = 0.60
+
 LIVE_VOLUME_PACE_MIN = 0.80
 LIVE_VOLUME_MIN_ELAPSED_SECONDS = 120
 LIVE_VOLUME_PACE_CAP = 4.00
@@ -368,10 +380,6 @@ def volume_ratio_closed(candles, period=20):
 
 
 def live_volume_ratio(candles, period=20):
-    """
-    Ritmo del volume della candela 15m LIVE normalizzato
-    rispetto al tempo trascorso nella candela.
-    """
     if len(candles) < period + 2:
         return 0.0, 0.0
 
@@ -452,7 +460,7 @@ def live_reversal(candle, direction):
 
 
 # ==========================================================
-# V6.2 - CONFERMA FINALE MOMENTUM LIVE
+# V6.3 - CONFERMA FINALE MOMENTUM / CONTINUAZIONE LIVE
 # ==========================================================
 
 def final_live_confirmation(
@@ -469,12 +477,20 @@ def final_live_confirmation(
     if atr15 <= 0:
         return False, ["ATR15 non valido"]
 
+    # ------------------------------------------------------
+    # 1. DIREZIONE CANDELA LIVE
+    # ------------------------------------------------------
+
     if REQUIRE_LIVE_DIRECTION_AFTER_HOLD:
         if direction == "LONG" and live15["c"] <= live15["o"]:
             reasons.append("candela live non verde")
 
         if direction == "SHORT" and live15["c"] >= live15["o"]:
             reasons.append("candela live non rossa")
+
+    # ------------------------------------------------------
+    # 2. BODY LIVE
+    # ------------------------------------------------------
 
     live_body = abs(live15["c"] - live15["o"])
     live_body_atr = live_body / atr15
@@ -485,24 +501,69 @@ def final_live_confirmation(
             f"< {LIVE_BODY_ATR_MIN:.2f}"
         )
 
+    # ------------------------------------------------------
+    # 3. PROGRESSIONE REALE OLTRE BREAKOUT
+    # ------------------------------------------------------
+
     required_margin = atr15 * FINAL_BREAKOUT_MARGIN_ATR15
 
     if direction == "LONG":
         if live15["c"] < level + required_margin:
             reasons.append(
-                "prezzo LONG troppo vicino al livello breakout"
+                f"continuazione LONG insufficiente "
+                f"(< {FINAL_BREAKOUT_MARGIN_ATR15:.2f} ATR oltre breakout)"
             )
     else:
         if live15["c"] > level - required_margin:
             reasons.append(
-                "prezzo SHORT troppo vicino al livello breakout"
+                f"continuazione SHORT insufficiente "
+                f"(< {FINAL_BREAKOUT_MARGIN_ATR15:.2f} ATR oltre breakout)"
             )
+
+    # ------------------------------------------------------
+    # 4. POSIZIONE CHIUSURA NEL RANGE LIVE
+    # ------------------------------------------------------
+
+    live_range = live15["h"] - live15["l"]
+
+    if live_range <= 0:
+        reasons.append("range candela live non valido")
+    else:
+        close_position = (
+            live15["c"] - live15["l"]
+        ) / live_range
+
+        if direction == "LONG":
+            if close_position < LIVE_CLOSE_POSITION_MIN:
+                reasons.append(
+                    f"chiusura LONG debole nel range "
+                    f"({close_position:.2f} < "
+                    f"{LIVE_CLOSE_POSITION_MIN:.2f})"
+                )
+        else:
+            short_max_position = 1.0 - LIVE_CLOSE_POSITION_MIN
+
+            if close_position > short_max_position:
+                reasons.append(
+                    f"chiusura SHORT debole nel range "
+                    f"({close_position:.2f} > "
+                    f"{short_max_position:.2f})"
+                )
+
+    # ------------------------------------------------------
+    # 5. ANTI-INVERSIONE
+    # ------------------------------------------------------
 
     if live_reversal(live15, direction):
         reasons.append("inversione live post-HOLD")
 
+    # ------------------------------------------------------
+    # 6. VOLUME LIVE
+    # ------------------------------------------------------
+
     if live_elapsed_seconds < LIVE_VOLUME_MIN_ELAPSED_SECONDS:
         reasons.append("volume live ancora troppo precoce")
+
     elif live_volume_pace < LIVE_VOLUME_PACE_MIN:
         reasons.append(
             f"volume live pace {live_volume_pace:.2f}x "
@@ -732,7 +793,7 @@ def calculate_leverage(entry, stop, quality, aggressive_ok):
 
 
 # ==========================================================
-# BTC REGIME V6.2
+# BTC REGIME V6.3
 # ==========================================================
 
 def get_btc_bias(data):
@@ -918,7 +979,7 @@ def volume_score(vol15, vol1h):
 
 
 # ==========================================================
-# HOLD V6.2
+# HOLD V6.3
 # ==========================================================
 
 def breakout_hold_check(
@@ -1488,7 +1549,7 @@ def analyze_symbol(symbol, data, btc_bias):
     direction = "LONG" if candidate_long else "SHORT"
 
     # ======================================================
-    # V6.2 - CONFERMA FINALE DOPO HOLD
+    # V6.3 - CONFERMA FINALE CONTINUAZIONE
     # ======================================================
 
     level = resistance if direction == "LONG" else support
@@ -1507,11 +1568,8 @@ def analyze_symbol(symbol, data, btc_bias):
         return None
 
     # ======================================================
-    # V6.2.1 - ANTI-INSEGUIMENTO DOPO HOLD
+    # ANTI-INSEGUIMENTO DOPO HOLD
     # ======================================================
-    # Ricontrollo l'estensione usando il prezzo LIVE attuale.
-    # Se nei 3 minuti di HOLD il prezzo e' gia corso oltre
-    # MAX_EXTENSION_ATR15 dal livello di breakout, niente ENTRY.
 
     post_hold_extension = (
         price - level
@@ -1624,7 +1682,7 @@ def analyze_symbol(symbol, data, btc_bias):
         return None
 
     # ======================================================
-    # SCORE V6.2
+    # SCORE V6.3
     # ======================================================
 
     score = 0
@@ -1928,11 +1986,12 @@ def build_message(symbol, signal):
         f"Follow-through: {signal['follow_through_atr']:.2f} ATR15\n"
         f"BTC: {signal['btc']}\n"
         f"Liquidazioni 15m: {liq_text}\n"
-        f"Score V6.2: {signal['quality']}\n"
+        f"Score V6.3: {signal['quality']}\n"
         f"Componenti: {score_text}\n"
         f"Grado conferma: {grade}\n"
         "HOLD breakout: SUPERATO\n"
         "Candela live successiva: CONFERMATA\n"
+        "Continuazione post-HOLD: CONFERMATA\n"
         "Momentum post-HOLD: CONFERMATO\n"
         "Volume live post-HOLD: CONFERMATO\n"
         "Timeframe: 15m / 1H / 4H\n\n"
@@ -2072,12 +2131,12 @@ threading.Thread(
 
 print(
     "CryptoSignalAI12 avviato - "
-    "modalita V6.2.1 LIVE CONTINUATION attiva"
+    "modalita V6.3 CONTINUATION FILTER attiva"
 )
 
 send_telegram(
     "CryptoSignalAI12 ONLINE\n"
-    "V6.2.1 LIVE CONTINUATION attiva.\n"
+    "V6.3 CONTINUATION FILTER attiva.\n"
     "Telegram invia solo SEGNALI CONFERMATI.\n"
     "Volume breakout 15m: floor 1.15x, poi scoring.\n"
     "Volume 1H: floor 0.30x, poi scoring.\n"
@@ -2088,8 +2147,9 @@ send_telegram(
     "Dopo HOLD il prezzo deve restare oltre il livello.\n"
     "LONG: candela live successiva VERDE.\n"
     "SHORT: candela live successiva ROSSA.\n"
-    "Body live minimo: 0.03 ATR15.\n"
-    "Margine post-breakout: 0.02 ATR15.\n"
+    "Body live minimo: 0.05 ATR15.\n"
+    "Continuazione minima oltre breakout: 0.06 ATR15.\n"
+    "Chiusura live direzionale: minimo 60% del range.\n"
     "Volume live: normalizzato per il tempo trascorso.\n"
     "Volume live pace minimo: 0.80x.\n"
     "Anti-inversione ricontrollata dopo HOLD.\n"
