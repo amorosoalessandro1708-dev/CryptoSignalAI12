@@ -37,18 +37,8 @@ LIQ_WINDOW_SECONDS = 15 * 60
 
 
 # ==========================================================
-# V6.3.1 - CACHE REST
+# V6.3.2 - CACHE REST
 # ==========================================================
-
-# 15m resta LIVE: viene scaricato ad ogni scansione.
-# 1H e 4H vengono conservati in cache.
-#
-# TTL volutamente inferiori alla durata della candela:
-# 1H viene aggiornato almeno ogni 15 minuti.
-# 4H viene aggiornato almeno ogni 60 minuti.
-#
-# Questo mantiene i dati sufficientemente freschi,
-# riducendo molto le chiamate REST.
 
 CACHE_1H_SECONDS = 15 * 60
 CACHE_4H_SECONDS = 60 * 60
@@ -104,7 +94,7 @@ REQUIRE_PRICE_BEYOND_LEVEL_AFTER_HOLD = True
 
 
 # ==========================================================
-# V6.3 - CONTINUAZIONE LIVE POST-HOLD
+# V6.3.2 - CONTINUAZIONE LIVE POST-HOLD
 # ==========================================================
 
 REQUIRE_LIVE_DIRECTION_AFTER_HOLD = True
@@ -113,7 +103,10 @@ LIVE_BODY_ATR_MIN = 0.05
 FINAL_BREAKOUT_MARGIN_ATR15 = 0.06
 LIVE_CLOSE_POSITION_MIN = 0.60
 
-LIVE_VOLUME_PACE_MIN = 0.80
+# MODIFICA:
+# prima 0.80, ora 1.00.
+LIVE_VOLUME_PACE_MIN = 1.00
+
 LIVE_VOLUME_MIN_ELAPSED_SECONDS = 120
 LIVE_VOLUME_PACE_CAP = 4.00
 
@@ -156,11 +149,26 @@ ATR_MAX_PCT = 6.00
 
 
 # ==========================================================
-# ANTI-INVERSIONE / ANTI-INSEGUIMENTO
+# ANTI-INVERSIONE / ANTI-INSEGUIMENTO V6.3.2
 # ==========================================================
 
 MAX_LIVE_RETRACE = 0.45
+
+# Limite generale già presente.
 MAX_EXTENSION_ATR15 = 1.20
+
+# Nuovo controllo anti-esaurimento.
+#
+# Misura quanto il prezzo è già avanzato dal livello
+# strutturale al momento della conferma.
+#
+# Per i confermati normali siamo più prudenti.
+# La logica Aggressivo 20x+ rimane separata.
+NORMAL_MAX_POST_HOLD_EXTENSION_ATR15 = 0.90
+
+# Se la candela live ha già percorso una distanza molto
+# grande rispetto ad ATR15, evitiamo di inseguire il prezzo.
+NORMAL_MAX_LIVE_RANGE_ATR15 = 1.60
 
 
 # ==========================================================
@@ -202,11 +210,8 @@ LEVERAGE_STEPS = [
 
 
 # ==========================================================
-# PROTEZIONE BINANCE V6.3.1
+# PROTEZIONE BINANCE V6.3.2
 # ==========================================================
-
-# Prima: 0.18
-# Ora: 0.30 per alleggerire ulteriormente il rate REST.
 
 MIN_REST_GAP_SECONDS = 0.30
 
@@ -420,7 +425,6 @@ def get_cached_klines(
 
 
 def market_data(symbol):
-    # 15m SEMPRE aggiornato.
     c15 = parse_candles(
         get_klines(
             symbol,
@@ -428,14 +432,12 @@ def market_data(symbol):
         )
     )
 
-    # 1H CACHE
     c1h = get_cached_klines(
         symbol,
         "1h",
         CACHE_1H_SECONDS
     )
 
-    # 4H CACHE
     c4h = get_cached_klines(
         symbol,
         "4h",
@@ -687,7 +689,7 @@ def live_reversal(
 
 
 # ==========================================================
-# V6.3 - CONFERMA FINALE CONTINUAZIONE
+# V6.3.2 - CONFERMA FINALE CONTINUAZIONE
 # ==========================================================
 
 def final_live_confirmation(
@@ -705,8 +707,6 @@ def final_live_confirmation(
         return False, [
             "ATR15 non valido"
         ]
-
-    # DIREZIONE LIVE
 
     if REQUIRE_LIVE_DIRECTION_AFTER_HOLD:
 
@@ -726,8 +726,6 @@ def final_live_confirmation(
                 "candela live non rossa"
             )
 
-    # BODY LIVE
-
     live_body = abs(
         live15["c"]
         - live15["o"]
@@ -746,8 +744,6 @@ def final_live_confirmation(
             f"{live_body_atr:.2f} ATR "
             f"< {LIVE_BODY_ATR_MIN:.2f}"
         )
-
-    # CONTINUAZIONE REALE
 
     required_margin = (
         atr15
@@ -775,8 +771,6 @@ def final_live_confirmation(
                 "continuazione SHORT "
                 "insufficiente"
             )
-
-    # POSIZIONE CHIUSURA LIVE
 
     live_range = (
         live15["h"]
@@ -820,8 +814,6 @@ def final_live_confirmation(
                     f"({close_position:.2f})"
                 )
 
-    # ANTI-INVERSIONE
-
     if live_reversal(
         live15,
         direction
@@ -829,8 +821,6 @@ def final_live_confirmation(
         reasons.append(
             "inversione live post-HOLD"
         )
-
-    # VOLUME LIVE
 
     if (
         live_elapsed_seconds
@@ -1907,35 +1897,13 @@ def analyze_symbol(
         for c in c4h[:-1]
     ]
 
-    e20_1h = ema(
-        closes1h,
-        20
-    )
+    e20_1h = ema(closes1h, 20)
+    e50_1h = ema(closes1h, 50)
+    e20_4h = ema(closes4h, 20)
+    e50_4h = ema(closes4h, 50)
 
-    e50_1h = ema(
-        closes1h,
-        50
-    )
-
-    e20_4h = ema(
-        closes4h,
-        20
-    )
-
-    e50_4h = ema(
-        closes4h,
-        50
-    )
-
-    atr15 = atr(
-        c15[:-1],
-        14
-    )
-
-    atr1h = atr(
-        c1h[:-1],
-        14
-    )
+    atr15 = atr(c15[:-1], 14)
+    atr1h = atr(c1h[:-1], 14)
 
     if None in (
         e20_1h,
@@ -2118,32 +2086,24 @@ def analyze_symbol(
         else 0.0
     )
 
-    strong15_long = (
-        candle_strength(
-            last15,
-            "LONG"
-        )
+    strong15_long = candle_strength(
+        last15,
+        "LONG"
     )
 
-    strong15_short = (
-        candle_strength(
-            last15,
-            "SHORT"
-        )
+    strong15_short = candle_strength(
+        last15,
+        "SHORT"
     )
 
-    reversing_long = (
-        live_reversal(
-            live15,
-            "LONG"
-        )
+    reversing_long = live_reversal(
+        live15,
+        "LONG"
     )
 
-    reversing_short = (
-        live_reversal(
-            live15,
-            "SHORT"
-        )
+    reversing_short = live_reversal(
+        live15,
+        "SHORT"
     )
 
     extension_long = (
@@ -2234,7 +2194,7 @@ def analyze_symbol(
         or early_break_short
     )
 
-    # DIAGNOSTICA LONG
+    # DIAGNOSTICA
 
     if (
         attempt_long
@@ -2270,37 +2230,26 @@ def analyze_symbol(
                 "trend1H non LONG"
             )
 
-        if (
-            vol15
-            < CONFIRM_VOL_15M_FLOOR
-        ):
+        if vol15 < CONFIRM_VOL_15M_FLOOR:
             reasons.append(
                 f"volume15 {vol15:.2f}x "
                 f"< floor "
                 f"{CONFIRM_VOL_15M_FLOOR:.2f}x"
             )
 
-        if (
-            vol1h
-            < CONFIRM_VOL_1H_FLOOR
-        ):
+        if vol1h < CONFIRM_VOL_1H_FLOOR:
             reasons.append(
                 f"volume1H {vol1h:.2f}x"
             )
 
-        if (
-            body_atr
-            < CONFIRM_BODY_ATR_FLOOR
-        ):
+        if body_atr < CONFIRM_BODY_ATR_FLOOR:
             reasons.append(
-                f"body/ATR "
-                f"{body_atr:.2f}"
+                f"body/ATR {body_atr:.2f}"
             )
 
         if not volatility_ok:
             reasons.append(
-                f"ATR1H "
-                f"{atr_pct:.2f}%"
+                f"ATR1H {atr_pct:.2f}%"
             )
 
         if reversing_long:
@@ -2318,8 +2267,6 @@ def analyze_symbol(
             "LONG",
             reasons
         )
-
-    # DIAGNOSTICA SHORT
 
     if (
         attempt_short
@@ -2355,37 +2302,26 @@ def analyze_symbol(
                 "trend1H non SHORT"
             )
 
-        if (
-            vol15
-            < CONFIRM_VOL_15M_FLOOR
-        ):
+        if vol15 < CONFIRM_VOL_15M_FLOOR:
             reasons.append(
                 f"volume15 {vol15:.2f}x "
                 f"< floor "
                 f"{CONFIRM_VOL_15M_FLOOR:.2f}x"
             )
 
-        if (
-            vol1h
-            < CONFIRM_VOL_1H_FLOOR
-        ):
+        if vol1h < CONFIRM_VOL_1H_FLOOR:
             reasons.append(
                 f"volume1H {vol1h:.2f}x"
             )
 
-        if (
-            body_atr
-            < CONFIRM_BODY_ATR_FLOOR
-        ):
+        if body_atr < CONFIRM_BODY_ATR_FLOOR:
             reasons.append(
-                f"body/ATR "
-                f"{body_atr:.2f}"
+                f"body/ATR {body_atr:.2f}"
             )
 
         if not volatility_ok:
             reasons.append(
-                f"ATR1H "
-                f"{atr_pct:.2f}%"
+                f"ATR1H {atr_pct:.2f}%"
             )
 
         if reversing_short:
@@ -2449,15 +2385,13 @@ def analyze_symbol(
                 "direction": "LONG",
                 "price": price,
                 "level": resistance,
-                "invalidation":
-                    invalidation,
+                "invalidation": invalidation,
                 "volume1h": vol1h,
                 "volume15": vol15,
                 "atr_pct": atr_pct,
                 "quality": quality,
                 "leverage": leverage,
-                "early_break":
-                    early_break_long,
+                "early_break": early_break_long,
             }
 
         if pre_short:
@@ -2498,15 +2432,13 @@ def analyze_symbol(
                 "direction": "SHORT",
                 "price": price,
                 "level": support,
-                "invalidation":
-                    invalidation,
+                "invalidation": invalidation,
                 "volume1h": vol1h,
                 "volume15": vol15,
                 "atr_pct": atr_pct,
                 "quality": quality,
                 "leverage": leverage,
-                "early_break":
-                    early_break_short,
+                "early_break": early_break_short,
             }
 
         return None
@@ -2520,8 +2452,7 @@ def analyze_symbol(
             level=resistance,
             price=price,
             atr15=atr15,
-            breakout_candle_time=
-                last15["t"]
+            breakout_candle_time=last15["t"]
         )
 
     else:
@@ -2531,8 +2462,7 @@ def analyze_symbol(
             level=support,
             price=price,
             atr15=atr15,
-            breakout_candle_time=
-                last15["t"]
+            breakout_candle_time=last15["t"]
         )
 
     if not hold_ok:
@@ -2550,7 +2480,7 @@ def analyze_symbol(
         else support
     )
 
-    # CONFERMA LIVE V6.3
+    # CONFERMA LIVE
 
     (
         live_confirmation_ok,
@@ -2561,16 +2491,16 @@ def analyze_symbol(
         live15=live15,
         level=level,
         atr15=atr15,
-        live_volume_pace=
-            live_volume_pace,
-        live_elapsed_seconds=
-            live_volume_elapsed
+        live_volume_pace=live_volume_pace,
+        live_elapsed_seconds=live_volume_elapsed
     )
 
     if not live_confirmation_ok:
         return None
 
-    # ANTI-INSEGUIMENTO
+    # ======================================================
+    # NUOVO ANTI-ESAURIMENTO / ANTI-CHASING
+    # ======================================================
 
     post_hold_extension = (
         price - level
@@ -2578,10 +2508,23 @@ def analyze_symbol(
         else level - price
     )
 
+    post_hold_extension_atr = (
+        post_hold_extension / atr15
+    )
+
+    live_range = (
+        live15["h"]
+        - live15["l"]
+    )
+
+    live_range_atr = (
+        live_range / atr15
+    )
+
+    # Primo limite assoluto già esistente.
     if (
-        post_hold_extension
-        > atr15
-        * MAX_EXTENSION_ATR15
+        post_hold_extension_atr
+        > MAX_EXTENSION_ATR15
     ):
         log_no_confirm(
             symbol,
@@ -2589,9 +2532,35 @@ def analyze_symbol(
             [
                 f"prezzo troppo esteso "
                 f"dopo HOLD "
-                f"({post_hold_extension / atr15:.2f} "
+                f"({post_hold_extension_atr:.2f} "
                 f"ATR15 > "
                 f"{MAX_EXTENSION_ATR15:.2f})"
+            ]
+        )
+
+        return None
+
+    # Nuovo filtro per evitare di inseguire una spinta
+    # già molto avanzata.
+    #
+    # Non modifica i criteri con cui viene definito
+    # successivamente un segnale aggressivo; serve come
+    # protezione di ingresso dei confermati.
+    if (
+        post_hold_extension_atr
+        > NORMAL_MAX_POST_HOLD_EXTENSION_ATR15
+        and live_range_atr
+        > NORMAL_MAX_LIVE_RANGE_ATR15
+    ):
+        log_no_confirm(
+            symbol,
+            direction,
+            [
+                "anti-esaurimento",
+                f"estensione "
+                f"{post_hold_extension_atr:.2f} ATR15",
+                f"range live "
+                f"{live_range_atr:.2f} ATR15"
             ]
         )
 
@@ -2911,7 +2880,7 @@ def analyze_symbol(
 
         return None
 
-    # AGGRESSIVO
+    # AGGRESSIVO - PARAMETRI INVARIATI
 
     btc_aggressive_ok = (
         btc_allows_aggressive(
@@ -2981,8 +2950,6 @@ def analyze_symbol(
     if risk <= 0:
         return None
 
-    # LEVA
-
     leverage = calculate_leverage(
         entry,
         stop,
@@ -2990,16 +2957,13 @@ def analyze_symbol(
         aggressive_ok
     )
 
-    # TARGET
-
     target_data = (
         intelligent_targets(
             direction=direction,
             entry=entry,
             stop=stop,
             quality=score,
-            aggressive_ok=
-                aggressive_ok
+            aggressive_ok=aggressive_ok
         )
     )
 
@@ -3041,24 +3005,23 @@ def analyze_symbol(
         "level": level,
         "volume1h": vol1h,
         "volume15": vol15,
-        "live_volume_pace":
-            live_volume_pace,
-        "live_volume_elapsed":
-            live_volume_elapsed,
+        "live_volume_pace": live_volume_pace,
+        "live_volume_elapsed": live_volume_elapsed,
         "atr_pct": atr_pct,
         "quality": score,
-        "score_breakdown":
-            score_breakdown,
+        "score_breakdown": score_breakdown,
         "leverage": leverage,
         "oi": oi_change,
         "funding": funding,
         "btc": btc_bias,
         "long_liq": long_liq,
         "short_liq": short_liq,
-        "liq_available":
-            liq_available,
-        "follow_through_atr":
-            follow_atr,
+        "liq_available": liq_available,
+        "follow_through_atr": follow_atr,
+        "post_hold_extension_atr":
+            post_hold_extension_atr,
+        "live_range_atr":
+            live_range_atr,
         "aggressive":
             leverage >= 20
             and aggressive_ok,
@@ -3128,29 +3091,15 @@ def build_message(
         * 100
     )
 
-    if (
-        signal["direction"]
-        == "LONG"
-    ):
-        favorable_liq = (
-            signal["short_liq"]
-        )
-
-        adverse_liq = (
-            signal["long_liq"]
-        )
+    if signal["direction"] == "LONG":
+        favorable_liq = signal["short_liq"]
+        adverse_liq = signal["long_liq"]
 
     else:
-        favorable_liq = (
-            signal["long_liq"]
-        )
-
-        adverse_liq = (
-            signal["short_liq"]
-        )
+        favorable_liq = signal["long_liq"]
+        adverse_liq = signal["short_liq"]
 
     if signal["liq_available"]:
-
         liq_text = (
             f"Favorevoli "
             f"{fmt_money(favorable_liq)}"
@@ -3220,6 +3169,10 @@ def build_message(
         f"{signal['follow_through_atr']:.2f} "
         "ATR15\n"
 
+        f"Estensione post-HOLD: "
+        f"{signal['post_hold_extension_atr']:.2f} "
+        "ATR15\n"
+
         f"BTC: "
         f"{signal['btc']}\n"
 
@@ -3244,6 +3197,7 @@ def build_message(
         "CONFERMATO\n"
         "Volume live post-HOLD: "
         "CONFERMATO\n"
+        "Anti-esaurimento: SUPERATO\n"
 
         "Timeframe: 15m / 1H / 4H\n\n"
 
@@ -3434,13 +3388,12 @@ threading.Thread(
 
 print(
     "CryptoSignalAI12 avviato - "
-    "V6.3.1 REST OPTIMIZED"
+    "V6.3.2 ANTI-EXHAUSTION"
 )
 
 send_telegram(
     "CryptoSignalAI12 ONLINE\n"
-    "V6.3.1 REST OPTIMIZED attiva.\n"
-    "Logica segnali V6.3 invariata.\n"
+    "V6.3.2 ANTI-EXHAUSTION attiva.\n"
     "15m aggiornato ad ogni scansione.\n"
     "1H e 4H ottimizzati tramite cache REST.\n"
     "Protezione Binance 429 potenziata.\n"
@@ -3448,11 +3401,13 @@ send_telegram(
     "Body live minimo: 0.05 ATR15.\n"
     "Continuazione minima: 0.06 ATR15.\n"
     "Chiusura live direzionale: minimo 60% del range.\n"
-    "Volume live pace minimo: 0.80x.\n"
+    "Volume live pace minimo: 1.00x.\n"
     "Volume breakout 15m floor: 1.15x.\n"
     "Volume 1H floor: 0.30x.\n"
     "Score minimo confermato: 7.\n"
     "OI hard floor: -0.10%.\n"
+    "Anti-esaurimento / anti-chasing attivo.\n"
+    "Estensione normale post-HOLD: 0.90 ATR15.\n"
     "Aggressivo 20x+: filtri separati invariati.\n"
     "Scanner: 12 coppie / ciclo."
 )
