@@ -65,6 +65,7 @@ VOL1H_SCORE_STRONG = 1.00
 
 # ==========================================================
 # V6.3.5 - HOLD 2 MINUTI
+# CANDELA LIVE FORTE: 60%
 # ==========================================================
 
 BREAKOUT_HOLD_SECONDS = 2 * 60
@@ -76,8 +77,8 @@ REQUIRE_LIVE_DIRECTION_AFTER_HOLD = True
 LIVE_BODY_ATR_MIN = 0.05
 FINAL_BREAKOUT_MARGIN_ATR15 = 0.06
 
-# V6.3.5: prima 0.60
-LIVE_CLOSE_POSITION_MIN = 0.55
+# MANTENUTO SELETTIVO: 60%
+LIVE_CLOSE_POSITION_MIN = 0.60
 
 LIVE_VOLUME_PACE_MIN = 1.00
 LIVE_VOLUME_MIN_ELAPSED_SECONDS = 120
@@ -114,18 +115,15 @@ NORMAL_MAX_LIVE_RANGE_ATR15 = 1.60
 
 # ==========================================================
 # V6.3.5 DYNAMIC IMPULSE EXHAUSTION
-# 6 = SOLO MASSIMO LOOKBACK.
-# IL BOT NON ASPETTA 6 CANDELE.
+# 6 = SOLO MASSIMO LOOKBACK
+# IL BOT NON ASPETTA 6 CANDELE
 # ==========================================================
 
 IMPULSE_MAX_LOOKBACK_BARS = 6
 IMPULSE_MIN_BARS = 2
 IMPULSE_PULLBACK_TOLERANCE_ATR15 = 0.20
 
-# V6.3.5: prima 2.50
 NORMAL_MAX_DYNAMIC_IMPULSE_ATR15 = 3.00
-
-# V6.3.5: prima 3.00
 NORMAL_MAX_TOTAL_MOVE_ATR15 = 3.50
 
 
@@ -1947,10 +1945,6 @@ def analyze_symbol(symbol, data, btc_bias):
         atr15
     )
 
-    # ======================================================
-    # V6.3.5: IMPULSO MASSIMO 3.00 ATR15
-    # ======================================================
-
     if (
         impulse_bars >= IMPULSE_MIN_BARS
         and dynamic_impulse_atr
@@ -1968,10 +1962,6 @@ def analyze_symbol(symbol, data, btc_bias):
         )
 
         return None
-
-    # ======================================================
-    # V6.3.5: MOVIMENTO TOTALE MASSIMO 3.50 ATR15
-    # ======================================================
 
     if (
         impulse_bars >= IMPULSE_MIN_BARS
@@ -2724,7 +2714,7 @@ send_telegram(
     "Continuazione minima: 0.06 ATR15.\n"
 
     "Chiusura live direzionale: "
-    "minimo 55% del range.\n"
+    "minimo 60% del range.\n"
 
     "Volume live pace minimo: 1.00x.\n"
 
