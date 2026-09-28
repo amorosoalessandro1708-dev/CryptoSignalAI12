@@ -37,7 +37,7 @@ LIQ_WINDOW_SECONDS = 15 * 60
 
 
 # ==========================================================
-# V6.3.2 - CACHE REST
+# V6.3.3 - CACHE REST
 # ==========================================================
 
 CACHE_1H_SECONDS = 15 * 60
@@ -94,7 +94,7 @@ REQUIRE_PRICE_BEYOND_LEVEL_AFTER_HOLD = True
 
 
 # ==========================================================
-# V6.3.2 - CONTINUAZIONE LIVE POST-HOLD
+# V6.3.3 - CONTINUAZIONE LIVE POST-HOLD
 # ==========================================================
 
 REQUIRE_LIVE_DIRECTION_AFTER_HOLD = True
@@ -103,8 +103,6 @@ LIVE_BODY_ATR_MIN = 0.05
 FINAL_BREAKOUT_MARGIN_ATR15 = 0.06
 LIVE_CLOSE_POSITION_MIN = 0.60
 
-# MODIFICA:
-# prima 0.80, ora 1.00.
 LIVE_VOLUME_PACE_MIN = 1.00
 
 LIVE_VOLUME_MIN_ELAPSED_SECONDS = 120
@@ -149,26 +147,31 @@ ATR_MAX_PCT = 6.00
 
 
 # ==========================================================
-# ANTI-INVERSIONE / ANTI-INSEGUIMENTO V6.3.2
+# ANTI-INVERSIONE / ANTI-INSEGUIMENTO
 # ==========================================================
 
 MAX_LIVE_RETRACE = 0.45
 
-# Limite generale già presente.
 MAX_EXTENSION_ATR15 = 1.20
 
-# Nuovo controllo anti-esaurimento.
-#
-# Misura quanto il prezzo è già avanzato dal livello
-# strutturale al momento della conferma.
-#
-# Per i confermati normali siamo più prudenti.
-# La logica Aggressivo 20x+ rimane separata.
 NORMAL_MAX_POST_HOLD_EXTENSION_ATR15 = 0.90
-
-# Se la candela live ha già percorso una distanza molto
-# grande rispetto ad ATR15, evitiamo di inseguire il prezzo.
 NORMAL_MAX_LIVE_RANGE_ATR15 = 1.60
+
+
+# ==========================================================
+# V6.3.3 - IMPULSE EXHAUSTION
+# ==========================================================
+
+# Numero di candele 15m precedenti utilizzate per capire
+# se il movimento è già molto avanzato prima dell'ingresso.
+IMPULSE_LOOKBACK_BARS = 6
+
+# Massima escursione direzionale precedente.
+NORMAL_MAX_PRIOR_IMPULSE_ATR15 = 2.50
+
+# Massimo movimento totale:
+# impulso precedente + estensione attuale dal breakout.
+NORMAL_MAX_TOTAL_MOVE_ATR15 = 3.00
 
 
 # ==========================================================
@@ -210,7 +213,7 @@ LEVERAGE_STEPS = [
 
 
 # ==========================================================
-# PROTEZIONE BINANCE V6.3.2
+# PROTEZIONE BINANCE V6.3.3
 # ==========================================================
 
 MIN_REST_GAP_SECONDS = 0.30
@@ -293,9 +296,7 @@ def get_json(url, params=None, timeout=15):
             )
 
             if r.status_code in (418, 429):
-                retry_after = r.headers.get(
-                    "Retry-After"
-                )
+                retry_after = r.headers.get("Retry-After")
 
                 try:
                     wait = float(retry_after)
@@ -461,9 +462,7 @@ def ema(values, period):
 
     k = 2 / (period + 1)
 
-    value = sum(
-        values[:period]
-    ) / period
+    value = sum(values[:period]) / period
 
     for price in values[period:]:
         value = (
@@ -641,6 +640,55 @@ def candle_strength(
 
 
 # ==========================================================
+# V6.3.3 - CALCOLO IMPULSO PRECEDENTE
+# ==========================================================
+
+def calculate_prior_impulse(
+    candles,
+    direction,
+    atr15,
+    lookback=IMPULSE_LOOKBACK_BARS
+):
+    if atr15 is None or atr15 <= 0:
+        return 0.0
+
+    # Escludiamo:
+    # - candela live [-1]
+    # - candela breakout chiusa [-2]
+    #
+    # Guardiamo quindi le candele immediatamente precedenti.
+    if len(candles) < lookback + 3:
+        return 0.0
+
+    prior = candles[
+        -(lookback + 2):-2
+    ]
+
+    if not prior:
+        return 0.0
+
+    if direction == "LONG":
+        start_price = prior[0]["l"]
+        end_price = prior[-1]["c"]
+
+        move = max(
+            0.0,
+            end_price - start_price
+        )
+
+    else:
+        start_price = prior[0]["h"]
+        end_price = prior[-1]["c"]
+
+        move = max(
+            0.0,
+            start_price - end_price
+        )
+
+    return move / atr15
+
+
+# ==========================================================
 # ANTI-INVERSIONE LIVE
 # ==========================================================
 
@@ -689,7 +737,7 @@ def live_reversal(
 
 
 # ==========================================================
-# V6.3.2 - CONFERMA FINALE CONTINUAZIONE
+# CONFERMA FINALE CONTINUAZIONE
 # ==========================================================
 
 def final_live_confirmation(
@@ -757,8 +805,7 @@ def final_live_confirmation(
             < level + required_margin
         ):
             reasons.append(
-                "continuazione LONG "
-                "insufficiente"
+                "continuazione LONG insufficiente"
             )
 
     else:
@@ -768,8 +815,7 @@ def final_live_confirmation(
             > level - required_margin
         ):
             reasons.append(
-                "continuazione SHORT "
-                "insufficiente"
+                "continuazione SHORT insufficiente"
             )
 
     live_range = (
@@ -872,15 +918,11 @@ def get_derivatives(symbol):
 
         if len(data) >= 2:
             prev = float(
-                data[-2][
-                    "sumOpenInterestValue"
-                ]
+                data[-2]["sumOpenInterestValue"]
             )
 
             curr = float(
-                data[-1][
-                    "sumOpenInterestValue"
-                ]
+                data[-1]["sumOpenInterestValue"]
             )
 
             if prev > 0:
@@ -1072,24 +1114,14 @@ def liquidation_metrics(symbol):
 
         for event in liquidation_events:
 
-            if (
-                event["symbol"]
-                != symbol
-            ):
+            if event["symbol"] != symbol:
                 continue
 
-            if (
-                event["kind"]
-                == "LONG_LIQ"
-            ):
-                long_liq += (
-                    event["notional"]
-                )
+            if event["kind"] == "LONG_LIQ":
+                long_liq += event["notional"]
 
             else:
-                short_liq += (
-                    event["notional"]
-                )
+                short_liq += event["notional"]
 
     return (
         long_liq,
@@ -1224,25 +1256,10 @@ def get_btc_bias(data):
     ):
         return "NEUTRAL_STABLE"
 
-    e20_1h = ema(
-        closes1h,
-        20
-    )
-
-    e50_1h = ema(
-        closes1h,
-        50
-    )
-
-    e20_4h = ema(
-        closes4h,
-        20
-    )
-
-    e50_4h = ema(
-        closes4h,
-        50
-    )
+    e20_1h = ema(closes1h, 20)
+    e50_1h = ema(closes1h, 50)
+    e20_4h = ema(closes4h, 20)
+    e50_4h = ema(closes4h, 50)
 
     previous_closes = (
         closes1h[:-1]
@@ -2194,7 +2211,7 @@ def analyze_symbol(
         or early_break_short
     )
 
-    # DIAGNOSTICA
+    # DIAGNOSTICA LONG
 
     if (
         attempt_long
@@ -2267,6 +2284,8 @@ def analyze_symbol(
             "LONG",
             reasons
         )
+
+    # DIAGNOSTICA SHORT
 
     if (
         attempt_short
@@ -2499,7 +2518,7 @@ def analyze_symbol(
         return None
 
     # ======================================================
-    # NUOVO ANTI-ESAURIMENTO / ANTI-CHASING
+    # ANTI-ESAURIMENTO POST-HOLD
     # ======================================================
 
     post_hold_extension = (
@@ -2521,7 +2540,6 @@ def analyze_symbol(
         live_range / atr15
     )
 
-    # Primo limite assoluto già esistente.
     if (
         post_hold_extension_atr
         > MAX_EXTENSION_ATR15
@@ -2540,12 +2558,6 @@ def analyze_symbol(
 
         return None
 
-    # Nuovo filtro per evitare di inseguire una spinta
-    # già molto avanzata.
-    #
-    # Non modifica i criteri con cui viene definito
-    # successivamente un segnale aggressivo; serve come
-    # protezione di ingresso dei confermati.
     if (
         post_hold_extension_atr
         > NORMAL_MAX_POST_HOLD_EXTENSION_ATR15
@@ -2561,6 +2573,65 @@ def analyze_symbol(
                 f"{post_hold_extension_atr:.2f} ATR15",
                 f"range live "
                 f"{live_range_atr:.2f} ATR15"
+            ]
+        )
+
+        return None
+
+    # ======================================================
+    # V6.3.3 - IMPULSE EXHAUSTION
+    # ======================================================
+
+    prior_impulse_atr = calculate_prior_impulse(
+        candles=c15,
+        direction=direction,
+        atr15=atr15,
+        lookback=IMPULSE_LOOKBACK_BARS
+    )
+
+    total_move_atr = (
+        prior_impulse_atr
+        + max(
+            0.0,
+            post_hold_extension_atr
+        )
+    )
+
+    if (
+        prior_impulse_atr
+        > NORMAL_MAX_PRIOR_IMPULSE_ATR15
+    ):
+        log_no_confirm(
+            symbol,
+            direction,
+            [
+                "IMPULSE EXHAUSTION",
+                f"impulso precedente "
+                f"{prior_impulse_atr:.2f} ATR15 "
+                f"> "
+                f"{NORMAL_MAX_PRIOR_IMPULSE_ATR15:.2f}"
+            ]
+        )
+
+        return None
+
+    if (
+        total_move_atr
+        > NORMAL_MAX_TOTAL_MOVE_ATR15
+    ):
+        log_no_confirm(
+            symbol,
+            direction,
+            [
+                "IMPULSE EXHAUSTION",
+                f"movimento totale "
+                f"{total_move_atr:.2f} ATR15 "
+                f"> "
+                f"{NORMAL_MAX_TOTAL_MOVE_ATR15:.2f}",
+                f"impulso precedente "
+                f"{prior_impulse_atr:.2f}",
+                f"post-HOLD "
+                f"{post_hold_extension_atr:.2f}"
             ]
         )
 
@@ -2880,7 +2951,7 @@ def analyze_symbol(
 
         return None
 
-    # AGGRESSIVO - PARAMETRI INVARIATI
+    # AGGRESSIVO
 
     btc_aggressive_ok = (
         btc_allows_aggressive(
@@ -2950,12 +3021,16 @@ def analyze_symbol(
     if risk <= 0:
         return None
 
+    # LEVA
+
     leverage = calculate_leverage(
         entry,
         stop,
         score,
         aggressive_ok
     )
+
+    # TARGET
 
     target_data = (
         intelligent_targets(
@@ -3022,6 +3097,10 @@ def analyze_symbol(
             post_hold_extension_atr,
         "live_range_atr":
             live_range_atr,
+        "prior_impulse_atr":
+            prior_impulse_atr,
+        "total_move_atr":
+            total_move_atr,
         "aggressive":
             leverage >= 20
             and aggressive_ok,
@@ -3388,12 +3467,12 @@ threading.Thread(
 
 print(
     "CryptoSignalAI12 avviato - "
-    "V6.3.2 ANTI-EXHAUSTION"
+    "V6.3.3 IMPULSE EXHAUSTION"
 )
 
 send_telegram(
     "CryptoSignalAI12 ONLINE\n"
-    "V6.3.2 ANTI-EXHAUSTION attiva.\n"
+    "V6.3.3 IMPULSE EXHAUSTION attiva.\n"
     "15m aggiornato ad ogni scansione.\n"
     "1H e 4H ottimizzati tramite cache REST.\n"
     "Protezione Binance 429 potenziata.\n"
@@ -3408,7 +3487,10 @@ send_telegram(
     "OI hard floor: -0.10%.\n"
     "Anti-esaurimento / anti-chasing attivo.\n"
     "Estensione normale post-HOLD: 0.90 ATR15.\n"
-    "Aggressivo 20x+: filtri separati invariati.\n"
+    "Impulse Exhaustion: 6 candele 15m.\n"
+    "Impulso precedente massimo: 2.50 ATR15.\n"
+    "Movimento totale massimo: 3.00 ATR15.\n"
+    "Aggressivo 20x+: parametri invariati.\n"
     "Scanner: 12 coppie / ciclo."
 )
 
