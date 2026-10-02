@@ -89,7 +89,7 @@ MAX_EXTENSION_ATR15 = 1.20
 NORMAL_MAX_POST_HOLD_EXTENSION_ATR15 = 0.90
 NORMAL_MAX_LIVE_RANGE_ATR15 = 1.60
 
-# V6.4 LIVE DIRECTION RESET
+# V6.4.1 LIVE DIRECTION RESET
 # Logica di mercato semplificata:
 # 15m = ingresso sulla PRIMA candela ancora aperta
 # 1H = direzione principale
@@ -290,74 +290,6 @@ def candle_strength(candle, direction):
     if direction == "LONG":
         return candle["c"] > candle["o"] and body >= 0.50 and close_pos >= 0.65
     return candle["c"] < candle["o"] and body >= 0.50 and close_pos <= 0.35
-
-
-def calculate_dynamic_impulse(candles, direction, atr15, max_lookback=IMPULSE_MAX_LOOKBACK_BARS):
-    """Rileva l'impulso recente usando da 2 a massimo 6 candele chiuse.
-    Non introduce alcuna attesa aggiuntiva."""
-    if atr15 is None or atr15 <= 0 or len(candles) < 4:
-        return 0.0, 0.0, 0
-    closed = candles[:-1]
-    recent = closed[-min(max_lookback, len(closed)):]
-    if len(recent) < 2:
-        return 0.0, 0.0, 0
-
-    tolerance = atr15 * IMPULSE_PULLBACK_TOLERANCE_ATR15
-    start_index = len(recent) - 1
-
-    if direction == "LONG":
-        reference_low = recent[-1]["l"]
-        for i in range(len(recent) - 2, -1, -1):
-            current, nxt = recent[i], recent[i + 1]
-            progressing = current["l"] <= reference_low + tolerance
-            close_not_too_high = current["c"] <= nxt["c"] + tolerance
-            if progressing and close_not_too_high:
-                start_index = i
-                reference_low = min(reference_low, current["l"])
-            else:
-                break
-        bars_used = len(recent) - start_index
-        if bars_used < IMPULSE_MIN_BARS:
-            return 0.0, 0.0, bars_used
-        impulse_start = min(c["l"] for c in recent[start_index:])
-        impulse_move = max(0.0, recent[-1]["c"] - impulse_start)
-        total_move = max(0.0, candles[-1]["c"] - impulse_start)
-    else:
-        reference_high = recent[-1]["h"]
-        for i in range(len(recent) - 2, -1, -1):
-            current, nxt = recent[i], recent[i + 1]
-            progressing = current["h"] >= reference_high - tolerance
-            close_not_too_low = current["c"] >= nxt["c"] - tolerance
-            if progressing and close_not_too_low:
-                start_index = i
-                reference_high = max(reference_high, current["h"])
-            else:
-                break
-        bars_used = len(recent) - start_index
-        if bars_used < IMPULSE_MIN_BARS:
-            return 0.0, 0.0, bars_used
-        impulse_start = max(c["h"] for c in recent[start_index:])
-        impulse_move = max(0.0, impulse_start - recent[-1]["c"])
-        total_move = max(0.0, impulse_start - candles[-1]["c"])
-
-    return impulse_move / atr15, total_move / atr15, bars_used
-
-
-def calculate_swing_excursion(candles, direction, atr15, lookback=SWING_LOOKBACK_BARS):
-    if atr15 is None or atr15 <= 0 or len(candles) < 4:
-        return 0.0
-    closed = candles[:-1]
-    recent = closed[-min(lookback, len(closed)):]
-    if not recent:
-        return 0.0
-    live_price = candles[-1]["c"]
-    if direction == "LONG":
-        swing_start = min(c["l"] for c in recent)
-        move = max(0.0, live_price - swing_start)
-    else:
-        swing_start = max(c["h"] for c in recent)
-        move = max(0.0, swing_start - live_price)
-    return move / atr15
 
 
 def live_reversal(candle, direction):
@@ -1075,11 +1007,11 @@ def scan_market():
 
 threading.Thread(target=ws_loop,daemon=True).start()
 
-print("CryptoSignalAI12 avviato - V6.4 LIVE DIRECTION RESET")
+print("CryptoSignalAI12 avviato - V6.4.1 LIVE DIRECTION RESET")
 
 send_telegram(
     "CryptoSignalAI12 ONLINE\n"
-    "V6.4 LIVE DIRECTION RESET attiva.\n"
+    "V6.4.1 LIVE DIRECTION RESET attiva.\n"
     "\n--- LOGICA MERCATO ---\n"
     "15m: ingresso sulla PRIMA candela ancora aperta.\n"
     "Volume LIVE minimo: 2.50x ritmo atteso.\n"
