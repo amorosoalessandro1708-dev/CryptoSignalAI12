@@ -852,28 +852,34 @@ def analyze_symbol(symbol, data, btc_bias):
 
 def build_message(symbol, signal):
     pair = symbol.replace("USDT", "/USDT")
-    title = "🔥 LIVE POWER AGGRESSIVO" if signal.get("aggressive", False) else "⚡ LIVE POWER CONFERMATO"
+    aggressive = signal.get("aggressive", False)
+
+    title = (
+        "🔥 LIVE POWER AGGRESSIVO"
+        if aggressive
+        else "⚡ LIVE POWER CONFERMATO"
+    )
+
     return (
-        f"{title}\\n{pair} — {signal['direction']}\\n\\n"
-        f"ENTRY: {fmt_price(signal['entry_low'])} - {fmt_price(signal['entry_high'])}\\n"
-        f"SL intelligente: {fmt_price(signal['sl'])}\\n"
-        f"TP1: {fmt_price(signal['tp1'])} ({signal['tp1_r']:.2f}R)\\n"
-        f"TP2: {fmt_price(signal['tp2'])} ({signal['tp2_r']:.2f}R)\\n"
-        f"TP3: {fmt_price(signal['tp3'])} ({signal['tp3_r']:.2f}R)\\n"
-        f"Leva indicativa: {signal['leverage']}x\\n\\n"
-        f"Volume LIVE: {signal['live_volume_pace']:.2f}x\\n"
-        f"Body LIVE: {signal['live_body_atr']:.2f} ATR15\\n"
-        f"Breakout BODY: {signal['follow_through_atr']:.2f} ATR15\\n"
-        f"Rejection wick: {signal['rejection_wick_ratio']:.2f}x body — OK\\n"
-        f"Trend 1H: CONCORDE\\n"
-        f"Contesto 4H: {signal['context4h']} — NON OPPOSTO\\n"
-        f"BTC: {signal['btc']}\\n\\n"
-        "Prima candela 15m: ANCORA APERTA\\n"
-        "Volume >= 2.50x: CONFERMATO\\n"
-        "Wick Guard: SUPERATO\\n"
-        "HOLD: NON RICHIESTO\\n"
-        "Chiusura prima candela: NON ATTESA\\n"
-        "Seconda candela: NON ATTESA"
+        f"{title}\n"
+        f"{pair} — {signal['direction']}\n\n"
+        f"ENTRY: {fmt_price(signal['entry_low'])} - {fmt_price(signal['entry_high'])}\n"
+        f"SL intelligente: {fmt_price(signal['sl'])}\n\n"
+        f"TP1: {fmt_price(signal['tp1'])}\n"
+        f"TP2: {fmt_price(signal['tp2'])}\n"
+        f"TP3: {fmt_price(signal['tp3'])}\n\n"
+        f"Leva indicativa: {signal['leverage']}x\n\n"
+        f"Volume LIVE: {signal['live_volume_pace']:.2f}x\n"
+        f"Body LIVE: {signal['live_body_atr']:.2f} ATR15\n"
+        f"Breakout: CONFERMATO\n"
+        f"Rejection Wick: OK ({signal['rejection_wick_ratio']:.2f}x body)\n\n"
+        f"Trend 1H: CONCORDE\n"
+        f"Contesto 4H: {signal['context4h']} — NON OPPOSTO\n"
+        f"BTC: {signal['btc']}\n\n"
+        "Modalità ingresso: LIVE POWER\n"
+        "Prima candela ancora in formazione\n"
+        "Seconda candela: NON ATTESA\n"
+        "HOLD: NON RICHIESTO"
     )
 
 
@@ -924,18 +930,21 @@ threading.Thread(target=ws_loop,daemon=True).start()
 print("CryptoSignalAI12 avviato - V6.5 LIVE WICK GUARD")
 
 send_telegram(
-    "CryptoSignalAI12 ONLINE\\n"
-    "V6.5 LIVE WICK GUARD attiva.\\n"
-    "15m: ingresso sulla PRIMA candela ancora aperta.\\n"
-    "Volume LIVE minimo: 2.50x.\\n"
-    "Body LIVE minimo: 0.45 ATR15.\\n"
-    "Breakout BODY minimo: 0.10 ATR15.\\n"
-    "Rejection Wick Guard: wick contrario max 50% del body.\\n"
-    "Breakout calcolato sui CORPI delle 2 candele precedenti.\\n"
-    "1H: direzione obbligatoria.\\n"
-    "4H: concorde o neutro; blocca solo se chiaramente opposto.\\n"
-    "BTC: stessa direzione per le altcoin.\\n"
-    "HOLD: NO. Chiusura prima candela: NO. Seconda candela: NO.\\n"
+    "CryptoSignalAI12 ONLINE\n"
+    "V6.5 LIVE WICK GUARD attiva.\n\n"
+    "--- LOGICA MERCATO ---\n"
+    "15m: ingresso sulla PRIMA candela ancora aperta.\n"
+    "Volume LIVE minimo: 2.50x ritmo atteso.\n"
+    "Body LIVE minimo: 0.45 ATR15.\n"
+    "Breakout BODY minimo: 0.10 ATR15.\n"
+    "Rejection Wick Guard: wick contrario max 50% del body.\n"
+    "Breakout calcolato sui CORPI delle 2 candele precedenti.\n"
+    "1H: direzione obbligatoria.\n"
+    "4H: concorde o neutro; blocca solo se chiaramente opposto.\n"
+    "BTC: stessa direzione per le altcoin.\n\n"
+    "HOLD: NON RICHIESTO\n"
+    "Chiusura prima candela: NON ATTESA\n"
+    "Seconda candela: NON ATTESA\n"
     "Scanner: 12 coppie / ciclo ogni 60 secondi."
 )
 
