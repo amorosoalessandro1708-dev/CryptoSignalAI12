@@ -69,7 +69,7 @@ FINAL_BREAKOUT_MARGIN_ATR15 = 0.06
 LIVE_CLOSE_POSITION_MIN = 0.60
 LIVE_VOLUME_PACE_MIN = 1.00
 LIVE_VOLUME_MIN_ELAPSED_SECONDS = 30
-LIVE_VOLUME_PACE_CAP = 4.00
+LIVE_VOLUME_PACE_CAP = 20.00
 
 REQUIRE_BTC_NOT_OPPOSITE = True
 REQUIRE_STRONG_BTC_FOR_AGGRESSIVE = True
@@ -89,7 +89,7 @@ MAX_EXTENSION_ATR15 = 1.20
 NORMAL_MAX_POST_HOLD_EXTENSION_ATR15 = 0.90
 NORMAL_MAX_LIVE_RANGE_ATR15 = 1.60
 
-# V6.5.1 LIVE WICK GUARD 30S
+# V6.6 MOMENTUM CONTINUATION
 # Logica di mercato semplificata:
 # 15m = ingresso sulla PRIMA candela ancora aperta
 # 1H = direzione principale
@@ -104,9 +104,13 @@ LIVE_POWER_FOLLOW_THROUGH_ATR15 = 0.10
 LIVE_POWER_CLOSE_POSITION_MIN = 0.70
 LIVE_POWER_MIN_ELAPSED_SECONDS = 30
 
-# Il pace non deve deteriorarsi nettamente tra due scansioni.
-# 0.95 = tolleriamo una piccola oscillazione del 5%.
-LIVE_POWER_MIN_PACE_VS_PREVIOUS = 0.95
+# V6.6: il ritmo deve accelerare rispetto alla lettura precedente.
+LIVE_POWER_MIN_PACE_GROWTH = 1.08
+# Via immediata: nessuna seconda scansione se l'impulso e' eccezionale.
+LIVE_POWER_EXCEPTIONAL_PACE_MIN = 3.50
+LIVE_POWER_EXCEPTIONAL_BODY_ATR_MIN = 0.80
+LIVE_POWER_EXCEPTIONAL_WICK_MAX = 0.20
+LIVE_POWER_EXCEPTIONAL_CLOSE_POSITION_MIN = 0.85
 
 # V6.5 REJECTION WICK GUARD
 REJECTION_WICK_MAX_BODY_RATIO = 0.50
@@ -622,24 +626,30 @@ def intelligent_targets(direction, entry, stop, quality, aggressive_ok):
 
 def live_power_volume_ok(symbol, live15, live_volume_pace, elapsed_seconds):
     """
-    Volume LIVE semplificato.
-    - minimo 2.50x del ritmo atteso;
-    - dopo almeno 120 secondi della candela;
-    - se abbiamo una lettura precedente della stessa candela,
-      il volume assoluto deve aumentare e il pace non deve crollare.
-    - se alla prima lettura utile il pace e' gia' >= 2.50x,
-      il segnale NON deve aspettare una seconda scansione.
+    V6.6 MOMENTUM CONTINUATION
+    Registra ogni lettura della candela live e distingue:
+    - volume minimo >= 2.50x;
+    - accelerazione vera: pace corrente >= pace precedente * 1.08;
+    - prima lettura: il volume viene memorizzato, ma la via normale aspetta
+      una lettura successiva per dimostrare accelerazione.
+    La via eccezionale viene valutata in analyze_symbol e puo' entrare subito.
     """
     if elapsed_seconds < LIVE_POWER_MIN_ELAPSED_SECONDS:
-        return False, "volume live troppo precoce"
+        return False, "volume live troppo precoce", None, 0.0
 
     candle_time = live15["t"]
     previous = live_power_volume_state.get(symbol)
+
+    previous_pace = 0.0
+    same_candle = previous is not None and previous.get("candle_time") == candle_time
+    if same_candle:
+        previous_pace = float(previous.get("pace", 0.0) or 0.0)
 
     live_power_volume_state[symbol] = {
         "candle_time": candle_time,
         "volume": live15["v"],
         "pace": live_volume_pace,
+        "price": live15["c"],
         "time": time.time(),
     }
 
@@ -647,29 +657,27 @@ def live_power_volume_ok(symbol, live15, live_volume_pace, elapsed_seconds):
         return False, (
             f"volume live pace {live_volume_pace:.2f}x < "
             f"{LIVE_POWER_VOL_PACE_MIN:.2f}x"
-        )
+        ), previous_pace if same_candle else None, 0.0
 
-    # Prima lettura utile: 2.50x basta per poter entrare subito.
-    if previous is None or previous.get("candle_time") != candle_time:
-        return True, "volume live >= 2.50x"
+    if not same_candle or previous_pace <= 0:
+        return False, "prima lettura: attendo accelerazione", None, 0.0
 
-    previous_volume = previous.get("volume", 0.0)
-    previous_pace = previous.get("pace", 0.0)
+    growth = live_volume_pace / previous_pace
+    growth_pct = (growth - 1.0) * 100.0
 
-    if live15["v"] <= previous_volume:
-        return False, "volume assoluto non in crescita"
+    if live15["v"] <= float(previous.get("volume", 0.0) or 0.0):
+        return False, "volume assoluto non in crescita", previous_pace, growth_pct
 
-    if (
-        previous_pace > 0
-        and live_volume_pace < previous_pace * LIVE_POWER_MIN_PACE_VS_PREVIOUS
-    ):
+    if growth < LIVE_POWER_MIN_PACE_GROWTH:
         return False, (
-            f"ritmo volume in calo "
-            f"({previous_pace:.2f}x -> {live_volume_pace:.2f}x)"
-        )
+            f"volume non accelera abbastanza "
+            f"({previous_pace:.2f}x -> {live_volume_pace:.2f}x, {growth_pct:+.1f}%)"
+        ), previous_pace, growth_pct
 
-    return True, "volume live >= 2.50x e sostenuto"
-
+    return True, (
+        f"ACCELERAZIONE {previous_pace:.2f}x -> "
+        f"{live_volume_pace:.2f}x ({growth_pct:+.1f}%)"
+    ), previous_pace, growth_pct
 
 def live_power_candle_strength(candle, direction, atr15):
     if atr15 is None or atr15 <= 0:
@@ -765,7 +773,7 @@ def analyze_symbol(symbol, data, btc_bias):
     wick_long_ok, wick_long_ratio = rejection_wick_ok(live15, "LONG")
     wick_short_ok, wick_short_ratio = rejection_wick_ok(live15, "SHORT")
 
-    volume_ok, volume_reason = live_power_volume_ok(
+    volume_ok, volume_reason, previous_volume_pace, volume_growth_pct = live_power_volume_ok(
         symbol, live15, live_volume_pace, live_volume_elapsed
     )
 
@@ -773,15 +781,29 @@ def analyze_symbol(symbol, data, btc_bias):
     btc_long_ok = symbol == "BTCUSDT" or btc_direction(btc_bias) == "LONG"
     btc_short_ok = symbol == "BTCUSDT" or btc_direction(btc_bias) == "SHORT"
 
+    # Via immediata per impulsi eccezionali: non aspetta una seconda scansione.
+    exceptional_long = (
+        live_volume_pace >= LIVE_POWER_EXCEPTIONAL_PACE_MIN
+        and body_long_atr >= LIVE_POWER_EXCEPTIONAL_BODY_ATR_MIN
+        and wick_long_ratio <= LIVE_POWER_EXCEPTIONAL_WICK_MAX
+        and close_pos_long >= LIVE_POWER_EXCEPTIONAL_CLOSE_POSITION_MIN
+    )
+    exceptional_short = (
+        live_volume_pace >= LIVE_POWER_EXCEPTIONAL_PACE_MIN
+        and body_short_atr >= LIVE_POWER_EXCEPTIONAL_BODY_ATR_MIN
+        and wick_short_ratio <= LIVE_POWER_EXCEPTIONAL_WICK_MAX
+        and close_pos_short <= 1.0 - LIVE_POWER_EXCEPTIONAL_CLOSE_POSITION_MIN
+    )
+
     long_ok = (
         LIVE_POWER_ENABLED and trend1h_long and four_h_allows_long and btc_long_ok
         and live_depth_long >= atr15 * LIVE_POWER_FOLLOW_THROUGH_ATR15
-        and candle_long_ok and wick_long_ok and volume_ok
+        and candle_long_ok and wick_long_ok and (volume_ok or exceptional_long)
     )
     short_ok = (
         LIVE_POWER_ENABLED and trend1h_short and four_h_allows_short and btc_short_ok
         and live_depth_short >= atr15 * LIVE_POWER_FOLLOW_THROUGH_ATR15
-        and candle_short_ok and wick_short_ok and volume_ok
+        and candle_short_ok and wick_short_ok and (volume_ok or exceptional_short)
     )
 
     if not long_ok and not short_ok:
@@ -802,6 +824,11 @@ def analyze_symbol(symbol, data, btc_bias):
         direction, level = "SHORT", support
         body_atr, close_position = body_short_atr, 1.0 - close_pos_short
         follow_atr, wick_ratio = live_depth_short / atr15, wick_short_ratio
+
+    exceptional_entry = exceptional_long if direction == "LONG" else exceptional_short
+    continuation_mode = "IMPULSO ECCEZIONALE" if exceptional_entry and not volume_ok else "ACCELERAZIONE"
+    if exceptional_entry and not volume_ok:
+        volume_reason = "impulso eccezionale: ingresso immediato"
 
     entry = price
     stop = intelligent_stop(direction, entry, level, live15, atr15)
@@ -841,6 +868,9 @@ def analyze_symbol(symbol, data, btc_bias):
         "entry_mode": "LIVE_POWER_WICK_GUARD", "live_power": True,
         "live_body_atr": body_atr, "live_close_position": close_position,
         "live_volume_reason": volume_reason, "rejection_wick_ratio": wick_ratio,
+        "previous_volume_pace": previous_volume_pace,
+        "volume_growth_pct": volume_growth_pct,
+        "continuation_mode": continuation_mode,
         "score_breakdown": [
             f"VOL LIVE {live_volume_pace:.2f}x",
             f"BODY {body_atr:.2f} ATR15",
@@ -870,6 +900,8 @@ def build_message(symbol, signal):
         f"TP3: {fmt_price(signal['tp3'])}\n\n"
         f"Leva indicativa: {signal['leverage']}x\n\n"
         f"Volume LIVE: {signal['live_volume_pace']:.2f}x\n"
+        f"Momentum volume: {signal['continuation_mode']}\n"
+        f"Accelerazione: {signal['live_volume_reason']}\n"
         f"Body LIVE: {signal['live_body_atr']:.2f} ATR15\n"
         f"Breakout: CONFERMATO\n"
         f"Rejection Wick: OK ({signal['rejection_wick_ratio']:.2f}x body)\n\n"
@@ -927,14 +959,16 @@ def scan_market():
 
 threading.Thread(target=ws_loop,daemon=True).start()
 
-print("CryptoSignalAI12 avviato - V6.5.1 LIVE WICK GUARD 30S")
+print("CryptoSignalAI12 avviato - V6.6 MOMENTUM CONTINUATION")
 
 send_telegram(
     "CryptoSignalAI12 ONLINE\n"
-    "V6.5.1 LIVE WICK GUARD 30S attiva.\n\n"
+    "V6.6 MOMENTUM CONTINUATION attiva.\n\n"
     "--- LOGICA MERCATO ---\n"
     "15m: ingresso sulla PRIMA candela ancora aperta.\n"
     "Volume LIVE minimo: 2.50x ritmo atteso.\n"
+    "Continuazione normale: accelerazione volume >= +8% tra letture.\n"
+    "Via immediata: >=3.50x + body >=0.80 ATR + wick <=20% + close >=85%.\n"
     "Body LIVE minimo: 0.45 ATR15.\n"
     "Breakout BODY minimo: 0.10 ATR15.\n"
     "Rejection Wick Guard: wick contrario max 50% del body.\n"
