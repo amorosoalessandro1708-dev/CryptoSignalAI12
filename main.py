@@ -68,7 +68,7 @@ LIVE_BODY_ATR_MIN = 0.05
 FINAL_BREAKOUT_MARGIN_ATR15 = 0.06
 LIVE_CLOSE_POSITION_MIN = 0.60
 LIVE_VOLUME_PACE_MIN = 1.00
-LIVE_VOLUME_MIN_ELAPSED_SECONDS = 120
+LIVE_VOLUME_MIN_ELAPSED_SECONDS = 30
 LIVE_VOLUME_PACE_CAP = 4.00
 
 REQUIRE_BTC_NOT_OPPOSITE = True
@@ -89,7 +89,7 @@ MAX_EXTENSION_ATR15 = 1.20
 NORMAL_MAX_POST_HOLD_EXTENSION_ATR15 = 0.90
 NORMAL_MAX_LIVE_RANGE_ATR15 = 1.60
 
-# V6.5 LIVE WICK GUARD
+# V6.5.1 LIVE WICK GUARD 30S
 # Logica di mercato semplificata:
 # 15m = ingresso sulla PRIMA candela ancora aperta
 # 1H = direzione principale
@@ -102,7 +102,7 @@ LIVE_POWER_VOL_PACE_MIN = 2.50
 LIVE_POWER_BODY_ATR_MIN = 0.45
 LIVE_POWER_FOLLOW_THROUGH_ATR15 = 0.10
 LIVE_POWER_CLOSE_POSITION_MIN = 0.70
-LIVE_POWER_MIN_ELAPSED_SECONDS = 120
+LIVE_POWER_MIN_ELAPSED_SECONDS = 30
 
 # Il pace non deve deteriorarsi nettamente tra due scansioni.
 # 0.95 = tolleriamo una piccola oscillazione del 5%.
@@ -927,11 +927,11 @@ def scan_market():
 
 threading.Thread(target=ws_loop,daemon=True).start()
 
-print("CryptoSignalAI12 avviato - V6.5 LIVE WICK GUARD")
+print("CryptoSignalAI12 avviato - V6.5.1 LIVE WICK GUARD 30S")
 
 send_telegram(
     "CryptoSignalAI12 ONLINE\n"
-    "V6.5 LIVE WICK GUARD attiva.\n\n"
+    "V6.5.1 LIVE WICK GUARD 30S attiva.\n\n"
     "--- LOGICA MERCATO ---\n"
     "15m: ingresso sulla PRIMA candela ancora aperta.\n"
     "Volume LIVE minimo: 2.50x ritmo atteso.\n"
