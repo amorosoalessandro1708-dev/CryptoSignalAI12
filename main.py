@@ -89,7 +89,7 @@ MAX_EXTENSION_ATR15 = 1.20
 NORMAL_MAX_POST_HOLD_EXTENSION_ATR15 = 0.90
 NORMAL_MAX_LIVE_RANGE_ATR15 = 1.60
 
-# V6.6.4 FULL CANDLE MOMENTUM 30S
+# V6.7 DYNAMIC STRUCTURAL SL 30S
 # Logica di mercato semplificata:
 # 15m = ingresso sulla PRIMA candela ancora aperta
 # 1H = direzione principale
@@ -119,9 +119,15 @@ REJECTION_WICK_MAX_BODY_RATIO = 0.15
 SWING_LOOKBACK_BARS = 12
 NORMAL_MAX_SWING_ATR15 = 4.00
 
+# V6.7 STOP LOSS DINAMICO STRUTTURALE
+# Lo stop si adatta a volatilita', struttura e forza del trend.
 SL_STRUCTURE_BUFFER_ATR15 = 0.10
-SL_MIN_DISTANCE_ATR15 = 0.45
-SL_MAX_DISTANCE_ATR15 = 1.35
+SL_BUFFER_STRONG_TREND_ATR15 = 0.18
+SL_BUFFER_NORMAL_TREND_ATR15 = 0.14
+SL_BUFFER_NEUTRAL_4H_ATR15 = 0.10
+SL_MIN_DISTANCE_ATR15 = 0.55
+SL_MAX_DISTANCE_ATR15 = 1.80
+SL_STRUCTURE_LOOKBACK_BARS = 4
 
 TP1_R_BASE = 0.60
 TP2_R_BASE = 1.20
@@ -592,21 +598,65 @@ def breakout_hold_check(symbol, direction, level, price, atr15, breakout_candle_
     return True
 
 
-def intelligent_stop(direction, entry, level, breakout_candle, atr15):
-    if atr15 <= 0:
+def intelligent_stop(direction, entry, level, breakout_candle, atr15,
+                     recent_closed_15m=None, context4h="NEUTRAL",
+                     btc_bias="NEUTRAL_STABLE"):
+    """
+    V6.7 - Stop loss dinamico strutturale.
+
+    1) Usa ATR15 per adattarsi alla volatilita' della singola crypto.
+    2) Cerca una struttura reale nelle ultime candele 15m chiuse.
+    3) Aggiunge un buffer ATR in base al contesto del trend.
+    4) Mantiene limiti min/max per evitare stop dentro il rumore
+       o eccessivamente lontani.
+    """
+    if atr15 is None or atr15 <= 0:
         return None
-    min_distance, max_distance = atr15 * SL_MIN_DISTANCE_ATR15, atr15 * SL_MAX_DISTANCE_ATR15
-    buffer_value = atr15 * SL_STRUCTURE_BUFFER_ATR15
+
+    recent = list(recent_closed_15m or [])
+    if recent:
+        recent = recent[-SL_STRUCTURE_LOOKBACK_BARS:]
+
+    trend_strong = (
+        (direction == "LONG" and context4h == "LONG" and btc_direction(btc_bias) == "LONG")
+        or
+        (direction == "SHORT" and context4h == "SHORT" and btc_direction(btc_bias) == "SHORT")
+    )
+
+    if trend_strong:
+        buffer_atr = SL_BUFFER_STRONG_TREND_ATR15
+    elif context4h == "NEUTRAL":
+        buffer_atr = SL_BUFFER_NEUTRAL_4H_ATR15
+    else:
+        buffer_atr = SL_BUFFER_NORMAL_TREND_ATR15
+
+    buffer_value = atr15 * buffer_atr
+    min_distance = atr15 * SL_MIN_DISTANCE_ATR15
+    max_distance = atr15 * SL_MAX_DISTANCE_ATR15
+
     if direction == "LONG":
-        technical_stop = min(breakout_candle["l"], level - buffer_value)
-        distance = min(max(entry - technical_stop, min_distance), max_distance)
+        # Livello d'invalidazione: minimo della candela live, livello di
+        # breakout e minimi recenti. Lo stop va sotto la struttura.
+        candidates = [breakout_candle["l"], level]
+        if recent:
+            candidates.append(min(c["l"] for c in recent))
+        structural_level = min(candidates)
+        technical_stop = structural_level - buffer_value
+        raw_distance = entry - technical_stop
+        distance = min(max(raw_distance, min_distance), max_distance)
         stop = entry - distance
         return stop if stop < entry else None
-    technical_stop = max(breakout_candle["h"], level + buffer_value)
-    distance = min(max(technical_stop - entry, min_distance), max_distance)
+
+    # SHORT: logica speculare sopra i massimi strutturali.
+    candidates = [breakout_candle["h"], level]
+    if recent:
+        candidates.append(max(c["h"] for c in recent))
+    structural_level = max(candidates)
+    technical_stop = structural_level + buffer_value
+    raw_distance = technical_stop - entry
+    distance = min(max(raw_distance, min_distance), max_distance)
     stop = entry + distance
     return stop if stop > entry else None
-
 
 def intelligent_targets(direction, entry, stop, quality, aggressive_ok):
     risk = abs(entry - stop)
@@ -626,7 +676,7 @@ def intelligent_targets(direction, entry, stop, quality, aggressive_ok):
 
 def live_power_volume_ok(symbol, live15, live_volume_pace, elapsed_seconds):
     """
-    V6.6.4 FULL CANDLE MOMENTUM 30S
+    V6.7 DYNAMIC STRUCTURAL SL 30S
     Registra ogni lettura della candela live e distingue:
     - volume minimo >= 2.50x;
     - accelerazione vera: pace corrente >= pace precedente * 1.20;
@@ -831,7 +881,12 @@ def analyze_symbol(symbol, data, btc_bias):
         volume_reason = "impulso eccezionale: ingresso immediato"
 
     entry = price
-    stop = intelligent_stop(direction, entry, level, live15, atr15)
+    stop = intelligent_stop(
+        direction, entry, level, live15, atr15,
+        recent_closed_15m=c15[:-1],
+        context4h=context4h,
+        btc_bias=btc_bias,
+    )
     if stop is None:
         return None
 
@@ -959,11 +1014,11 @@ def scan_market():
 
 threading.Thread(target=ws_loop,daemon=True).start()
 
-print("CryptoSignalAI12 avviato - V6.6.4 FULL CANDLE MOMENTUM 30S")
+print("CryptoSignalAI12 avviato - V6.7 DYNAMIC STRUCTURAL SL 30S")
 
 send_telegram(
     "CryptoSignalAI12 ONLINE\n"
-    "V6.6.4 FULL CANDLE MOMENTUM 30S attiva.\n\n"
+    "V6.7 DYNAMIC STRUCTURAL SL 30S attiva.\n\n"
     "--- LOGICA MERCATO ---\n"
     "15m: ingresso sulla PRIMA candela ancora aperta.\n"
     "Volume LIVE minimo: 2.50x ritmo atteso.\n"
@@ -972,6 +1027,7 @@ send_telegram(
     "Body LIVE minimo: 0.60 ATR15.\n"
     "Breakout BODY minimo: 0.15 ATR15.\n"
     "Rejection Wick Guard: wick contrario max 15% del body.\n"
+    "SL V6.7: dinamico su ATR15 + struttura recente + forza trend.\n"
     "Breakout calcolato sui CORPI delle 2 candele precedenti.\n"
     "1H: direzione obbligatoria.\n"
     "4H: concorde o neutro; blocca solo se chiaramente opposto.\n"
