@@ -31,7 +31,7 @@ LIQ_WS_URLS = [
     "wss://fstream.binance.com/public/ws/!forceOrder@arr",
 ]
 
-SCAN_SECONDS = 60
+SCAN_SECONDS = 30
 LIQ_WINDOW_SECONDS = 15 * 60
 
 CACHE_1H_SECONDS = 15 * 60
@@ -89,7 +89,7 @@ MAX_EXTENSION_ATR15 = 1.20
 NORMAL_MAX_POST_HOLD_EXTENSION_ATR15 = 0.90
 NORMAL_MAX_LIVE_RANGE_ATR15 = 1.60
 
-# V6.6 MOMENTUM CONTINUATION
+# V6.6.2 MOMENTUM CONTINUATION 30S
 # Logica di mercato semplificata:
 # 15m = ingresso sulla PRIMA candela ancora aperta
 # 1H = direzione principale
@@ -100,12 +100,12 @@ LIVE_POWER_ENABLED = True
 LIVE_POWER_STRUCTURE_BARS = 2
 LIVE_POWER_VOL_PACE_MIN = 2.50
 LIVE_POWER_BODY_ATR_MIN = 0.45
-LIVE_POWER_FOLLOW_THROUGH_ATR15 = 0.10
+LIVE_POWER_FOLLOW_THROUGH_ATR15 = 0.15
 LIVE_POWER_CLOSE_POSITION_MIN = 0.70
 LIVE_POWER_MIN_ELAPSED_SECONDS = 30
 
 # V6.6: il ritmo deve accelerare rispetto alla lettura precedente.
-LIVE_POWER_MIN_PACE_GROWTH = 1.08
+LIVE_POWER_MIN_PACE_GROWTH = 1.20
 # Via immediata: nessuna seconda scansione se l'impulso e' eccezionale.
 LIVE_POWER_EXCEPTIONAL_PACE_MIN = 3.50
 LIVE_POWER_EXCEPTIONAL_BODY_ATR_MIN = 0.80
@@ -113,7 +113,7 @@ LIVE_POWER_EXCEPTIONAL_WICK_MAX = 0.20
 LIVE_POWER_EXCEPTIONAL_CLOSE_POSITION_MIN = 0.85
 
 # V6.5 REJECTION WICK GUARD
-REJECTION_WICK_MAX_BODY_RATIO = 0.50
+REJECTION_WICK_MAX_BODY_RATIO = 0.40
 
 # Swing guard: non si azzera per piccole pause/rimbalzi.
 SWING_LOOKBACK_BARS = 12
@@ -626,10 +626,10 @@ def intelligent_targets(direction, entry, stop, quality, aggressive_ok):
 
 def live_power_volume_ok(symbol, live15, live_volume_pace, elapsed_seconds):
     """
-    V6.6 MOMENTUM CONTINUATION
+    V6.6.2 MOMENTUM CONTINUATION 30S
     Registra ogni lettura della candela live e distingue:
     - volume minimo >= 2.50x;
-    - accelerazione vera: pace corrente >= pace precedente * 1.08;
+    - accelerazione vera: pace corrente >= pace precedente * 1.20;
     - prima lettura: il volume viene memorizzato, ma la via normale aspetta
       una lettura successiva per dimostrare accelerazione.
     La via eccezionale viene valutata in analyze_symbol e puo' entrare subito.
@@ -959,19 +959,19 @@ def scan_market():
 
 threading.Thread(target=ws_loop,daemon=True).start()
 
-print("CryptoSignalAI12 avviato - V6.6 MOMENTUM CONTINUATION")
+print("CryptoSignalAI12 avviato - V6.6.2 MOMENTUM CONTINUATION 30S")
 
 send_telegram(
     "CryptoSignalAI12 ONLINE\n"
-    "V6.6 MOMENTUM CONTINUATION attiva.\n\n"
+    "V6.6.2 MOMENTUM CONTINUATION 30S attiva.\n\n"
     "--- LOGICA MERCATO ---\n"
     "15m: ingresso sulla PRIMA candela ancora aperta.\n"
     "Volume LIVE minimo: 2.50x ritmo atteso.\n"
-    "Continuazione normale: accelerazione volume >= +8% tra letture.\n"
+    "Continuazione normale: accelerazione volume >= +20% tra letture.\n"
     "Via immediata: >=3.50x + body >=0.80 ATR + wick <=20% + close >=85%.\n"
     "Body LIVE minimo: 0.45 ATR15.\n"
-    "Breakout BODY minimo: 0.10 ATR15.\n"
-    "Rejection Wick Guard: wick contrario max 50% del body.\n"
+    "Breakout BODY minimo: 0.15 ATR15.\n"
+    "Rejection Wick Guard: wick contrario max 40% del body.\n"
     "Breakout calcolato sui CORPI delle 2 candele precedenti.\n"
     "1H: direzione obbligatoria.\n"
     "4H: concorde o neutro; blocca solo se chiaramente opposto.\n"
@@ -979,7 +979,7 @@ send_telegram(
     "HOLD: NON RICHIESTO\n"
     "Chiusura prima candela: NON ATTESA\n"
     "Seconda candela: NON ATTESA\n"
-    "Scanner: 12 coppie / ciclo ogni 60 secondi."
+    "Scanner: 12 coppie / ciclo ogni 30 secondi."
 )
 
 while True:
