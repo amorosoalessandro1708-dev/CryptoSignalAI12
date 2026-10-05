@@ -89,7 +89,7 @@ MAX_EXTENSION_ATR15 = 1.20
 NORMAL_MAX_POST_HOLD_EXTENSION_ATR15 = 0.90
 NORMAL_MAX_LIVE_RANGE_ATR15 = 1.60
 
-# V6.8 ADAPTIVE MOMENTUM 15S
+# V6.9 EARLY REVERSAL 15S
 # Logica di mercato semplificata:
 # 15m = ingresso sulla PRIMA candela ancora aperta
 # 1H = direzione principale
@@ -142,6 +142,24 @@ REVERSAL_BREAKOUT_ATR_MIN = 0.20
 REVERSAL_WICK_MAX = 0.12
 REVERSAL_CLOSE_POSITION_MIN = 0.88
 REVERSAL_PRICE_PROGRESS_MIN_ATR15 = 0.05
+
+# V6.9 EARLY REVERSAL - ingresso anticipato sulla prima candela 15m
+EARLY_REVERSAL_ENABLED = True
+EARLY_REVERSAL_VOL_PACE_MIN = 2.80
+EARLY_REVERSAL_BODY_ATR_MIN = 0.65
+EARLY_REVERSAL_BREAKOUT_ATR_MIN = 0.12
+EARLY_REVERSAL_WICK_MAX = 0.15
+EARLY_REVERSAL_CLOSE_POSITION_MIN = 0.85
+EARLY_REVERSAL_PRICE_PROGRESS_MIN_ATR15 = 0.03
+EARLY_REVERSAL_VOLUME_GROWTH_MIN = 1.10
+# Via immediata sulla prima lettura utile solo se l'impulso e' eccezionale.
+EARLY_REVERSAL_EXCEPTIONAL_PACE_MIN = 3.80
+EARLY_REVERSAL_EXCEPTIONAL_BODY_ATR_MIN = 0.85
+EARLY_REVERSAL_EXCEPTIONAL_BREAKOUT_ATR_MIN = 0.18
+EARLY_REVERSAL_EXCEPTIONAL_WICK_MAX = 0.10
+EARLY_REVERSAL_EXCEPTIONAL_CLOSE_POSITION_MIN = 0.90
+# Se due candele 15m chiuse sono gia' forti nella direzione, non inseguiamo.
+EARLY_REVERSAL_MAX_PRIOR_DIRECTIONAL_BARS = 1
 TP1_MIN_ATR15 = 0.30
 TP1_MAX_ATR15 = 0.75
 TP2_MIN_ATR15 = 0.65
@@ -710,7 +728,7 @@ def adaptive_targets(direction, entry, stop, atr15, quality, live_volume_pace, b
 
 def live_power_volume_ok(symbol, live15, live_volume_pace, elapsed_seconds):
     """
-    V6.8 ADAPTIVE MOMENTUM 15S
+    V6.9 EARLY REVERSAL 15S
     Registra ogni lettura della candela live e distingue:
     - volume minimo >= 2.50x;
     - accelerazione vera: pace corrente >= pace precedente * 1.20;
@@ -779,6 +797,40 @@ def anti_late_entry_ok(body_atr, follow_atr):
     if body_atr>=LATE_ENTRY_BODY_ATR_HARD: return False,f'body gia esteso {body_atr:.2f} ATR'
     if follow_atr>=LATE_ENTRY_BREAKOUT_ATR_HARD: return False,f'breakout gia esteso {follow_atr:.2f} ATR'
     return True,'impulso non eccessivamente esteso'
+
+def prior_directional_bars(c15, direction, atr15, lookback=2):
+    count=0
+    for candle in reversed(c15[:-1][-lookback:]):
+        body=abs(candle['c']-candle['o'])
+        directional=(direction=='LONG' and candle['c']>candle['o']) or (direction=='SHORT' and candle['c']<candle['o'])
+        if directional and atr15>0 and body/atr15>=0.35:
+            count+=1
+        else:
+            break
+    return count
+
+def btc_blocks_early_reversal(symbol,direction,btc_bias):
+    if symbol=='BTCUSDT': return False
+    opposite='SHORT_STRONG' if direction=='LONG' else 'LONG_STRONG'
+    return btc_bias==opposite
+
+def early_reversal_ok(symbol,direction,c15,trendL,trendS,ctx,btc_bias,body,wick,close_pos,pace,follow,growth,price_prog):
+    if not EARLY_REVERSAL_ENABLED: return False,False,'OFF'
+    against=(direction=='SHORT' and trendL) or (direction=='LONG' and trendS)
+    if not against: return False,False,'non contro 1H'
+    # 4H resta protezione: blocca solo se chiaramente opposto alla nuova direzione.
+    if direction=='LONG' and ctx=='SHORT': return False,False,'4H SHORT'
+    if direction=='SHORT' and ctx=='LONG': return False,False,'4H LONG'
+    # BTC non deve essere gia' girato; blocca solo se ancora STRONG contro il reversal.
+    if btc_blocks_early_reversal(symbol,direction,btc_bias): return False,False,f'BTC {btc_bias} opposto forte'
+    a15=atr(c15[:-1],14)
+    if not a15: return False,False,'ATR non valido'
+    prior=prior_directional_bars(c15,direction,a15,2)
+    if prior>EARLY_REVERSAL_MAX_PRIOR_DIRECTIONAL_BARS: return False,False,f'tardi: {prior} candele gia sviluppate'
+    exceptional=(pace>=EARLY_REVERSAL_EXCEPTIONAL_PACE_MIN and body>=EARLY_REVERSAL_EXCEPTIONAL_BODY_ATR_MIN and follow>=EARLY_REVERSAL_EXCEPTIONAL_BREAKOUT_ATR_MIN and wick<=EARLY_REVERSAL_EXCEPTIONAL_WICK_MAX and close_pos>=EARLY_REVERSAL_EXCEPTIONAL_CLOSE_POSITION_MIN)
+    if exceptional: return True,True,'EARLY REVERSAL ECCEZIONALE'
+    normal=(pace>=EARLY_REVERSAL_VOL_PACE_MIN and body>=EARLY_REVERSAL_BODY_ATR_MIN and follow>=EARLY_REVERSAL_BREAKOUT_ATR_MIN and wick<=EARLY_REVERSAL_WICK_MAX and close_pos>=EARLY_REVERSAL_CLOSE_POSITION_MIN and growth>=(EARLY_REVERSAL_VOLUME_GROWTH_MIN-1)*100 and price_prog>=EARLY_REVERSAL_PRICE_PROGRESS_MIN_ATR15)
+    return (True,False,'EARLY REVERSAL CONFERMATO') if normal else (False,False,'non ancora confermato')
 
 def reversal_context_ok(direction, trend1h_long, trend1h_short, context4h, btc_bias, body_atr, wick_ratio, close_position, pace, follow_atr, growth_pct, price_prog):
     if not REVERSAL_ENABLED: return False
@@ -868,18 +920,21 @@ def analyze_symbol(symbol, data, btc_bias):
     contS=LIVE_POWER_ENABLED and trendS and not clearL and btcS and fS>=LIVE_POWER_FOLLOW_THROUGH_ATR15 and cSok and wSok and lateS and pSok and vok
     revL=reversal_context_ok('LONG',trendL,trendS,ctx,btc_bias,bL,wL,cpL,pace,fL,growth,ppL) and lateL
     revS=reversal_context_ok('SHORT',trendL,trendS,ctx,btc_bias,bS,wS,cpS,pace,fS,growth,ppS) and lateS
-    long_ok=contL or revL; short_ok=contS or revS
+    earlyL,earlyXL,earlyReasonL=early_reversal_ok(symbol,'LONG',c15,trendL,trendS,ctx,btc_bias,bL,wL,cpL,pace,fL,growth,ppL)
+    earlyS,earlyXS,earlyReasonS=early_reversal_ok(symbol,'SHORT',c15,trendL,trendS,ctx,btc_bias,bS,wS,cpS,pace,fS,growth,ppS)
+    earlyL=earlyL and lateL; earlyS=earlyS and lateS
+    long_ok=contL or revL or earlyL; short_ok=contS or revS or earlyS
     if long_ok==short_ok:
         if DIAGNOSTIC_LOGS and pace>=LIVE_POWER_VOL_PACE_MIN: print(f'{symbol} NO V6.8 pace={pace:.2f}x 1H L={trendL} S={trendS} 4H={ctx} progL={ppL:+.2f} progS={ppS:+.2f}')
         return None
     if long_ok:
-        direction='LONG'; mode='REVERSAL' if revL and not contL else 'CONTINUATION'; level=res; body=bL; cp=cpL; follow=fL; wick=wL; pp=ppL; dp=dpL; preason=prL; latereason=lateLr
+        direction='LONG'; mode='EARLY_REVERSAL' if earlyL else ('REVERSAL' if revL and not contL else 'CONTINUATION'); level=res; body=bL; cp=cpL; follow=fL; wick=wL; pp=ppL; dp=dpL; preason=earlyReasonL if earlyL else prL; latereason=lateLr
     else:
-        direction='SHORT'; mode='REVERSAL' if revS and not contS else 'CONTINUATION'; level=sup; body=bS; cp=cpS; follow=fS; wick=wS; pp=ppS; dp=dpS; preason=prS; latereason=lateSr
+        direction='SHORT'; mode='EARLY_REVERSAL' if earlyS else ('REVERSAL' if revS and not contS else 'CONTINUATION'); level=sup; body=bS; cp=cpS; follow=fS; wick=wS; pp=ppS; dp=dpS; preason=earlyReasonS if earlyS else prS; latereason=lateSr
     entry=price
     stop=intelligent_stop(direction,entry,level,live15,atr15,recent_closed_15m=c15[:-1],context4h=ctx,btc_bias=btc_bias)
     if stop is None: return None
-    quality=10+(1 if pace>=3 else 0)+(1 if body>=0.70 else 0)+(1 if pp>=0.08 else 0)+(1 if mode=='REVERSAL' else 0)
+    quality=10+(1 if pace>=3 else 0)+(1 if body>=0.70 else 0)+(1 if pp>=0.08 else 0)+(1 if mode in ('REVERSAL','EARLY_REVERSAL') else 0)
     aggressive=mode=='CONTINUATION' and pace>=3.50 and body>=0.80 and quality>=AGGRESSIVE_SCORE_MIN
     lev=calculate_leverage(entry,stop,quality,aggressive)
     td=adaptive_targets(direction,entry,stop,atr15,quality,pace,body,follow,mode,ctx,btc_bias)
@@ -890,7 +945,7 @@ def analyze_symbol(symbol, data, btc_bias):
 
 def build_message(symbol, signal):
     pair=symbol.replace('USDT','/USDT'); mode=signal.get('signal_mode','CONTINUATION')
-    title='🔄 REVERSAL CONFERMATO' if mode=='REVERSAL' else ('🔥 MOMENTUM AGGRESSIVO' if signal.get('aggressive') else '⚡ MOMENTUM CONFERMATO')
+    title='⚡ EARLY REVERSAL' if mode=='EARLY_REVERSAL' else ('🔄 REVERSAL CONFERMATO' if mode=='REVERSAL' else ('🔥 MOMENTUM AGGRESSIVO' if signal.get('aggressive') else '⚡ MOMENTUM CONFERMATO'))
     return (f"{title}\n{pair} — {signal['direction']}\n\n"
             f"ENTRY: {fmt_price(signal['entry_low'])} - {fmt_price(signal['entry_high'])}\n"
             f"SL dinamico: {fmt_price(signal['sl'])}\n\n"
@@ -947,15 +1002,15 @@ def scan_market():
 
 threading.Thread(target=ws_loop,daemon=True).start()
 
-print("CryptoSignalAI12 avviato - V6.8 ADAPTIVE MOMENTUM 15S")
+print("CryptoSignalAI12 avviato - V6.9 EARLY REVERSAL 15S")
 
 send_telegram(
     "CryptoSignalAI12 ONLINE\n"
-    "V6.8 ADAPTIVE MOMENTUM 15S attiva.\n\n"
+    "V6.9 EARLY REVERSAL 15S attiva.\n\n"
     "Scanner: 12 coppie / ciclo target ogni 15 secondi.\n"
     "CONTINUATION: volume + prezzo + breakout devono avanzare insieme.\n"
     "ANTI-LATE: niente ingresso su impulso gia troppo esteso.\n"
-    "REVERSAL: inversione anticipata con requisiti piu severi.\n"
+    "EARLY REVERSAL: ingresso possibile sulla prima candela 15m; non attende la 2a/3a.\n"
     "SL: dinamico su ATR15 + struttura recente + contesto trend.\n"
     "TP1/TP2/TP3: dinamici su ATR15 + forza + spazio residuo.\n"
     "HOLD: NON RICHIESTO\n"
