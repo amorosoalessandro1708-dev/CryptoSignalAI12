@@ -896,9 +896,7 @@ def early_reversal_ok(symbol,direction,c15,trendL,trendS,ctx,btc_bias,btc15,body
     if not EARLY_REVERSAL_ENABLED: return False,False,'OFF'
     against=(direction=='SHORT' and trendL) or (direction=='LONG' and trendS)
     if not against: return False,False,'non contro 1H'
-    # 4H resta protezione: blocca solo se chiaramente opposto alla nuova direzione.
-    if direction=='LONG' and ctx=='SHORT': return False,False,'4H SHORT'
-    if direction=='SHORT' and ctx=='LONG': return False,False,'4H LONG'
+    # V6.9.3: solo EARLY REVERSAL non richiede allineamento 4H.
     # V6.9.1: per le altcoin BTC 15m LIVE deve essere FORTE e nella stessa direzione.
     # Questo permette di anticipare l'ingresso senza aspettare il cambio del bias 1H/4H.
     if not btc15_strong_aligned(symbol,direction,btc15):
@@ -1095,17 +1093,18 @@ def scan_market():
 
 threading.Thread(target=ws_loop,daemon=True).start()
 
-print("CryptoSignalAI12 avviato - V6.9.2 BTC15 DIREZIONALE 15S")
+print("CryptoSignalAI12 avviato - V6.9.3 EARLY REVERSAL 4H LIBERO 15S")
 
 send_telegram(
     "CryptoSignalAI12 ONLINE\n"
-    "V6.9.2 BTC15 DIREZIONALE 15S attiva.\n\n"
+    "V6.9.3 EARLY REVERSAL 4H LIBERO 15S attiva.\n\n"
     "Scanner: 12 coppie / ciclo target ogni 15 secondi.\n"
     "CONTINUATION: volume + prezzo + breakout devono avanzare insieme.\n"
     "ANTI-LATE: niente ingresso su impulso gia troppo esteso.\n"
     "EARLY REVERSAL: ingresso possibile sulla prima candela 15m; non attende la 2a/3a.\n"    "ALTCOIN EARLY: BTC 15m LIVE deve essere FORTE e nella stessa direzione.\n"
     "TUTTE LE ALTCOIN: BTC15 direzionale e concorde (body >=0.15 ATR); BTC15 neutro o contrario blocca.\n"
     "EARLY REVERSAL: resta BTC15 FORTE (body >=0.45 ATR, close >=80%, volume >=1.50x, wick <=25%).\n"
+    "EARLY REVERSAL: 4H contrario non blocca; CONTINUATION e REVERSAL normale invariati.\n"
 
     "SL: dinamico su ATR15 + struttura recente + contesto trend.\n"
     "TP1/TP2/TP3: dinamici su ATR15 + forza + spazio residuo.\n"
