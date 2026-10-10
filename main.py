@@ -165,6 +165,7 @@ EARLY_REVERSAL_MAX_PRIOR_DIRECTIONAL_BARS = 1
 # V6.9.1 - BTC 15m LIVE forte e direzionale per EARLY REVERSAL altcoin.
 # Non basta il vecchio bias 1H/4H: la candela BTC 15m deve spingere davvero
 # nella stessa direzione dell'altcoin.
+BTC15_DIRECTIONAL_BODY_ATR_MIN = 0.15  # BTC15 non neutro: corpo minimo 0.15 ATR, nessun volume minimo aggiuntivo
 BTC15_STRONG_BODY_ATR_MIN = 0.45
 BTC15_STRONG_CLOSE_POSITION_MIN = 0.80
 BTC15_STRONG_VOLUME_PACE_MIN = 1.50
@@ -606,6 +607,7 @@ def get_btc15_live_strength(btc_data):
         adverse_wick = 0.0
 
     wick_ratio = adverse_wick / body if body > 0 else 999.0
+    directional = direction if body_atr >= BTC15_DIRECTIONAL_BODY_ATR_MIN else "NEUTRAL"
     strong = (
         direction in ("LONG", "SHORT")
         and body_atr >= BTC15_STRONG_BODY_ATR_MIN
@@ -616,6 +618,7 @@ def get_btc15_live_strength(btc_data):
 
     return {
         "direction": direction if strong else "NEUTRAL",
+        "directional": directional,
         "strong": strong,
         "body_atr": body_atr,
         "close_position": close_pos,
@@ -1005,6 +1008,14 @@ def analyze_symbol(symbol, data, btc_bias, btc15):
     earlyS,earlyXS,earlyReasonS=early_reversal_ok(symbol,'SHORT',c15,trendL,trendS,ctx,btc_bias,btc15,bS,wS,cpS,pace,fS,growth,ppS)
     earlyL=earlyL and lateL; earlyS=earlyS and lateS
     long_ok=contL or revL or earlyL; short_ok=contS or revS or earlyS
+    # Unica nuova regola: per OGNI segnale altcoin BTC15 deve essere
+    # direzionale e concorde. Il requisito FORTE degli EARLY resta invariato.
+    if symbol != 'BTCUSDT':
+        btc15_dir = btc15.get('directional', 'NEUTRAL')
+        if btc15_dir != 'LONG':
+            long_ok = False
+        if btc15_dir != 'SHORT':
+            short_ok = False
     if long_ok==short_ok:
         if DIAGNOSTIC_LOGS and pace>=LIVE_POWER_VOL_PACE_MIN: print(f'{symbol} NO V6.8 pace={pace:.2f}x 1H L={trendL} S={trendS} 4H={ctx} progL={ppL:+.2f} progS={ppS:+.2f}')
         return None
@@ -1021,7 +1032,7 @@ def analyze_symbol(symbol, data, btc_bias, btc15):
     td=adaptive_targets(direction,entry,stop,atr15,quality,pace,body,follow,mode,ctx,btc_bias)
     if td is None: return None
     tp1,tp2,tp3,r1,r2,r3,tstrength=td
-    return {'type':'CONFIRMED','direction':direction,'signal_mode':mode,'price':entry,'entry_low':entry-atr15*.06,'entry_high':entry+atr15*.06,'sl':stop,'tp1':tp1,'tp2':tp2,'tp3':tp3,'tp1_r':r1,'tp2_r':r2,'tp3_r':r3,'target_strength':tstrength,'level':level,'volume1h':volume_ratio_closed(c1h),'volume15':pace,'live_volume_pace':pace,'live_volume_elapsed':elapsed,'atr_pct':atr1h/last1h['c']*100,'quality':quality,'leverage':lev,'btc':btc_bias,'btc15_direction':btc15.get('direction','NEUTRAL'),'btc15_strong':btc15.get('strong',False),'btc15_body_atr':btc15.get('body_atr',0.0),'btc15_volume_pace':btc15.get('volume_pace',0.0),'context4h':ctx,'follow_through_atr':follow,'aggressive':lev>=20 and aggressive,'entry_mode':'V6.8_ADAPTIVE','live_power':True,'live_body_atr':body,'live_close_position':cp,'live_volume_reason':vreason,'rejection_wick_ratio':wick,'previous_volume_pace':prevpace,'volume_growth_pct':growth,'continuation_mode':mode,'price_progress_atr':pp,'depth_progress_atr':dp,'progress_reason':preason,'late_entry_reason':latereason}
+    return {'type':'CONFIRMED','direction':direction,'signal_mode':mode,'price':entry,'entry_low':entry-atr15*.06,'entry_high':entry+atr15*.06,'sl':stop,'tp1':tp1,'tp2':tp2,'tp3':tp3,'tp1_r':r1,'tp2_r':r2,'tp3_r':r3,'target_strength':tstrength,'level':level,'volume1h':volume_ratio_closed(c1h),'volume15':pace,'live_volume_pace':pace,'live_volume_elapsed':elapsed,'atr_pct':atr1h/last1h['c']*100,'quality':quality,'leverage':lev,'btc':btc_bias,'btc15_direction':btc15.get('directional','NEUTRAL'),'btc15_strong':btc15.get('strong',False),'btc15_body_atr':btc15.get('body_atr',0.0),'btc15_volume_pace':btc15.get('volume_pace',0.0),'context4h':ctx,'follow_through_atr':follow,'aggressive':lev>=20 and aggressive,'entry_mode':'V6.8_ADAPTIVE','live_power':True,'live_body_atr':body,'live_close_position':cp,'live_volume_reason':vreason,'rejection_wick_ratio':wick,'previous_volume_pace':prevpace,'volume_growth_pct':growth,'continuation_mode':mode,'price_progress_atr':pp,'depth_progress_atr':dp,'progress_reason':preason,'late_entry_reason':latereason}
 
 
 def build_message(symbol, signal):
@@ -1066,7 +1077,7 @@ def scan_market():
     btc_data=market_data("BTCUSDT")
     btc_bias=get_btc_bias(btc_data)
     btc15=get_btc15_live_strength(btc_data)
-    print(f"BTC regime corrente: {btc_bias} | BTC15 LIVE: {btc15['direction']} strong={btc15['strong']} body={btc15['body_atr']:.2f}ATR vol={btc15['volume_pace']:.2f}x")
+    print(f"BTC regime corrente: {btc_bias} | BTC15 LIVE: {btc15.get('directional','NEUTRAL')} strong={btc15['strong']} body={btc15['body_atr']:.2f}ATR vol={btc15['volume_pace']:.2f}x")
     for symbol in SYMBOLS:
         try:
             data=btc_data if symbol=="BTCUSDT" else market_data(symbol)
@@ -1084,16 +1095,17 @@ def scan_market():
 
 threading.Thread(target=ws_loop,daemon=True).start()
 
-print("CryptoSignalAI12 avviato - V6.9.1 BTC15 STRONG EARLY 15S")
+print("CryptoSignalAI12 avviato - V6.9.2 BTC15 DIREZIONALE 15S")
 
 send_telegram(
     "CryptoSignalAI12 ONLINE\n"
-    "V6.9.1 BTC15 STRONG EARLY 15S attiva.\n\n"
+    "V6.9.2 BTC15 DIREZIONALE 15S attiva.\n\n"
     "Scanner: 12 coppie / ciclo target ogni 15 secondi.\n"
     "CONTINUATION: volume + prezzo + breakout devono avanzare insieme.\n"
     "ANTI-LATE: niente ingresso su impulso gia troppo esteso.\n"
     "EARLY REVERSAL: ingresso possibile sulla prima candela 15m; non attende la 2a/3a.\n"    "ALTCOIN EARLY: BTC 15m LIVE deve essere FORTE e nella stessa direzione.\n"
-    "BTC15 forte: body >=0.45 ATR, close >=80%, volume >=1.50x, wick contrario <=25% body.\n"
+    "TUTTE LE ALTCOIN: BTC15 direzionale e concorde (body >=0.15 ATR); BTC15 neutro o contrario blocca.\n"
+    "EARLY REVERSAL: resta BTC15 FORTE (body >=0.45 ATR, close >=80%, volume >=1.50x, wick <=25%).\n"
 
     "SL: dinamico su ATR15 + struttura recente + contesto trend.\n"
     "TP1/TP2/TP3: dinamici su ATR15 + forza + spazio residuo.\n"
