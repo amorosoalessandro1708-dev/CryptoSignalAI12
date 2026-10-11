@@ -8,7 +8,7 @@ import requests
 
 # ==========================================================
 # MOMENTUM CONFERMATO - UN SOLO TIPO DI SEGNALE
-# Nessun nuovo indicatore: EMA, ATR, volume, prezzo e BTC15.
+# Nessun nuovo indicatore: EMA, ATR, volume, prezzo e BTC 15m/30m/1h.
 # ==========================================================
 BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
@@ -20,6 +20,7 @@ SYMBOLS = [
 REST = 'https://fapi.binance.com'
 KLINES_URL = REST + '/fapi/v1/klines'
 SCAN_SECONDS = 15
+CACHE_30M_SECONDS = 5 * 60
 CACHE_1H_SECONDS = 15 * 60
 CACHE_4H_SECONDS = 60 * 60
 LIVE_VOLUME_MIN_ELAPSED_SECONDS = 15
@@ -155,6 +156,10 @@ def market_data(symbol):
     }
 
 
+def btc_30m_data():
+    return cached_candles('BTCUSDT', '30m', CACHE_30M_SECONDS)
+
+
 def ema(values, period):
     if len(values) < period:
         return None
@@ -251,6 +256,22 @@ def btc_bias(data):
     if one[-2]['c'] < a and a < previous:
         return 'SHORT_LIGHT'
     return 'NEUTRAL_STABLE'
+
+
+def btc_30m_direction(candles):
+    # BTC 30m: direzione della candela 30m in formazione, con corpo
+    # minimo proporzionato all'ATR30. Stesso criterio del BTC15 direzionale.
+    if len(candles) < 22:
+        return 'NEUTRAL'
+    a30 = atr(candles[:-1], 14)
+    if not a30 or a30 <= 0:
+        return 'NEUTRAL'
+    live = candles[-1]
+    direction = 'LONG' if live['c'] > live['o'] else 'SHORT'
+    metrics = candle_metrics(live, direction, a30)
+    if not metrics or metrics['body'] < BTC15_DIRECTIONAL_BODY_ATR_MIN:
+        return 'NEUTRAL'
+    return direction
 
 
 def get_btc15_live_strength(btc_data):
@@ -383,7 +404,7 @@ def calculate_leverage(entry, stop, quality, aggressive_ok):
     return max((x for x in LEVERAGE_STEPS if x <= allowed), default=1)
 
 
-def analyze_symbol(symbol, data, bias, btc15):
+def analyze_symbol(symbol, data, bias, btc15, btc30, btc1h):
     c15, c1h, c4h = data['15m'], data['1h'], data['4h']
     if min(len(c15), len(c1h), len(c4h)) < 55:
         return None
@@ -423,9 +444,14 @@ def analyze_symbol(symbol, data, bias, btc15):
         if prior_directional_bars(c15, direction, a15) > EARLY_REVERSAL_MAX_PRIOR_DIRECTIONAL_BARS:
             continue
         countertrend = direction != trend
-        # BTC15 direzionale per tutte le altcoin; FORTE se controtrend 1H.
+        # Altcoin: BTC15 e BTC30 concordi; BTC1H concorde o neutrale.
+        # In controtrend altcoin 1H, BTC15 deve essere anche FORTE.
         if symbol != 'BTCUSDT':
             if btc15['directional'] != direction:
+                continue
+            if btc30 != direction:
+                continue
+            if btc1h not in (direction, 'NEUTRAL'):
                 continue
             if countertrend and not (btc15['strong'] and btc15['direction'] == direction):
                 continue
@@ -464,7 +490,9 @@ def analyze_symbol(symbol, data, bias, btc15):
             'depth_progress_atr': dp, 'context1h': trend, 'context4h': ctx,
             'btc': bias, 'btc15_direction': btc15['directional'],
             'btc15_strong': btc15['strong'], 'btc15_body_atr': btc15['body_atr'],
-            'btc15_volume_pace': btc15['volume_pace'], 'target_strength': strength,
+            'btc15_volume_pace': btc15['volume_pace'],
+            'btc30_direction': btc30, 'btc1h_direction': btc1h,
+            'target_strength': strength,
             'exceptional': exceptional,
         }
     if DIAGNOSTIC_LOGS and pace >= MOMENTUM_VOLUME_MIN:
@@ -506,6 +534,8 @@ def build_message(symbol, signal):
         f"{'FORTE' if signal['btc15_strong'] else 'direzionale'} | "
         f"body {signal['btc15_body_atr']:.2f} ATR | "
         f"vol {signal['btc15_volume_pace']:.2f}x\n"
+        f"BTC30 LIVE: {signal['btc30_direction']}\n"
+        f"BTC1H trend: {signal['btc1h_direction']}\n"
         f"Forza target: {signal['target_strength']:.2f}\n\n"
         'Candela 15m ancora in formazione | HOLD non richiesto'
     )
@@ -527,12 +557,14 @@ def scan_market():
     btc_data = market_data('BTCUSDT')
     bias = btc_bias(btc_data)
     btc15 = get_btc15_live_strength(btc_data)
-    print(f"BTC: {bias} | BTC15: {btc15['directional']} forte={btc15['strong']}")
+    btc30 = btc_30m_direction(btc_30m_data())
+    btc1h = trend_1h(btc_data['1h'])
+    print(f"BTC: {bias} | BTC15: {btc15['directional']} forte={btc15['strong']} | BTC30: {btc30} | BTC1H: {btc1h}")
     for symbol in SYMBOLS:
         try:
             data = btc_data if symbol == 'BTCUSDT' else market_data(symbol)
             successful += 1
-            signal = analyze_symbol(symbol, data, bias, btc15)
+            signal = analyze_symbol(symbol, data, bias, btc15, btc30, btc1h)
             if signal and should_send(symbol, signal):
                 print(symbol, 'MOMENTUM CONFERMATO', signal['direction'],
                       'leva', signal['leverage'])
@@ -553,7 +585,8 @@ def main():
         'Volume >=2.50x | body >=0.80 ATR15 | breakout >=0.70 ATR15 | '
         'wick <=0.20x | accelerazione >=10% (salvo impulso eccezionale).\n'
         '1H obbligatorio (trend o controtrend), 4H informativo.\n'
-        'BTC15 direzionale per altcoin, FORTE se controtrend 1H.\n'
+        'BTC15 e BTC30 concordi per altcoin; BTC1H concorde o NEUTRALE.\n'
+        'BTC15 FORTE se altcoin controtrend 1H.\n'
         'SL, TP e leva dinamici. Nessun HOLD. Prima candela LIVE.')
     while True:
         started = time.monotonic()
