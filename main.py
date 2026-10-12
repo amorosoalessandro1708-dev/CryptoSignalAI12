@@ -1,6 +1,8 @@
 import os
 import time
 import threading
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -19,8 +21,8 @@ SYMBOLS = [
 ]
 REST = 'https://fapi.binance.com'
 KLINES_URL = REST + '/fapi/v1/klines'
-SCAN_SECONDS = 15
-CACHE_30M_SECONDS = 5 * 60
+SCAN_SECONDS = 5
+CACHE_30M_SECONDS = 5  # BTC30 LIVE: non usare dati vecchi di cinque minuti
 CACHE_1H_SECONDS = 15 * 60
 CACHE_4H_SECONDS = 60 * 60
 LIVE_VOLUME_MIN_ELAPSED_SECONDS = 15
@@ -33,14 +35,17 @@ DIAGNOSTIC_LOGS = True
 # Un solo set di filtri per LONG e SHORT, in trend o controtrend 1H.
 MOMENTUM_VOLUME_MIN = 2.50
 MOMENTUM_BODY_ATR_MIN = 0.80
-MOMENTUM_BREAKOUT_ATR_MIN = 0.70
-MOMENTUM_WICK_MAX = 0.20
-MOMENTUM_VOLUME_GROWTH_MIN = 1.10  # +10% rispetto alla scansione precedente
+MOMENTUM_BREAKOUT_ATR_MIN = 0.45
+MOMENTUM_WICK_MAX = 0.15
+MOMENTUM_VOLUME_GROWTH_MIN = 1.10  # +10% su finestra di progressione
 MOMENTUM_CLOSE_POSITION_MIN = 0.80
-PRICE_PROGRESS_MIN_ATR15 = 0.03
-BREAKOUT_PROGRESS_MIN_ATR15 = 0.02
-LIVE_POWER_STRUCTURE_BARS = 2
-# Via eccezionale gia presente nel bot originale: permette la prima lettura.
+PRICE_PROGRESS_MIN_ATR15 = 0.06
+BREAKOUT_PROGRESS_MIN_ATR15 = 0.04
+LIVE_POWER_STRUCTURE_BARS = 4
+PROGRESS_WINDOW_MIN_SECONDS = 15
+PROGRESS_WINDOW_MAX_SECONDS = 30
+SCAN_WORKERS = 6
+# Via eccezionale: non salta mai il requisito di progressione.
 EARLY_REVERSAL_EXCEPTIONAL_PACE_MIN = 3.80
 EARLY_REVERSAL_EXCEPTIONAL_BODY_ATR_MIN = 0.85
 EARLY_REVERSAL_EXCEPTIONAL_WICK_MAX = 0.10
@@ -57,7 +62,7 @@ BTC15_STRONG_CLOSE_POSITION_MIN = 0.80
 BTC15_STRONG_VOLUME_PACE_MIN = 1.50
 BTC15_STRONG_MAX_ADVERSE_WICK_BODY = 0.25
 
-# Stop, target e leva: stessi parametri del codice fornito.
+# Stop strutturale e target dinamici: leva adattata alla distanza dello stop.
 SL_STRUCTURE_BUFFER_ATR15 = 0.10
 SL_BUFFER_STRONG_TREND_ATR15 = 0.18
 SL_BUFFER_NORMAL_TREND_ATR15 = 0.14
@@ -77,8 +82,7 @@ request_lock = threading.Lock()
 cache_lock = threading.Lock()
 last_rest_request = 0.0
 market_cache = {}
-live_volume_state = {}
-live_momentum_state = {}
+live_snapshots = {}
 signal_state = {}
 
 
@@ -297,30 +301,34 @@ def get_btc15_live_strength(btc_data):
             'body_atr': metrics['body'], 'volume_pace': pace}
 
 
-def update_volume(symbol, live, pace):
-    previous = live_volume_state.get(symbol)
-    same = previous is not None and previous['candle_time'] == live['t']
-    growth = 0.0
-    if same and previous['pace'] > 0:
-        growth = pace / previous['pace']
-    volume_rising = same and live['v'] > previous['volume']
-    live_volume_state[symbol] = {'candle_time': live['t'], 'pace': pace, 'volume': live['v']}
-    return growth, bool(volume_rising)
+def update_live_progress(symbol, live, pace, resistance, support, a15):
+    """Progressione e crescita del volume su 15-30 s, anche con scanner a 5 s.
 
-
-def update_progress(symbol, direction, live, level, a15):
-    key = (symbol, direction)
-    depth = ((live['c'] - level) if direction == 'LONG' else (level - live['c'])) / a15
-    previous = live_momentum_state.get(key)
-    same = previous is not None and previous['candle_time'] == live['t']
-    price_progress = 0.0
-    depth_progress = 0.0
-    if same:
-        price_progress = ((live['c'] - previous['price']) if direction == 'LONG'
-                          else (previous['price'] - live['c'])) / a15
-        depth_progress = depth - previous['depth']
-    live_momentum_state[key] = {'candle_time': live['t'], 'price': live['c'], 'depth': depth}
-    return same, price_progress, depth_progress
+    Aggiorna lo storico a ogni scansione, prima di valutare i filtri.
+    Il confronto usa soltanto letture della stessa candela 15m.
+    """
+    now = time.monotonic()
+    history = live_snapshots.setdefault(symbol, deque(maxlen=30))
+    if history and history[-1]['candle_time'] != live['t']:
+        history.clear()
+    eligible = [item for item in history
+                if PROGRESS_WINDOW_MIN_SECONDS <= now - item['time'] <= PROGRESS_WINDOW_MAX_SECONDS]
+    prior = eligible[0] if eligible else None  # circa 30 s di storia, se disponibile
+    result = {}
+    for direction, level in (('LONG', resistance), ('SHORT', support)):
+        if prior is None:
+            result[direction] = (False, 0.0, 0.0, 0.0, False)
+            continue
+        sign = 1 if direction == 'LONG' else -1
+        price_progress = sign * (live['c'] - prior['price']) / a15
+        # Il livello e' stabile all'interno della stessa candela (candele chiuse).
+        depth_progress = sign * (live['c'] - prior['price']) / a15
+        growth = pace / prior['pace'] if prior['pace'] > 0 else 0.0
+        volume_rising = live['v'] > prior['volume']
+        result[direction] = (True, price_progress, depth_progress, growth, volume_rising)
+    history.append({'time': now, 'candle_time': live['t'], 'price': live['c'],
+                    'pace': pace, 'volume': live['v']})
+    return result
 
 
 def prior_directional_bars(c15, direction, a15):
@@ -335,6 +343,10 @@ def prior_directional_bars(c15, direction, a15):
 
 
 def intelligent_stop(direction, entry, level, live, a15, recent, ctx, bias):
+    """SL oltre la struttura. Se troppo distante, scarta il segnale.
+
+    Non avvicina artificialmente lo stop oltre un minimo/massimo strutturale.
+    """
     trend_strong = ctx == direction and bias.startswith(direction)
     if trend_strong:
         buffer_atr = SL_BUFFER_STRONG_TREND_ATR15
@@ -345,12 +357,15 @@ def intelligent_stop(direction, entry, level, live, a15, recent, ctx, bias):
     recent = recent[-SL_STRUCTURE_LOOKBACK_BARS:]
     if direction == 'LONG':
         structural = min([live['l'], level] + [c['l'] for c in recent])
-        raw_distance = entry - (structural - a15 * buffer_atr)
+        structural_stop = structural - a15 * buffer_atr
+        raw_distance = entry - structural_stop
     else:
         structural = max([live['h'], level] + [c['h'] for c in recent])
-        raw_distance = structural + a15 * buffer_atr - entry
-    distance = max(a15 * SL_MIN_DISTANCE_ATR15,
-                   min(raw_distance, a15 * SL_MAX_DISTANCE_ATR15))
+        structural_stop = structural + a15 * buffer_atr
+        raw_distance = structural_stop - entry
+    if raw_distance <= 0 or raw_distance > a15 * SL_MAX_DISTANCE_ATR15:
+        return None
+    distance = max(raw_distance, a15 * SL_MIN_DISTANCE_ATR15)
     return entry - distance if direction == 'LONG' else entry + distance
 
 
@@ -359,6 +374,7 @@ def clamp(value, low, high):
 
 
 def adaptive_targets(direction, entry, stop, a15, quality, pace, body, follow, ctx, bias):
+    """TP proporzionati al rischio strutturale e alla forza osservata."""
     risk = abs(entry - stop)
     if risk <= 0:
         return None
@@ -374,12 +390,13 @@ def adaptive_targets(direction, entry, stop, a15, quality, pace, body, follow, c
     strength = clamp(strength, 0, 1)
     exhaustion = clamp((body - 1.20) / 0.35, 0, 1)
     adjusted = clamp(strength * (1 - 0.35 * exhaustion), 0, 1)
-    a1 = TP1_MIN_ATR15 + (TP1_MAX_ATR15 - TP1_MIN_ATR15) * adjusted
-    a2 = TP2_MIN_ATR15 + (TP2_MAX_ATR15 - TP2_MIN_ATR15) * adjusted
-    a3 = TP3_MIN_ATR15 + (TP3_MAX_ATR15 - TP3_MIN_ATR15) * adjusted
-    d1 = max(a15 * a1, entry * TP_MIN_NET_PCT)
-    d2 = max(a15 * a2, d1 * 1.45)
-    d3 = max(a15 * a3, d2 * 1.35)
+    # 1R-1.4R, 1.6R-2.2R, 2.4R-3.3R (non sono previsioni).
+    r1 = 1.00 + 0.40 * adjusted
+    r2 = 1.60 + 0.60 * adjusted
+    r3 = 2.40 + 0.90 * adjusted
+    d1 = max(risk * r1, entry * TP_MIN_NET_PCT)
+    d2 = max(risk * r2, d1 * 1.15)
+    d3 = max(risk * r3, d2 * 1.15)
     sign = 1 if direction == 'LONG' else -1
     return entry + sign * d1, entry + sign * d2, entry + sign * d3, strength
 
@@ -415,15 +432,11 @@ def analyze_symbol(symbol, data, bias, btc15, btc30, btc1h):
     trend = trend_1h(c1h)
     ctx = context_4h(c4h)
     pace, elapsed = live_volume_ratio(c15)
-    growth, volume_rising = update_volume(symbol, live, pace)
     structure = c15[-(LIVE_POWER_STRUCTURE_BARS + 1):-1]
-    resistance = max(max(c['o'], c['c']) for c in structure)
-    support = min(min(c['o'], c['c']) for c in structure)
-    # Aggiorniamo entrambe le progressioni a ogni scansione, anche senza segnale.
-    progression = {
-        'LONG': update_progress(symbol, 'LONG', live, resistance, a15),
-        'SHORT': update_progress(symbol, 'SHORT', live, support, a15),
-    }
+    resistance = max(c['h'] for c in structure)
+    support = min(c['l'] for c in structure)
+    # Letture LIVE su 15-30 s: una sola finestra per tutte le direzioni.
+    progression = update_live_progress(symbol, live, pace, resistance, support, a15)
     if trend == 'NEUTRAL' or elapsed < LIVE_VOLUME_MIN_ELAPSED_SECONDS:
         return None
     if pace < MOMENTUM_VOLUME_MIN:
@@ -455,19 +468,21 @@ def analyze_symbol(symbol, data, bias, btc15, btc30, btc1h):
                 continue
             if countertrend and not (btc15['strong'] and btc15['direction'] == direction):
                 continue
-        same, pp, dp = progression[direction]
+        same, pp, dp, growth, volume_rising = progression[direction]
         progress_ok = (same and pp >= PRICE_PROGRESS_MIN_ATR15 and
                        dp >= BREAKOUT_PROGRESS_MIN_ATR15)
         growth_ok = volume_rising and growth >= MOMENTUM_VOLUME_GROWTH_MIN
-        # La via eccezionale evita di perdere la prima scansione di un impulso.
+        # Eccezione solo per crescita volume; la progressione resta obbligatoria.
         exceptional = (pace >= EARLY_REVERSAL_EXCEPTIONAL_PACE_MIN and
                        body >= EARLY_REVERSAL_EXCEPTIONAL_BODY_ATR_MIN and
                        wick <= EARLY_REVERSAL_EXCEPTIONAL_WICK_MAX and
                        close_pos >= EARLY_REVERSAL_EXCEPTIONAL_CLOSE_POSITION_MIN)
-        if not ((growth_ok and progress_ok) or exceptional):
+        if not (progress_ok and (growth_ok or exceptional)):
             continue
         entry = live['c']
         stop = intelligent_stop(direction, entry, level, live, a15, c15[:-1], ctx, bias)
+        if stop is None:
+            continue  # Stop strutturale troppo distante: non inviare segnale.
         quality = 10 + int(pace >= 3) + int(body >= 0.70) + int(pp >= 0.08) + int(countertrend)
         # Unico tipo di segnale; leva dinamica, nessuna etichetta aggressiva.
         aggressive_ok = (not countertrend and pace >= 3.50 and
@@ -542,8 +557,7 @@ def build_message(symbol, signal):
 
 
 def should_send(symbol, signal):
-    # Un solo messaggio per simbolo/direzione/candela, senza duplicati al riavvio
-    # soltanto finche' il processo resta attivo (stato in memoria).
+    # Deduplica in memoria: un riavvio azzera questo stato.
     now = time.time()
     key = (symbol, signal['direction'], signal['candle_time'])
     for old_key, old_time in list(signal_state.items()):
@@ -553,6 +567,7 @@ def should_send(symbol, signal):
 
 
 def scan_market():
+    started = time.monotonic()
     successful = 0
     btc_data = market_data('BTCUSDT')
     bias = btc_bias(btc_data)
@@ -560,20 +575,32 @@ def scan_market():
     btc30 = btc_30m_direction(btc_30m_data())
     btc1h = trend_1h(btc_data['1h'])
     print(f"BTC: {bias} | BTC15: {btc15['directional']} forte={btc15['strong']} | BTC30: {btc30} | BTC1H: {btc1h}")
+    # Download concorrente; il limite globale REST di 0.30 s resta attivo.
+    market = {'BTCUSDT': btc_data}
+    with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as executor:
+        futures = {executor.submit(market_data, symbol): symbol
+                   for symbol in SYMBOLS if symbol != 'BTCUSDT'}
+        for future in as_completed(futures):
+            symbol = futures[future]
+            try:
+                market[symbol] = future.result()
+            except Exception as exc:
+                print(symbol, 'ERRORE download:', exc)
     for symbol in SYMBOLS:
+        if symbol not in market:
+            continue
         try:
-            data = btc_data if symbol == 'BTCUSDT' else market_data(symbol)
             successful += 1
-            signal = analyze_symbol(symbol, data, bias, btc15, btc30, btc1h)
+            signal = analyze_symbol(symbol, market[symbol], bias, btc15, btc30, btc1h)
             if signal and should_send(symbol, signal):
                 print(symbol, 'MOMENTUM CONFERMATO', signal['direction'],
                       'leva', signal['leverage'])
                 if send_telegram(build_message(symbol, signal)):
                     signal_state[(symbol, signal['direction'], signal['candle_time'])] = time.time()
         except Exception as exc:
-            print(symbol, 'ERRORE:', exc)
-        time.sleep(0.20)
-    print(f'Scansione completata: {successful}/{len(SYMBOLS)} coppie')
+            print(symbol, 'ERRORE analisi:', exc)
+    elapsed = time.monotonic() - started
+    print(f'Scansione completata: {successful}/{len(SYMBOLS)} coppie | durata {elapsed:.1f}s | target {SCAN_SECONDS}s')
 
 
 def main():
@@ -581,13 +608,13 @@ def main():
     send_telegram(
         'CryptoSignalAI12 ONLINE\n'
         'Unico segnale: 🚀 MOMENTUM CONFERMATO (LONG/SHORT).\n'
-        '12 coppie, scanner target 15 secondi.\n'
-        'Volume >=2.50x | body >=0.80 ATR15 | breakout >=0.70 ATR15 | '
-        'wick <=0.20x | accelerazione >=10% (salvo impulso eccezionale).\n'
+        '12 coppie, scanner target 5 secondi (durata effettiva nei log).\n'
+        'Volume >=2.50x | body >=0.80 ATR15 | breakout >=0.45 ATR15 | '
+        'wick <=0.15x | progressione LIVE 15-30s obbligatoria.\n'
         '1H obbligatorio (trend o controtrend), 4H informativo.\n'
         'BTC15 e BTC30 concordi per altcoin; BTC1H concorde o NEUTRALE.\n'
         'BTC15 FORTE se altcoin controtrend 1H.\n'
-        'SL, TP e leva dinamici. Nessun HOLD. Prima candela LIVE.')
+        'Breakout massimi/minimi ultime 4 candele. SL strutturale, TP in R, leva dinamica. Nessun HOLD.')
     while True:
         started = time.monotonic()
         try:
