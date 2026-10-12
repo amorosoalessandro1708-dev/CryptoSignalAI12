@@ -17,7 +17,10 @@ CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 SYMBOLS = [
     'SOLUSDT', 'BTCUSDT', 'ETHUSDT', 'XRPUSDT',
     'BNBUSDT', 'DOGEUSDT', 'AVAXUSDT', 'SUIUSDT',
-    'LINKUSDT', 'ADAUSDT', 'NEARUSDT', 'UNIUSDT'
+    'LINKUSDT', 'ADAUSDT', 'NEARUSDT', 'UNIUSDT',
+    'LTCUSDT', 'DOTUSDT', 'APTUSDT', 'ARBUSDT',
+    'OPUSDT', 'INJUSDT', 'RENDERUSDT', '1000PEPEUSDT',
+    'FILUSDT', 'ETCUSDT', 'AAVEUSDT', 'TIAUSDT', 'SEIUSDT'
 ]
 REST = 'https://fapi.binance.com'
 KLINES_URL = REST + '/fapi/v1/klines'
@@ -457,17 +460,16 @@ def analyze_symbol(symbol, data, bias, btc15, btc30, btc1h):
         if prior_directional_bars(c15, direction, a15) > EARLY_REVERSAL_MAX_PRIOR_DIRECTIONAL_BARS:
             continue
         countertrend = direction != trend
-        # Altcoin: BTC15 e BTC30 concordi; BTC1H concorde o neutrale.
-        # In controtrend altcoin 1H, BTC15 deve essere anche FORTE.
-        if symbol != 'BTCUSDT':
-            if btc15['directional'] != direction:
-                continue
-            if btc30 != direction:
-                continue
-            if btc1h not in (direction, 'NEUTRAL'):
-                continue
-            if countertrend and not (btc15['strong'] and btc15['direction'] == direction):
-                continue
+        # Conferme BTC obbligatorie per TUTTE le coppie, incluso BTCUSDT:
+        # BTC15 LIVE FORTE, BTC30 LIVE, BTC1H e bias generale concordi.
+        if not (btc15['strong'] and btc15['direction'] == direction):
+            continue
+        if btc30 != direction:
+            continue
+        if btc1h != direction:
+            continue
+        if not bias.startswith(direction + '_'):
+            continue
         same, pp, dp, growth, volume_rising = progression[direction]
         progress_ok = (same and pp >= PRICE_PROGRESS_MIN_ATR15 and
                        dp >= BREAKOUT_PROGRESS_MIN_ATR15)
@@ -608,12 +610,12 @@ def main():
     send_telegram(
         'CryptoSignalAI12 ONLINE\n'
         'Unico segnale: 🚀 MOMENTUM CONFERMATO (LONG/SHORT).\n'
-        '12 coppie, scanner target 5 secondi (durata effettiva nei log).\n'
+        '25 coppie, scanner target 5 secondi (durata effettiva nei log).\n'
         'Volume >=2.50x | body >=0.80 ATR15 | breakout >=0.45 ATR15 | '
         'wick <=0.15x | progressione LIVE 15-30s obbligatoria.\n'
         '1H obbligatorio (trend o controtrend), 4H informativo.\n'
-        'BTC15 e BTC30 concordi per altcoin; BTC1H concorde o NEUTRALE.\n'
-        'BTC15 FORTE se altcoin controtrend 1H.\n'
+        'TUTTE le coppie: BTC15 FORTE e BTC30 concordi; BTC1H concorde obbligatorio.\n'
+        'BTC contesto LONG/SHORT LIGHT o STRONG concorde obbligatorio.\n'
         'Breakout massimi/minimi ultime 4 candele. SL strutturale, TP in R, leva dinamica. Nessun HOLD.')
     while True:
         started = time.monotonic()
