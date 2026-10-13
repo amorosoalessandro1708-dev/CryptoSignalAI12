@@ -10,7 +10,7 @@ import requests
 
 # ==========================================================
 # MOMENTUM CONFERMATO - UN SOLO TIPO DI SEGNALE
-# Nessun nuovo indicatore: EMA, ATR, volume, prezzo e BTC 15m/30m/1h.
+# Nessun nuovo indicatore: EMA, ATR, volume, prezzo e BTC 15m/1h; BTC30 informativo.
 # ==========================================================
 BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
@@ -461,10 +461,8 @@ def analyze_symbol(symbol, data, bias, btc15, btc30, btc1h):
             continue
         countertrend = direction != trend
         # Conferme BTC obbligatorie per TUTTE le coppie, incluso BTCUSDT:
-        # BTC15 LIVE FORTE, BTC30 LIVE, BTC1H e bias generale concordi.
+        # BTC15 LIVE FORTE, BTC1H e bias generale concordi. BTC30 solo informativo.
         if not (btc15['strong'] and btc15['direction'] == direction):
-            continue
-        if btc30 != direction:
             continue
         if btc1h != direction:
             continue
@@ -614,7 +612,7 @@ def main():
         'Volume >=2.50x | body >=0.80 ATR15 | breakout >=0.45 ATR15 | '
         'wick <=0.15x | progressione LIVE 15-30s obbligatoria.\n'
         '1H obbligatorio (trend o controtrend), 4H informativo.\n'
-        'TUTTE le coppie: BTC15 FORTE e BTC30 concordi; BTC1H concorde obbligatorio.\n'
+        'TUTTE le coppie: BTC15 FORTE e BTC1H concordi obbligatori; BTC30 informativo.\n'
         'BTC contesto LONG/SHORT LIGHT o STRONG concorde obbligatorio.\n'
         'Breakout massimi/minimi ultime 4 candele. SL strutturale, TP in R, leva dinamica. Nessun HOLD.')
     while True:
