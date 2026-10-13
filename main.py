@@ -12,8 +12,9 @@ import requests
 # V8 - MOMENTUM DIREZIONALE, HOLD 5 MINUTI
 # 25 futures USDT; solo breakout della struttura 15m.
 # BTC15 direzionale + BTC1H + bias BTC + altcoin 1H concordi.
-# EMA e Stocastico 15m favorevoli all'avvio e MIGLIORATI
-# dopo 300s; volume sufficiente e prezzo in progresso.
+# EMA20 15m: prezzo concorde e EMA20 inclinata nella direzione.
+# EMA50 15m informativa, NON bloccante. EMA20/50 1H INVARIATE.
+# Stocastico 15m favorevole all'avvio e MIGLIORATO dopo 300s.
 # NESSUN ingresso anticipato / breakout esplosivo.
 # BTC30 e 4H informativi. Un solo messaggio Telegram.
 # ==========================================================
@@ -63,7 +64,7 @@ STOCH_K_PERIOD = 14
 STOCH_K_SMOOTH = 3
 STOCH_D_PERIOD = 3
 STOCH_MIN_SPREAD = 0.0
-# I filtri di trend 1H usano EMA20 e EMA50 chiuse.
+# I filtri di trend 1H usano EMA20 e EMA50 chiuse (INVARIATI).
 BTC15_DIRECTIONAL_BODY_ATR_MIN = 0.15
 
 # Gestione rischio V7 invariata (con prezzi di ingresso aggiornati).
@@ -330,14 +331,19 @@ def live_ema15(c15):
 
 
 def aligned_ema(c15, direction):
+    # MODIFICA UNICA AL FILTRO EMA 15m:
+    # - prezzo sopra/sotto EMA20 LIVE;
+    # - EMA20 LIVE inclinata nella stessa direzione rispetto alla barra precedente;
+    # - EMA50 15m NON blocca piu' (resta obbligatoria nel trend 1H).
     values = [c['c'] for c in c15]
-    e20, e50 = ema(values, 20), ema(values, 50)
-    if e20 is None or e50 is None:
+    e20 = ema(values, 20)
+    previous_e20 = ema(values[:-1], 20)
+    if e20 is None or previous_e20 is None:
         return False, None
     price = values[-1]
     if direction == 'LONG':
-        return price > e20 > e50, e20
-    return price < e20 < e50, e20
+        return price > e20 and e20 > previous_e20, e20
+    return price < e20 and e20 < previous_e20, e20
 
 
 def signed(value, direction):
@@ -722,12 +728,13 @@ def scan_market():
 
 
 def main():
-    print('CryptoSignalAI V8 - HOLD 5 MINUTI + EMA/STOCH MIGLIORATI')
+    print('CryptoSignalAI V8 - HOLD 5 MINUTI + EMA20 15m DIREZIONALE')
     send_telegram(
         'CryptoSignalAI V8 ONLINE\n'
         '25 coppie. Solo breakout 15m, HOLD 300 secondi obbligatorio.\n'
         'BTC15 direzionale + BTC1H + bias concordi; altcoin 1H direzionale.\n'
-        'EMA20/50 + Stocastico 15m favorevoli e migliorati dopo 5 minuti.\n'
+        'EMA20 15m: prezzo e inclinazione concordi; EMA50 15m informativa.\n'
+        'EMA20/EMA50 1H INVARIATE. Stocastico 15m favorevole e migliorato dopo 5 minuti.\n'
         'Volume LIVE >=1.20x, prezzo in progresso, anti-inseguimento ATR.\n'
         'BTC30/4H informativi. SL/TP e leva dinamici. NESSUN ingresso anticipato.')
     while True:
