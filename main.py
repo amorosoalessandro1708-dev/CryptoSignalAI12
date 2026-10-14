@@ -7,8 +7,8 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 import requests
 
-# V9.3: breakout/ripresa trend, verifica rapida 20-55s, nessun HOLD 5m.
-# BTC15 neutrale o concorde ammesso; BTC15 contrario blocca la conferma.
+# V9.4: breakout/ripresa trend, verifica rapida 20-55s, nessun HOLD 5m.
+# BTC15 obbligatoriamente concorde; BTC1H concorde o NEUTRAL, mai contrario.
 # Segnali informativi: strategia non validata, testare in simulazione.
 BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
@@ -441,12 +441,12 @@ def analyze_symbol(symbol,data,bias,btc15,btc30,btc1h,now,counters):
     if extension<BREAKOUT_MIN_ATR:
         invalidate(symbol,'non sopra/sotto livello al check',counters)
         return None
-    # V9.3: BTC15 neutrale o concorde; contrario blocca.
-    if btc15['directional'] not in (direction, 'NEUTRAL'):
-        invalidate(symbol,'BTC15 contrario',counters)
+    # V9.4: BTC15 deve essere concorde, NEUTRAL non basta.
+    if btc15['directional'] != direction:
+        invalidate(symbol,'BTC15 non concorde',counters)
         return None
-    if btc1h!=direction:
-        invalidate(symbol,'BTC1H non concorde',counters)
+    if btc1h not in (direction, 'NEUTRAL'):
+        invalidate(symbol,'BTC1H contrario',counters)
         return None
     if not bias.startswith(direction+'_'):
         invalidate(symbol,'bias BTC non concorde',counters)
@@ -531,7 +531,7 @@ def build_message(symbol,s):
     italian_time=datetime.now(ZoneInfo('Europe/Rome')).strftime('%d/%m/%Y %H:%M:%S')
     room=f"{s['room_r']:.2f}R" if s['room_r'] is not None else 'nessun ostacolo rilevato'
     return (
-        f"🚀 MOMENTUM CONFERMATO V9.3 (SPERIMENTALE)\n{pair} — {s['direction']}\n"
+        f"🚀 MOMENTUM CONFERMATO V9.4 (SPERIMENTALE)\n{pair} — {s['direction']}\n"
         f"Orario Italia: {italian_time}\n"
         f"Setup: {s['mode']} | Qualita': {s['quality']}/13\n\n"
         f"ENTRY: {fmt_price(s['entry_low'])} - {fmt_price(s['entry_high'])}\n"
@@ -594,7 +594,7 @@ def scan_market():
             data=market[symbol]
             signal=analyze_symbol(symbol,data,bias,btc15,btc30,btc1h,now,counters)
             if signal and should_send(symbol,signal):
-                print(symbol,'MOMENTUM CONFERMATO V9.3',signal['direction'],signal['mode'])
+                print(symbol,'MOMENTUM CONFERMATO V9.4',signal['direction'],signal['mode'])
                 if send_telegram(build_message(symbol,signal)):
                     signal_state[(symbol,signal['direction'],signal['candle_time'])]=time.time()
             trend=trend_1h(data['1h'])
@@ -608,17 +608,17 @@ def scan_market():
           f'durata {elapsed:.1f}s | target {SCAN_SECONDS}s | CHECK attivi {len(pending)}')
     diagnostic_totals.update(counters)
     if time.monotonic()-last_diag>=DIAGNOSTIC_EVERY_SECONDS:
-        print('DIAGNOSTICA V9.3 (questa scansione):',dict(counters))
-        print('DIAGNOSTICA V9.3 (cumulativa dall avvio):',dict(diagnostic_totals))
+        print('DIAGNOSTICA V9.4 (questa scansione):',dict(counters))
+        print('DIAGNOSTICA V9.4 (cumulativa dall avvio):',dict(diagnostic_totals))
         last_diag=time.monotonic()
 
 def main():
-    print('CryptoSignalAI V9.3 - CHECK RAPIDO >=20s, BTC15 NON CONTRARIO')
+    print('CryptoSignalAI V9.4 - CHECK RAPIDO >=20s, BTC15 CONCORDE, BTC1H NEUTRAL AMMESSO')
     send_telegram(
-        'CryptoSignalAI V9.3 ONLINE\n'
+        'CryptoSignalAI V9.4 ONLINE\n'
         '25 coppie. Breakout prima dei filtri; conferma successiva. Nessun HOLD 5 minuti.\n'
         'Controllo rapido 20-55s: tenuta livello con tolleranza 0.08 ATR, prezzo in progresso.\n'
-        'BTC15 concorde o NEUTRAL (mai contrario); BTC1H + bias BTC obbligatori alla conferma.\n'
+        'BTC15 obbligatoriamente concorde; BTC1H concorde o NEUTRAL (mai contrario). Bias BTC concorde obbligatorio.\n'
         'Trend 1H EMA20/50, EMA20 15m e Stocastico favorevoli alla conferma.\n'
         'Candela finale controllata, volume LIVE >=1.20x. SL strutturale 0.90-2.40 ATR15.\n'
         'TP e leva dinamici. Strategia non validata: testare in simulazione.')
