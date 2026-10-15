@@ -7,7 +7,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 import requests
 
-# V9.5: breakout/ripresa trend, verifica rapida 20-55s, nessun HOLD 5m.
+# V9.6: identica alla V9.5, modificato esclusivamente il calcolo dello stop loss.
 # BTC15 blocca solo se fortemente contrario; BTC1H concorde o NEUTRAL, mai contrario.
 # Segnali informativi: strategia non validata, testare in simulazione.
 BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
@@ -58,13 +58,14 @@ STOCH_K_SMOOTH = 3
 STOCH_D_PERIOD = 3
 BTC15_DIRECTIONAL_BODY_ATR_MIN = .15
 BTC15_STRONG_OPPOSITE_BODY_ATR_MIN = .45  # blocca solo corpo BTC15 opposto >= 0.45 ATR15
-# Stop più largo rispetto alla V9; limite massimo ancora applicato.
-SL_STRUCTURE_LOOKBACK_BARS = 4
-SL_BUFFER_STRONG_TREND_ATR15 = .25
-SL_BUFFER_NORMAL_TREND_ATR15 = .22
+# V9.6: solo parametri stop loss (gli altri filtri sono invariati).
+SL_STRUCTURE_LOOKBACK_BARS = 8      # struttura 15m piu ampia, solo candele chiuse
+SL_1H_LOOKBACK_BARS = 3            # controllo livelli 1h recenti, solo candele chiuse
+SL_BUFFER_STRONG_TREND_ATR15 = .35
+SL_BUFFER_NORMAL_TREND_ATR15 = .28
 SL_BUFFER_NEUTRAL_4H_ATR15 = .20
 SL_MIN_DISTANCE_ATR15 = .90
-SL_MAX_DISTANCE_ATR15 = 2.40
+SL_MAX_DISTANCE_ATR15 = 2.40       # rischio massimo invariato: nessuno stop forzato oltre limite
 TP_MIN_NET_PCT = .0015
 LEVERAGE_SAFETY = .35
 LEVERAGE_STEPS = (1,2,3,5,10,15,20,25,30,40,50,75,100)
@@ -305,23 +306,49 @@ def opportunity_level(c15,direction,a15):
             levels.append(('RIPRESA TREND',level))
     return levels
 
-def intelligent_stop(direction,entry,level,live,a15,recent,ctx,bias):
+# V9.6: unica funzione strategica modificata: stop dietro struttura 15m
+# e, se compatibile con il rischio massimo, anche dietro struttura 1h.
+def intelligent_stop(direction,entry,level,live,a15,recent,ctx,bias,one_hour):
     if ctx==direction and bias.startswith(direction):
         buffer=SL_BUFFER_STRONG_TREND_ATR15
     elif ctx=='NEUTRAL':
         buffer=SL_BUFFER_NEUTRAL_4H_ATR15
     else:
         buffer=SL_BUFFER_NORMAL_TREND_ATR15
-    recent=recent[-SL_STRUCTURE_LOOKBACK_BARS:]
+
+    closed15=recent[-SL_STRUCTURE_LOOKBACK_BARS:]
+    closed1h=one_hour[:-1][-SL_1H_LOOKBACK_BARS:]
+    if not closed15:
+        return None
+    margin=a15*buffer
+    maximum=a15*SL_MAX_DISTANCE_ATR15
+
     if direction=='LONG':
-        structural=min([live['l'],level]+[x['l'] for x in recent])
-        raw=entry-(structural-a15*buffer)
+        support15=min([live['l'],level]+[x['l'] for x in closed15])
+        structural=support15-margin
+        # Il supporto 1h si usa solo se e' sotto l'entry e rientra nel rischio massimo.
+        if closed1h:
+            support1h=min(x['l'] for x in closed1h)
+            candidate=support1h-margin
+            if 0 < entry-candidate <= maximum:
+                structural=min(structural,candidate)
+        raw=entry-structural
     else:
-        structural=max([live['h'],level]+[x['h'] for x in recent])
-        raw=(structural+a15*buffer)-entry
-    if raw<=0 or raw>a15*SL_MAX_DISTANCE_ATR15:
+        resistance15=max([live['h'],level]+[x['h'] for x in closed15])
+        structural=resistance15+margin
+        # La resistenza 1h si usa solo se e' sopra l'entry e rientra nel rischio massimo.
+        if closed1h:
+            resistance1h=max(x['h'] for x in closed1h)
+            candidate=resistance1h+margin
+            if 0 < candidate-entry <= maximum:
+                structural=max(structural,candidate)
+        raw=structural-entry
+
+    if raw<=0 or raw>maximum:
         return None
     distance=max(raw,a15*SL_MIN_DISTANCE_ATR15)
+    if distance>maximum:
+        return None
     return entry-distance if direction=='LONG' else entry+distance
 
 def available_room(c15,direction,entry,risk):
@@ -478,7 +505,7 @@ def analyze_symbol(symbol,data,bias,btc15,btc30,btc1h,now,counters):
     body=metrics['body']
     wick=metrics['wick']
     entry=live['c']
-    stop=intelligent_stop(direction,entry,level,live,a15,c15[:-1],ctx,bias)
+    stop=intelligent_stop(direction,entry,level,live,a15,c15[:-1],ctx,bias,c1h)
     if stop is None:
         invalidate(symbol,'stop strutturale fuori range',counters)
         return None
@@ -534,11 +561,11 @@ def build_message(symbol,s):
     italian_time=datetime.now(ZoneInfo('Europe/Rome')).strftime('%d/%m/%Y %H:%M:%S')
     room=f"{s['room_r']:.2f}R" if s['room_r'] is not None else 'nessun ostacolo rilevato'
     return (
-        f"🚀 MOMENTUM CONFERMATO V9.5 (SPERIMENTALE)\n{pair} — {s['direction']}\n"
+        f"🚀 MOMENTUM CONFERMATO V9.6 (SPERIMENTALE)\n{pair} — {s['direction']}\n"
         f"Orario Italia: {italian_time}\n"
         f"Setup: {s['mode']} | Qualita': {s['quality']}/13\n\n"
         f"ENTRY: {fmt_price(s['entry_low'])} - {fmt_price(s['entry_high'])}\n"
-        f"SL strutturale allargato: {fmt_price(s['sl'])}\n\n"
+        f"SL strutturale 15m/1H: {fmt_price(s['sl'])}\n\n"
         f"TP1: {fmt_price(s['tp1'])}\nTP2: {fmt_price(s['tp2'])}\n"
         f"TP3: {fmt_price(s['tp3'])}\n\n"
         f"Leva indicativa: {s['leverage']}x\n"
@@ -597,7 +624,7 @@ def scan_market():
             data=market[symbol]
             signal=analyze_symbol(symbol,data,bias,btc15,btc30,btc1h,now,counters)
             if signal and should_send(symbol,signal):
-                print(symbol,'MOMENTUM CONFERMATO V9.5',signal['direction'],signal['mode'])
+                print(symbol,'MOMENTUM CONFERMATO V9.6',signal['direction'],signal['mode'])
                 if send_telegram(build_message(symbol,signal)):
                     signal_state[(symbol,signal['direction'],signal['candle_time'])]=time.time()
             trend=trend_1h(data['1h'])
@@ -611,19 +638,19 @@ def scan_market():
           f'durata {elapsed:.1f}s | target {SCAN_SECONDS}s | CHECK attivi {len(pending)}')
     diagnostic_totals.update(counters)
     if time.monotonic()-last_diag>=DIAGNOSTIC_EVERY_SECONDS:
-        print('DIAGNOSTICA V9.5 (questa scansione):',dict(counters))
-        print('DIAGNOSTICA V9.5 (cumulativa dall avvio):',dict(diagnostic_totals))
+        print('DIAGNOSTICA V9.6 (questa scansione):',dict(counters))
+        print('DIAGNOSTICA V9.6 (cumulativa dall avvio):',dict(diagnostic_totals))
         last_diag=time.monotonic()
 
 def main():
-    print('CryptoSignalAI V9.5 - CHECK RAPIDO >=20s, BTC15 BLOCCA SOLO SE FORTE CONTRARIO, BTC1H NEUTRAL AMMESSO')
+    print('CryptoSignalAI V9.6 - CHECK RAPIDO >=20s, BTC15 BLOCCA SOLO SE FORTE CONTRARIO, BTC1H NEUTRAL AMMESSO')
     send_telegram(
-        'CryptoSignalAI V9.5 ONLINE\n'
+        'CryptoSignalAI V9.6 ONLINE\n'
         '25 coppie. Breakout prima dei filtri; conferma successiva. Nessun HOLD 5 minuti.\n'
         'Controllo rapido 20-55s: tenuta livello con tolleranza 0.08 ATR, prezzo in progresso.\n'
         'BTC15: blocco solo se fortemente contrario (corpo >=0.45 ATR15); BTC1H concorde o NEUTRAL. Bias BTC concorde obbligatorio.\n'
         'Trend 1H EMA20/50, EMA20 15m e Stocastico favorevoli alla conferma.\n'
-        'Candela finale controllata, volume LIVE >=1.20x. SL strutturale 0.90-2.40 ATR15.\n'
+        'Candela finale controllata, volume LIVE >=1.20x. SL strutturale 15m/1H, massimo 2.40 ATR15.\n'
         'TP e leva dinamici. Strategia non validata: testare in simulazione.')
     while True:
         started=time.monotonic()
