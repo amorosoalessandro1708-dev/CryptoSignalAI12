@@ -7,7 +7,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 import requests
 
-# V9.8.1: FAST sulla prima candela live forte; TREND sulla terza candela live
+# V9.8.2: FAST sulla prima candela live forte; TREND sulla terza candela live
 # con le prime due chiuse dello stesso colore. BTC15 direzionale concorde.
 # Segnali informativi: strategia non validata, testare in simulazione.
 BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
@@ -66,7 +66,7 @@ SL_BUFFER_NORMAL_TREND_ATR15 = .45
 SL_BUFFER_NEUTRAL_4H_ATR15 = .30
 SL_MIN_DISTANCE_ATR15 = 1.20
 SL_MAX_DISTANCE_ATR15 = 4.50       # limite massimo, non stop obbligatorio
-# V9.8.1: nessuna attesa fissa di 60/120s. Il volume live richiede
+# V9.8.2: nessuna attesa fissa di 60/120s. Il volume live richiede
 # soltanto 15s di campionamento per evitare divisioni instabili.
 FAST_BODY_ATR_MIN = .65
 FAST_VOLUME_PACE_MIN = 1.50
@@ -321,7 +321,7 @@ def opportunity_level(c15,direction,a15):
             levels.append(('RIPRESA TREND',level))
     return levels
 
-# V9.8.1: stop strutturale ampliato su 15m e 1h.
+# V9.8.2: stop strutturale ampliato su 15m e 1h.
 def intelligent_stop(direction,entry,level,live,a15,recent,ctx,bias,one_hour):
     if ctx==direction and bias.startswith(direction):
         buffer=SL_BUFFER_STRONG_TREND_ATR15
@@ -388,7 +388,7 @@ def adaptive_targets(direction,entry,stop,a15,quality,pace,body,follow,ctx,bias)
     strength+=.05*int(ctx==direction)+.05*int(bias.startswith(direction))
     strength=clamp(strength,0,1)
     adjusted=clamp(strength*(1-.35*clamp((body-1.2)/.35,0,1)),0,1)
-    d1=max(risk*.80,entry*TP_MIN_NET_PCT)
+    d1=max(risk*.35,entry*TP_MIN_NET_PCT)
     d2=max(risk*1.35,d1*1.15)
     d3=max(risk*2.15,d2*1.15)
     sign=1 if direction=='LONG' else -1
@@ -571,7 +571,7 @@ def build_message(symbol,s):
     italian_time=datetime.now(ZoneInfo('Europe/Rome')).strftime('%d/%m/%Y %H:%M:%S')
     room=f"{s['room_r']:.2f}R" if s['room_r'] is not None else 'nessun ostacolo rilevato'
     return (
-        f"🚀 FAST/TREND V9.8.1 (SPERIMENTALE)\n{pair} — {s['direction']}\n"
+        f"🚀 FAST/TREND V9.8.2 (SPERIMENTALE)\n{pair} — {s['direction']}\n"
         f"Orario Italia: {italian_time}\n"
         f"Setup: {s['mode']} | Qualita': {s['quality']}/13\n\n"
         f"ENTRY: {fmt_price(s['entry_low'])} - {fmt_price(s['entry_high'])}\n"
@@ -634,7 +634,7 @@ def scan_market():
             data=market[symbol]
             signal=analyze_symbol(symbol,data,bias,btc15,btc30,btc1h,now,counters)
             if signal and should_send(symbol,signal):
-                print(symbol,'FAST/TREND V9.8.1',signal['direction'],signal['mode'])
+                print(symbol,'FAST/TREND V9.8.2',signal['direction'],signal['mode'])
                 if send_telegram(build_message(symbol,signal)):
                     signal_state[(symbol,signal['direction'],signal['candle_time'])]=time.time()
             trend=trend_1h(data['1h'])
@@ -648,14 +648,14 @@ def scan_market():
           f'durata {elapsed:.1f}s | target {SCAN_SECONDS}s | FAST/TREND attivi')
     diagnostic_totals.update(counters)
     if time.monotonic()-last_diag>=DIAGNOSTIC_EVERY_SECONDS:
-        print('DIAGNOSTICA V9.8.1 (questa scansione):',dict(counters))
-        print('DIAGNOSTICA V9.8.1 (cumulativa dall avvio):',dict(diagnostic_totals))
+        print('DIAGNOSTICA V9.8.2 (questa scansione):',dict(counters))
+        print('DIAGNOSTICA V9.8.2 (cumulativa dall avvio):',dict(diagnostic_totals))
         last_diag=time.monotonic()
 
 def main():
-    print('CryptoSignalAI V9.8.1 - FAST PRIMA CANDELA / TREND TERZA CANDELA')
+    print('CryptoSignalAI V9.8.2 - FAST PRIMA CANDELA / TREND TERZA CANDELA')
     send_telegram(
-        'CryptoSignalAI V9.8.1 ONLINE (SPERIMENTALE)\n'
+        'CryptoSignalAI V9.8.2 ONLINE (SPERIMENTALE)\n'
         '25 coppie. FAST: prima candela live forte, volume >=1.50x.\n'
         'TREND: due candele chiuse dello stesso colore, ingresso sulla terza live, volume >=1.10x.\n'
         'Nessuna attesa fissa 60/120s; campionamento volume minimo 15s.\n'
