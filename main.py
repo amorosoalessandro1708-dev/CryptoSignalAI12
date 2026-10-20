@@ -7,7 +7,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 import requests
 
-# V9.8.4: FAST sulla prima candela live forte; TREND sulla terza candela live
+# V9.8.5: FAST sulla prima candela live forte; TREND sulla terza candela live
 # con le prime due chiuse dello stesso colore. BTC15 direzionale concorde.
 # Segnali informativi: strategia non validata, testare in simulazione.
 BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
@@ -46,6 +46,7 @@ MIN_CANDLE_ELAPSED_SECONDS = 15  # solo alla conferma; breakout rilevato anche p
 LIVE_VOLUME_MIN_ELAPSED_SECONDS = 15
 LIVE_VOLUME_PACE_CAP = 20.
 CLOSED_VOLUME_PREFERRED = 1.10
+MIN_CLOSED_VOLUME_RATIO = .80  # soglia obbligatoria sulla candela 15m precedente
 STRUCTURE_BARS = 6
 PULLBACK_TOUCH_TOLERANCE_ATR = .35
 PULLBACK_TRIGGER_BARS = 3
@@ -66,7 +67,7 @@ SL_BUFFER_NORMAL_TREND_ATR15 = .45
 SL_BUFFER_NEUTRAL_4H_ATR15 = .30
 SL_MIN_DISTANCE_ATR15 = 1.20
 SL_MAX_DISTANCE_ATR15 = 4.50       # limite massimo, non stop obbligatorio
-# V9.8.4: nessuna attesa fissa di 60/120s. Il volume live richiede
+# V9.8.5: nessuna attesa fissa di 60/120s. Il volume live richiede
 # soltanto 15s di campionamento per evitare divisioni instabili.
 FAST_BODY_ATR_MIN = .60
 FAST_BODY_FRACTION_MIN = .75  # corpo almeno 75% del range totale
@@ -323,7 +324,7 @@ def opportunity_level(c15,direction,a15):
             levels.append(('RIPRESA TREND',level))
     return levels
 
-# V9.8.4: stop strutturale ampliato su 15m e 1h.
+# V9.8.5: stop strutturale ampliato su 15m e 1h.
 def intelligent_stop(direction,entry,level,live,a15,recent,ctx,bias,one_hour):
     if ctx==direction and bias.startswith(direction):
         buffer=SL_BUFFER_STRONG_TREND_ATR15
@@ -531,6 +532,9 @@ def analyze_symbol(symbol,data,bias,btc15,btc30,btc1h,now,counters):
         counters['spazio tecnico insufficiente']+=1
         return None
     closed_vol=closed_volume_ratio(c15)
+    if closed_vol<MIN_CLOSED_VOLUME_RATIO:
+        counters['volume candela precedente insufficiente']+=1
+        return None
     body=metrics['body']
     quality=5+int(pace>=1.8)+int(pace>=2.5)+int(body>=.40)+int(body>=.65)
     quality+=int(total_move>=.35)+int(closed_vol>=CLOSED_VOLUME_PREFERRED)
@@ -575,7 +579,7 @@ def build_message(symbol,s):
     italian_time=datetime.now(ZoneInfo('Europe/Rome')).strftime('%d/%m/%Y %H:%M:%S')
     room=f"{s['room_r']:.2f}R" if s['room_r'] is not None else 'nessun ostacolo rilevato'
     return (
-        f"🚀 FAST/TREND V9.8.4 (SPERIMENTALE)\n{pair} — {s['direction']}\n"
+        f"🚀 FAST/TREND V9.8.5 (SPERIMENTALE)\n{pair} — {s['direction']}\n"
         f"Orario Italia: {italian_time}\n"
         f"Setup: {s['mode']} | Qualita': {s['quality']}/13\n\n"
         f"ENTRY: {fmt_price(s['entry_low'])} - {fmt_price(s['entry_high'])}\n"
@@ -638,7 +642,7 @@ def scan_market():
             data=market[symbol]
             signal=analyze_symbol(symbol,data,bias,btc15,btc30,btc1h,now,counters)
             if signal and should_send(symbol,signal):
-                print(symbol,'FAST/TREND V9.8.4',signal['direction'],signal['mode'])
+                print(symbol,'FAST/TREND V9.8.5',signal['direction'],signal['mode'])
                 if send_telegram(build_message(symbol,signal)):
                     signal_state[(symbol,signal['direction'],signal['candle_time'])]=time.time()
             trend=trend_1h(data['1h'])
@@ -652,16 +656,17 @@ def scan_market():
           f'durata {elapsed:.1f}s | target {SCAN_SECONDS}s | FAST/TREND attivi')
     diagnostic_totals.update(counters)
     if time.monotonic()-last_diag>=DIAGNOSTIC_EVERY_SECONDS:
-        print('DIAGNOSTICA V9.8.4 (questa scansione):',dict(counters))
-        print('DIAGNOSTICA V9.8.4 (cumulativa dall avvio):',dict(diagnostic_totals))
+        print('DIAGNOSTICA V9.8.5 (questa scansione):',dict(counters))
+        print('DIAGNOSTICA V9.8.5 (cumulativa dall avvio):',dict(diagnostic_totals))
         last_diag=time.monotonic()
 
 def main():
-    print('CryptoSignalAI V9.8.4 - FAST PRIMA CANDELA / TREND TERZA CANDELA')
+    print('CryptoSignalAI V9.8.5 - FAST PRIMA CANDELA / TREND TERZA CANDELA')
     send_telegram(
-        'CryptoSignalAI V9.8.4 ONLINE (SPERIMENTALE)\n'
+        'CryptoSignalAI V9.8.5 ONLINE (SPERIMENTALE)\n'
         '25 coppie. FAST: corpo >=0.60 ATR15 e >=75% candela, volume >=1.50x.\n'
         'TREND: terza live corpo >=0.45 ATR15 e >=70% candela, volume >=1.10x.\n'
+        'Volume candela 15m precedente obbligatorio >=0.80x per FAST e TREND.\n'
         'Nessuna attesa fissa 60/120s; campionamento volume minimo 15s.\n'
         'EMA20/50 15m e trend 1H, stocastico e BTC15 direzionale concordi.\n'
         'BTC15 FAST >=0.30 ATR; TREND >=0.15 ATR; bias BTC concorde.\n'
