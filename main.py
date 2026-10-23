@@ -8,10 +8,10 @@ from zoneinfo import ZoneInfo
 import requests
 
 # V9.9.0: FAST identico alla V9.8.9 (volume A progressivo o B sostenuto >=2.50x).
-# TREND: tre candele direzionali quasi piene, corpo >=0.35 ATR15 ciascuna;
-# wick favorevole al rifiuto <=20% del range, wick contraria <=5% del range.
-# Terza LIVE >=80% della media dei primi due corpi, con volume progressivo A.
-# Nessun controllo di volume sulle prime due candele TREND.
+# TREND: tre candele direzionali quasi Marubozu, corpo >=0.35 ATR15 ciascuna;
+# corpo >=90% del range e wick SUPERIORE/INFERIORE <=5% del range ciascuna.
+# Terza LIVE >=80% della media dei primi due corpi e volume progressivo A.
+# Nessun requisito di volume sulle prime due candele TREND.
 # Segnali informativi: strategia non validata, testare in simulazione.
 BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
@@ -88,16 +88,15 @@ FAST_BODY_FRACTION_MIN = .80  # corpo almeno 80% del range totale
 FAST_WICK_MAX = .35
 FAST_MAX_EXTENSION_ATR = 1.40
 FAST_BTC15_BODY_ATR_MIN = .30
-# TREND: 3 corpi forti e wick asimmetriche, favorevoli alla continuazione.
-# Per LONG wick inferiore (rifiuto ribasso) <=20%, superiore <=5%.
-# Per SHORT wick superiore (rifiuto rialzo) <=20%, inferiore <=5%.
-# 0% e' ammesso: anche una candela Marubozu e' valida.
+# TREND: 3 candele quasi Marubozu, sia per LONG che per SHORT.
+# Corpo >=0.35 ATR15, pienezza >=90%, due wick <=5% del range ciascuna.
+# Nessuna wick lunga ammessa, neppure se nella direzione favorevole.
 TREND_PREV_BODY_ATR_MIN = .35
-TREND_PREV_BODY_FRACTION_MIN = .75
+TREND_PREV_BODY_FRACTION_MIN = .90
 TREND_BODY_ATR_MIN = .35
-TREND_BODY_FRACTION_MIN = .75
-TREND_FAVORABLE_WICK_MAX_RANGE = .20
-TREND_ADVERSE_WICK_MAX_RANGE = .05
+TREND_BODY_FRACTION_MIN = .90
+TREND_UPPER_WICK_MAX_RANGE = .05
+TREND_LOWER_WICK_MAX_RANGE = .05
 TREND_THIRD_MIN_VS_PREV_AVG = .80  # terza live >=80% della media dei due corpi
 TREND_MAX_EXTENSION_ATR = 2.20
 TREND_BTC15_BODY_ATR_MIN = .15
@@ -321,18 +320,15 @@ def candle_metrics(c, direction, a15):
         wick=max(0.,c['c']-c['l'])/body
     upper_wick=max(0., c['h']-max(c['o'], c['c']))/span
     lower_wick=max(0., min(c['o'], c['c'])-c['l'])/span
-    # Wick favorevole = rifiuto opposto alla direzione (LONG inferiore,
-    # SHORT superiore). Wick contraria = rifiuto nella direzione dell'entrata.
-    favorable_wick=lower_wick if direction=='LONG' else upper_wick
-    adverse_wick=upper_wick if direction=='LONG' else lower_wick
     return {'body':body/a15,'close':pos,'wick':wick,'body_fraction':body/span,
-            'favorable_wick_range':favorable_wick,'adverse_wick_range':adverse_wick}
+            'upper_wick_range':upper_wick,'lower_wick_range':lower_wick}
 
 def trend_shape_ok(m):
+    """Entrambe le wick piccole (max 5% del range), LONG e SHORT uguali."""
     return (m is not None and
             m['body_fraction']>=TREND_BODY_FRACTION_MIN and
-            m['favorable_wick_range']<=TREND_FAVORABLE_WICK_MAX_RANGE and
-            m['adverse_wick_range']<=TREND_ADVERSE_WICK_MAX_RANGE)
+            m['upper_wick_range']<=TREND_UPPER_WICK_MAX_RANGE and
+            m['lower_wick_range']<=TREND_LOWER_WICK_MAX_RANGE)
 
 def trend_1h(candles):
     closes=[x['c'] for x in candles[:-1]]
@@ -609,7 +605,7 @@ def analyze_symbol(symbol,data,bias,btc15,btc30,btc1h,now,counters):
           metrics['body']>=FAST_BODY_ATR_MIN and
           metrics['body_fraction']>=FAST_BODY_FRACTION_MIN and
           metrics['wick']<=FAST_WICK_MAX)
-    # TREND: 3 corpi forti e wick asimmetriche (rifiuto favorevole ammesso).
+    # TREND: 3 corpi forti e wick <=5% su entrambi i lati (quasi Marubozu).
     # Le prime 2 sono chiuse; la terza e' LIVE: non attende la chiusura.
     # Nessun controllo volume sulle prime due; conta solo l'accelerazione LIVE.
     prev2_metrics=candle_metrics(prev2,direction,a15)
@@ -752,7 +748,7 @@ def build_message(symbol,s):
     italian_time=datetime.now(ZoneInfo('Europe/Rome')).strftime('%d/%m/%Y %H:%M:%S')
     room=f"{s['room_r']:.2f}R" if s['room_r'] is not None else 'nessun ostacolo rilevato'
     return (
-        f"🚀 FAST/TREND V9.8.9 (SPERIMENTALE)\n{pair} — {s['direction']}\n"
+        f"🚀 FAST/TREND V9.9.0 (SPERIMENTALE)\n{pair} — {s['direction']}\n"
         f"Orario Italia: {italian_time}\n"
         f"Setup: {s['mode']} | Qualita': {s['quality']}/13\n\n"
         f"ENTRY: {fmt_price(s['entry_low'])} - {fmt_price(s['entry_high'])}\n"
@@ -818,7 +814,7 @@ def scan_market():
             data=market[symbol]
             signal=analyze_symbol(symbol,data,bias,btc15,btc30,btc1h,now,counters)
             if signal and should_send(symbol,signal):
-                print(symbol,'FAST/TREND V9.8.9',signal['direction'],signal['mode'])
+                print(symbol,'FAST/TREND V9.9.0',signal['direction'],signal['mode'])
                 if send_telegram(build_message(symbol,signal)):
                     signal_state[(symbol,signal['direction'],signal['candle_time'])]=time.time()
             trend=trend_1h(data['1h'])
@@ -837,12 +833,12 @@ def scan_market():
         last_diag=time.monotonic()
 
 def main():
-    print('CryptoSignalAI V9.9.0 - FAST A/B INVARIATO, TREND CORPI FORTI + WICK FAVOREVOLI')
+    print('CryptoSignalAI V9.9.0 - FAST A/B INVARIATO, TREND 3 CANDELE QUASI MARUBOZU')
     send_telegram(
         'CryptoSignalAI V9.9.0 ONLINE (SPERIMENTALE)\n'
         '25 coppie. FAST INVARIATO: prima live corpo >=0.70 ATR15 e >=80% candela.\n'
-        'TREND: 3 corpi >=0.35 ATR15, pieni >=75%, chiusure progressive; terza LIVE >=80% media corpi prime due.\n'
-        'TREND wick: favorevole <=20% range, contraria <=5% (LONG inferiore/SHORT superiore favorevole).\n'
+        'TREND: 3 corpi >=0.35 ATR15, pieni >=90%, chiusure progressive; terza LIVE >=80% media corpi prime due.\n'
+        'TREND wick: sia superiore sia inferiore <=5% del range per tutte e tre; nessuna wick lunga ammessa.\n'
         'FAST volume: progressivo A OPPURE sostenuto B >=2.50x, calo ritmo <=15% su 2 intervalli live.\n'
         'TREND: volume progressivo A SOLO sulla terza LIVE; nessun filtro volume sulle prime due.\n'
         'Volume candela precedente >=0.80x SOLO per FAST.\n'
