@@ -1,14 +1,15 @@
 import os
 import time
 import threading
-from collections import Counter
+from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from zoneinfo import ZoneInfo
 import requests
 
-# V9.8.7: FAST sulla prima candela live forte; TREND sulla terza candela live
-# con le prime due chiuse dello stesso colore. BTC15 direzionale concorde.
+# V9.8.8: stessi segnali FAST/TREND della V9.8.7, con filtro volume
+# dinamico: intensita' rispetto allo storico + accelerazione della velocita'
+# degli scambi sulla candela LIVE. TREND valuta anche le due candele chiuse.
 # Segnali informativi: strategia non validata, testare in simulazione.
 BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
@@ -67,11 +68,20 @@ SL_BUFFER_NORMAL_TREND_ATR15 = .45
 SL_BUFFER_NEUTRAL_4H_ATR15 = .30
 SL_MIN_DISTANCE_ATR15 = 1.20
 SL_MAX_DISTANCE_ATR15 = 4.50       # limite massimo, non stop obbligatorio
-# V9.8.7: nessuna attesa fissa di 60/120s. Il volume live richiede
-# soltanto 15s di campionamento per evitare divisioni instabili.
+# V9.8.8: volume LIVE progressivo. Nessuna soglia LIVE fissa di 1.60x/1.20x.
+# Il minimo dinamico deriva da media e mediana delle ultime 20 candele chiuse.
+# Per accelerare, la velocita' degli scambi deve aumentare fra due intervalli
+# temporali consecutivi osservati (NON il volume cumulativo, che sale sempre).
+# Il volume resta un filtro: una crescita da valori troppo bassi non e' valida.
+VOLUME_SAMPLE_MIN_GAP_SECONDS = 4.0
+VOLUME_SAMPLE_MAX_GAP_SECONDS = 60.0
+VOLUME_SAMPLE_LOOKBACK_SECONDS = 120.0
+VOLUME_ACCEL_MIN_GROWTH = .12       # accelerazione di almeno +12%, NON soglia di volume
+VOLUME_RECENT_RATE_FLOOR_PART = .75 # recente >=75% della velocita' storica dinamica
+TREND_PREVIOUS_VOLUME_TOLERANCE = .85  # una piccola pausa fra 1a e 2a e' ammessa
+TREND_LIVE_VOLUME_TOLERANCE = .95     # proiezione 3a almeno 95% della 2a
 FAST_BODY_ATR_MIN = .70
 FAST_BODY_FRACTION_MIN = .80  # corpo almeno 80% del range totale
-FAST_VOLUME_PACE_MIN = 1.60
 FAST_WICK_MAX = .35
 FAST_MAX_EXTENSION_ATR = 1.40
 FAST_BTC15_BODY_ATR_MIN = .30
@@ -81,7 +91,6 @@ TREND_PREV_BODY_ATR_MIN = .20
 TREND_PREV_BODY_FRACTION_MIN = .60
 TREND_BODY_ATR_MIN = .50
 TREND_BODY_FRACTION_MIN = .75  # corpo almeno 75% del range totale
-TREND_VOLUME_PACE_MIN = 1.20
 TREND_WICK_MAX = .70
 TREND_MAX_EXTENSION_ATR = 2.20
 TREND_BTC15_BODY_ATR_MIN = .15
@@ -101,6 +110,10 @@ last_observed = {}
 signal_state = {}
 last_diag = 0.
 diagnostic_totals = Counter()
+# Campionamento in RAM per singola coppia; un riavvio richiede alcune scansioni
+# prima di avere due intervalli confrontabili sulla candela live.
+live_volume_samples = {}
+volume_samples_lock = threading.Lock()
 
 def send_telegram(message):
     if not BOT_TOKEN or not CHAT_ID:
@@ -189,6 +202,85 @@ def live_volume_ratio(candles):
     if avg<=0 or elapsed<LIVE_VOLUME_MIN_ELAPSED_SECONDS:
         return 0.,elapsed
     return min(live['v']/(avg*max(elapsed/900.,.01)),LIVE_VOLUME_PACE_CAP),elapsed
+
+def progressive_volume_metrics(symbol, candles, now):
+    """Controlla volume LIVE senza soglie x fisse, usando due campioni di velocita'.
+
+    - Livello: proiezione della candela 15m vs media+mediana volumi storici.
+    - Accelerazione: velocita' degli scambi nell'ultimo intervallo vs precedente.
+    - TREND: 2a candela chiusa non troppo sotto la 1a; terza LIVE non sotto
+      la 2a in proiezione. Piccole pause sono ammesse.
+    Tutti i campioni si riferiscono ALLA STESSA candela Binance, senza
+    interpolare tra chiusura e apertura di due candele differenti.
+    """
+    result = {'ready': False, 'accel_ok': False, 'intensity_ok': False,
+              'trend_sequence_ok': False, 'pace': 0., 'relative_pace': 0.,
+              'dynamic_floor': 0., 'growth': 0., 'recent_rate': 0.,
+              'prior_rate': 0., 'projected': 0.}
+    if len(candles) < 22:
+        return result
+
+    live = candles[-1]
+    elapsed = max(0., min((time.time()*1000-live['t'])/1000., 900.))
+    prior = [max(0., x['v']) for x in candles[-21:-1]]
+    avg = sum(prior)/len(prior)
+    sorted_prior = sorted(prior)
+    median = (sorted_prior[9]+sorted_prior[10])/2.
+    reference = (avg+median)/2.
+    # Memorizza anche i campioni iniziali (<15s), senza usarli per segnalare.
+    # Usare tempo monotonic per i delta, tempo UNIX solo per il minuto candela.
+    with volume_samples_lock:
+        state = live_volume_samples.get(symbol)
+        if (state is None or state['candle_time'] != live['t'] or
+                (state['samples'] and live['v'] < state['samples'][-1][1])):
+            state = {'candle_time': live['t'], 'samples': deque(maxlen=16)}
+            live_volume_samples[symbol] = state
+        samples = state['samples']
+        while samples and now-samples[0][0] > VOLUME_SAMPLE_LOOKBACK_SECONDS:
+            samples.popleft()
+        if not samples or now-samples[-1][0] >= VOLUME_SAMPLE_MIN_GAP_SECONDS:
+            samples.append((now, max(0., live['v'])))
+        points = tuple(samples)
+
+    if avg <= 0 or reference <= 0 or elapsed < LIVE_VOLUME_MIN_ELAPSED_SECONDS:
+        return result
+
+    # Proiezione su 900s con il volume accumulato nei secondi effettivi.
+    projected = max(0., live['v'])*900./elapsed
+    pace = min(projected/avg, LIVE_VOLUME_PACE_CAP)
+    dyn_floor = reference/avg
+    relative = projected/reference
+    result.update(pace=pace, dynamic_floor=dyn_floor,
+                  relative_pace=relative, projected=projected,
+                  intensity_ok=(projected >= reference))
+
+    # Minimo 3 osservazioni e 2 finestre temporali comparabili.
+    if len(points) < 3:
+        return result
+    t0,v0 = points[-3]
+    t1,v1 = points[-2]
+    t2,v2 = points[-1]
+    dt_prev,dt_new = t1-t0,t2-t1
+    if (not (VOLUME_SAMPLE_MIN_GAP_SECONDS <= dt_prev <= VOLUME_SAMPLE_MAX_GAP_SECONDS)
+            or not (VOLUME_SAMPLE_MIN_GAP_SECONDS <= dt_new <= VOLUME_SAMPLE_MAX_GAP_SECONDS)):
+        return result
+    prev_rate = max(0., v1-v0)/dt_prev
+    new_rate = max(0., v2-v1)/dt_new
+    # La crescita percentuale e' significativa solo se il nuovo ritmo e'
+    # abbastanza elevato in assoluto rispetto alla storia della coppia.
+    historical_rate = reference/900.
+    # Se il ritmo precedente era zero, usiamo una base piccola ma non nulla
+    # derivata dallo storico: evita valori infiniti nel messaggio Telegram.
+    growth = min(3., new_rate/max(prev_rate, historical_rate*.10)-1.) if new_rate>0 else 0.
+    accel_ok = (new_rate > 0 and new_rate >= prev_rate*(1.+VOLUME_ACCEL_MIN_GROWTH)
+                and new_rate >= historical_rate*VOLUME_RECENT_RATE_FLOOR_PART)
+    prev2,prev1 = candles[-3],candles[-2]
+    trend_seq = (prev1['v'] >= prev2['v']*TREND_PREVIOUS_VOLUME_TOLERANCE and
+                 projected >= prev1['v']*TREND_LIVE_VOLUME_TOLERANCE)
+    result.update(ready=True, accel_ok=accel_ok, growth=growth,
+                  recent_rate=new_rate, prior_rate=prev_rate,
+                  trend_sequence_ok=trend_seq)
+    return result
 
 def closed_volume_ratio(candles):
     if len(candles)<22:
@@ -328,7 +420,7 @@ def opportunity_level(c15,direction,a15):
             levels.append(('RIPRESA TREND',level))
     return levels
 
-# V9.8.7: stop strutturale ampliato su 15m e 1h.
+# Stop strutturale invariato dalla V9.8.7.
 def intelligent_stop(direction,entry,level,live,a15,recent,ctx,bias,one_hour):
     if ctx==direction and bias.startswith(direction):
         buffer=SL_BUFFER_STRONG_TREND_ATR15
@@ -456,6 +548,9 @@ def analyze_symbol(symbol,data,bias,btc15,btc30,btc1h,now,counters):
     Deduplica per simbolo/direzione/candela dopo invio Telegram riuscito.
     """
     c15,c1h,c4h=data['15m'],data['1h'],data['4h']
+    # Registra il volume a OGNI scansione, anche quando il trend 1H e' neutro.
+    # Altrimenti perderemmo l'inizio dell'accelerazione per mancanza di storico.
+    volume=progressive_volume_metrics(symbol,c15,now)
     if min(len(c15),len(c1h),len(c4h))<55:
         counters['dati insufficienti']+=1
         return None
@@ -484,8 +579,7 @@ def analyze_symbol(symbol,data,bias,btc15,btc30,btc1h,now,counters):
     fast=(candle_color(prev1)!=direction and
           metrics['body']>=FAST_BODY_ATR_MIN and
           metrics['body_fraction']>=FAST_BODY_FRACTION_MIN and
-          metrics['wick']<=FAST_WICK_MAX and
-          pace>=FAST_VOLUME_PACE_MIN)
+          metrics['wick']<=FAST_WICK_MAX)
     # Pattern di continuazione ispirato ai Three White Soldiers / Three Black Crows.
     # Prime due candele chiuse: corpo >=0.20 ATR15 e almeno 60% del range,
     # chiusure progressive, senza attendere la chiusura della terza live.
@@ -500,8 +594,22 @@ def analyze_symbol(symbol,data,bias,btc15,btc30,btc1h,now,counters):
            sign*(live['c']-prev1['c'])>0 and
            metrics['body']>=TREND_BODY_ATR_MIN and
            metrics['body_fraction']>=TREND_BODY_FRACTION_MIN and
-           metrics['wick']<=TREND_WICK_MAX and
-           pace>=TREND_VOLUME_PACE_MIN)
+           metrics['wick']<=TREND_WICK_MAX)
+    # Filtro volume comune: intensita' storica dinamica + crescita della
+    # velocita' degli scambi. TREND aggiunge la progressione fra le 3 candele.
+    if fast or trend:
+        if not volume['ready']:
+            counters['volume progressivo: campioni insufficienti']+=1
+            return None
+        if not volume['intensity_ok']:
+            counters['volume progressivo: intensita insufficiente']+=1
+            return None
+        if not volume['accel_ok']:
+            counters['volume progressivo: accelerazione insufficiente']+=1
+            return None
+        if trend and not volume['trend_sequence_ok']:
+            counters['volume progressivo: sequenza TREND insufficiente']+=1
+            trend=False
     if fast:
         mode='FAST ENTRY - PRIMA CANDELA'
         reference=live['o']
@@ -555,7 +663,9 @@ def analyze_symbol(symbol,data,bias,btc15,btc30,btc1h,now,counters):
         counters['volume candela precedente insufficiente (FAST)']+=1
         return None
     body=metrics['body']
-    quality=5+int(pace>=1.8)+int(pace>=2.5)+int(body>=.40)+int(body>=.65)
+    # I 2 punti qualita' del volume non dipendono piu' dalle soglie 1.8x/2.5x;
+    # valutano la forza rispetto al riferimento dinamico e l'accelerazione.
+    quality=5+int(volume['relative_pace']>=1.10)+int(volume['growth']>=.25)+int(body>=.40)+int(body>=.65)
     quality+=int(total_move>=.35)+int(closed_vol>=CLOSED_VOLUME_PREFERRED)
     quality+=int(ctx==direction)+int(signed(sto[0]-sto[1],direction)>=2.)
     quality=min(quality,13)
@@ -576,6 +686,9 @@ def analyze_symbol(symbol,data,bias,btc15,btc30,btc1h,now,counters):
             'leverage':leverage,'quality':quality,'level':level,
             'candle_time':live['t'],
             'live_volume_pace':pace,'closed_volume_ratio':closed_vol,
+            'volume_dynamic_floor':volume['dynamic_floor'],
+            'volume_acceleration':volume['growth'],
+            'volume_relative_strength':volume['relative_pace'],
             'live_body_atr':body,'follow_through_atr':total_move,
             'rejection_wick_ratio':metrics['wick'],'price_progress_atr':total_move,
             'stoch_k':sto[0],'stoch_d':sto[1],
@@ -598,7 +711,7 @@ def build_message(symbol,s):
     italian_time=datetime.now(ZoneInfo('Europe/Rome')).strftime('%d/%m/%Y %H:%M:%S')
     room=f"{s['room_r']:.2f}R" if s['room_r'] is not None else 'nessun ostacolo rilevato'
     return (
-        f"🚀 FAST/TREND V9.8.7 (SPERIMENTALE)\n{pair} — {s['direction']}\n"
+        f"🚀 FAST/TREND V9.8.8 (SPERIMENTALE)\n{pair} — {s['direction']}\n"
         f"Orario Italia: {italian_time}\n"
         f"Setup: {s['mode']} | Qualita': {s['quality']}/13\n\n"
         f"ENTRY: {fmt_price(s['entry_low'])} - {fmt_price(s['entry_high'])}\n"
@@ -609,6 +722,8 @@ def build_message(symbol,s):
         f"Candela live in corso da: {s['check_seconds']}s\n"
         f"Livello: {fmt_price(s['level'])}\n"
         f"Volume LIVE: {s['live_volume_pace']:.2f}x\n"
+        f"Volume soglia dinamica: {s['volume_dynamic_floor']:.2f}x\n"
+        f"Volume progressivo: +{s['volume_acceleration']*100:.0f}% velocita' scambi\n"
         f"Volume chiuso: {s['closed_volume_ratio']:.2f}x\n"
         f"Progressione: {s['price_progress_atr']:+.3f} ATR15\n"
         f"Estensione: {s['follow_through_atr']:.2f} ATR15\n"
@@ -661,7 +776,7 @@ def scan_market():
             data=market[symbol]
             signal=analyze_symbol(symbol,data,bias,btc15,btc30,btc1h,now,counters)
             if signal and should_send(symbol,signal):
-                print(symbol,'FAST/TREND V9.8.7',signal['direction'],signal['mode'])
+                print(symbol,'FAST/TREND V9.8.8',signal['direction'],signal['mode'])
                 if send_telegram(build_message(symbol,signal)):
                     signal_state[(symbol,signal['direction'],signal['candle_time'])]=time.time()
             trend=trend_1h(data['1h'])
@@ -675,16 +790,18 @@ def scan_market():
           f'durata {elapsed:.1f}s | target {SCAN_SECONDS}s | FAST/TREND attivi')
     diagnostic_totals.update(counters)
     if time.monotonic()-last_diag>=DIAGNOSTIC_EVERY_SECONDS:
-        print('DIAGNOSTICA V9.8.7 (questa scansione):',dict(counters))
-        print('DIAGNOSTICA V9.8.7 (cumulativa dall avvio):',dict(diagnostic_totals))
+        print('DIAGNOSTICA V9.8.8 (questa scansione):',dict(counters))
+        print('DIAGNOSTICA V9.8.8 (cumulativa dall avvio):',dict(diagnostic_totals))
         last_diag=time.monotonic()
 
 def main():
-    print('CryptoSignalAI V9.8.7 - FAST PRIMA CANDELA / TREND TERZA CANDELA')
+    print('CryptoSignalAI V9.8.8 - FAST/TREND CON VOLUME PROGRESSIVO')
     send_telegram(
-        'CryptoSignalAI V9.8.7 ONLINE (SPERIMENTALE)\n'
-        '25 coppie. FAST: prima live corpo >=0.70 ATR15 e >=80% candela, volume >=1.60x.\n'
-        'TREND: prime due chiuse corpo >=0.20 ATR15, >=60% e chiusure progressive; terza LIVE >=0.50 ATR15, >=75%, vol >=1.20x.\n'
+        'CryptoSignalAI V9.8.8 ONLINE (SPERIMENTALE)\n'
+        '25 coppie. FAST: prima live corpo >=0.70 ATR15 e >=80% candela.\n'
+        'TREND: prime due chiuse corpo >=0.20 ATR15, >=60% e chiusure progressive; terza LIVE >=0.50 ATR15, >=75%.\n'
+        'Volume FAST/TREND: intensita dinamica rispetto alle ultime 20 candele + accelerazione della velocita LIVE (almeno 2 intervalli osservati).\n'
+        'TREND: progressione volumi fra le 3 candele con piccola tolleranza.\n'
         'Volume candela precedente >=0.80x SOLO per FAST; non obbligatorio per TREND.\n'
         'Nessuna attesa fissa 60/120s; campionamento volume minimo 15s.\n'
         'EMA20/50 15m e trend 1H, stocastico e BTC15 direzionale concordi.\n'
