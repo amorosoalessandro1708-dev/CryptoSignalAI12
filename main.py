@@ -7,10 +7,11 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 import requests
 
-# V9.8.9: stessi segnali FAST/TREND della V9.8.8. Solo FAST aggiunge
-# la via B: volume >=2.50x dello storico dinamico e sostenuto su due
-# intervalli live (calo del ritmo <=15%); la via A progressiva resta attiva.
-# TREND mantiene esattamente il controllo volume progressivo della V9.8.8.
+# V9.9.0: FAST identico alla V9.8.9 (volume A progressivo o B sostenuto >=2.50x).
+# TREND: tre candele direzionali quasi piene, corpo >=0.35 ATR15 ciascuna;
+# wick favorevole al rifiuto <=20% del range, wick contraria <=5% del range.
+# Terza LIVE >=80% della media dei primi due corpi, con volume progressivo A.
+# Nessun controllo di volume sulle prime due candele TREND.
 # Segnali informativi: strategia non validata, testare in simulazione.
 BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
@@ -82,20 +83,22 @@ VOLUME_RECENT_RATE_FLOOR_PART = .75 # recente >=75% della velocita' storica dina
 # SOLO FAST, opzione B: volume molto alto e stabile (nessun segnale separato).
 FAST_SUSTAINED_VOLUME_MULTIPLIER = 2.50 # intensita >=2.50x vs media+mediana storico
 FAST_SUSTAINED_MAX_RATE_DROP = .15   # calo velocita' max 15% fra due intervalli
-TREND_PREVIOUS_VOLUME_TOLERANCE = .85  # una piccola pausa fra 1a e 2a e' ammessa
-TREND_LIVE_VOLUME_TOLERANCE = .95     # proiezione 3a almeno 95% della 2a
 FAST_BODY_ATR_MIN = .70
 FAST_BODY_FRACTION_MIN = .80  # corpo almeno 80% del range totale
 FAST_WICK_MAX = .35
 FAST_MAX_EXTENSION_ATR = 1.40
 FAST_BTC15_BODY_ATR_MIN = .30
-# TREND: le due candele CHIUSE devono avere un corpo reale e non essere laterali.
-# La terza candela rimane LIVE e conserva tutti i requisiti della V9.8.6.
-TREND_PREV_BODY_ATR_MIN = .20
-TREND_PREV_BODY_FRACTION_MIN = .60
-TREND_BODY_ATR_MIN = .50
-TREND_BODY_FRACTION_MIN = .75  # corpo almeno 75% del range totale
-TREND_WICK_MAX = .70
+# TREND: 3 corpi forti e wick asimmetriche, favorevoli alla continuazione.
+# Per LONG wick inferiore (rifiuto ribasso) <=20%, superiore <=5%.
+# Per SHORT wick superiore (rifiuto rialzo) <=20%, inferiore <=5%.
+# 0% e' ammesso: anche una candela Marubozu e' valida.
+TREND_PREV_BODY_ATR_MIN = .35
+TREND_PREV_BODY_FRACTION_MIN = .75
+TREND_BODY_ATR_MIN = .35
+TREND_BODY_FRACTION_MIN = .75
+TREND_FAVORABLE_WICK_MAX_RANGE = .20
+TREND_ADVERSE_WICK_MAX_RANGE = .05
+TREND_THIRD_MIN_VS_PREV_AVG = .80  # terza live >=80% della media dei due corpi
 TREND_MAX_EXTENSION_ATR = 2.20
 TREND_BTC15_BODY_ATR_MIN = .15
 # BTC15 puo' essere NEUTRAL solo se non supera la soglia di forza;
@@ -214,14 +217,14 @@ def progressive_volume_metrics(symbol, candles, now):
     - Accelerazione: velocita' degli scambi nell'ultimo intervallo vs precedente.
     - FAST B: volume >=2.50x e ritmo alto in entrambe le finestre consecutive
       senza rallentare oltre il 15%; solo FAST, non TREND.
-    - TREND: 2a candela chiusa non troppo sotto la 1a; terza LIVE non sotto
-      la 2a in proiezione. Piccole pause sono ammesse.
+    - TREND: verifica esclusivamente il ritmo progressivo della terza LIVE;
+      nessun vincolo su volume delle prime due candele chiuse.
     Tutti i campioni si riferiscono ALLA STESSA candela Binance, senza
     interpolare tra chiusura e apertura di due candele differenti.
     """
     result = {'ready': False, 'accel_ok': False, 'intensity_ok': False,
               'sustained_ok': False,
-              'trend_sequence_ok': False, 'pace': 0., 'relative_pace': 0.,
+              'pace': 0., 'relative_pace': 0.,
               'dynamic_floor': 0., 'growth': 0., 'recent_rate': 0.,
               'prior_rate': 0., 'projected': 0.}
     if len(candles) < 22:
@@ -290,13 +293,9 @@ def progressive_volume_metrics(symbol, candles, now):
                     prev_rate >= sustained_min_rate and
                     new_rate >= sustained_min_rate and
                     new_rate >= prev_rate*(1.-FAST_SUSTAINED_MAX_RATE_DROP))
-    prev2,prev1 = candles[-3],candles[-2]
-    trend_seq = (prev1['v'] >= prev2['v']*TREND_PREVIOUS_VOLUME_TOLERANCE and
-                 projected >= prev1['v']*TREND_LIVE_VOLUME_TOLERANCE)
     result.update(ready=True, accel_ok=accel_ok, sustained_ok=sustained_ok,
                   growth=growth,
-                  recent_rate=new_rate, prior_rate=prev_rate,
-                  trend_sequence_ok=trend_seq)
+                  recent_rate=new_rate, prior_rate=prev_rate)
     return result
 
 def closed_volume_ratio(candles):
@@ -320,7 +319,20 @@ def candle_metrics(c, direction, a15):
             return None
         pos=(c['h']-c['c'])/span
         wick=max(0.,c['c']-c['l'])/body
-    return {'body':body/a15,'close':pos,'wick':wick,'body_fraction':body/span}
+    upper_wick=max(0., c['h']-max(c['o'], c['c']))/span
+    lower_wick=max(0., min(c['o'], c['c'])-c['l'])/span
+    # Wick favorevole = rifiuto opposto alla direzione (LONG inferiore,
+    # SHORT superiore). Wick contraria = rifiuto nella direzione dell'entrata.
+    favorable_wick=lower_wick if direction=='LONG' else upper_wick
+    adverse_wick=upper_wick if direction=='LONG' else lower_wick
+    return {'body':body/a15,'close':pos,'wick':wick,'body_fraction':body/span,
+            'favorable_wick_range':favorable_wick,'adverse_wick_range':adverse_wick}
+
+def trend_shape_ok(m):
+    return (m is not None and
+            m['body_fraction']>=TREND_BODY_FRACTION_MIN and
+            m['favorable_wick_range']<=TREND_FAVORABLE_WICK_MAX_RANGE and
+            m['adverse_wick_range']<=TREND_ADVERSE_WICK_MAX_RANGE)
 
 def trend_1h(candles):
     closes=[x['c'] for x in candles[:-1]]
@@ -597,9 +609,9 @@ def analyze_symbol(symbol,data,bias,btc15,btc30,btc1h,now,counters):
           metrics['body']>=FAST_BODY_ATR_MIN and
           metrics['body_fraction']>=FAST_BODY_FRACTION_MIN and
           metrics['wick']<=FAST_WICK_MAX)
-    # Pattern di continuazione ispirato ai Three White Soldiers / Three Black Crows.
-    # Prime due candele chiuse: corpo >=0.20 ATR15 e almeno 60% del range,
-    # chiusure progressive, senza attendere la chiusura della terza live.
+    # TREND: 3 corpi forti e wick asimmetriche (rifiuto favorevole ammesso).
+    # Le prime 2 sono chiuse; la terza e' LIVE: non attende la chiusura.
+    # Nessun controllo volume sulle prime due; conta solo l'accelerazione LIVE.
     prev2_metrics=candle_metrics(prev2,direction,a15)
     prev1_metrics=candle_metrics(prev1,direction,a15)
     trend=(prev2_metrics is not None and prev1_metrics is not None and
@@ -607,14 +619,16 @@ def analyze_symbol(symbol,data,bias,btc15,btc30,btc1h,now,counters):
            prev1_metrics['body']>=TREND_PREV_BODY_ATR_MIN and
            prev2_metrics['body_fraction']>=TREND_PREV_BODY_FRACTION_MIN and
            prev1_metrics['body_fraction']>=TREND_PREV_BODY_FRACTION_MIN and
+           trend_shape_ok(prev2_metrics) and trend_shape_ok(prev1_metrics) and
            sign*(prev1['c']-prev2['c'])>0 and
            sign*(live['c']-prev1['c'])>0 and
            metrics['body']>=TREND_BODY_ATR_MIN and
-           metrics['body_fraction']>=TREND_BODY_FRACTION_MIN and
-           metrics['wick']<=TREND_WICK_MAX)
+           metrics['body']>=TREND_THIRD_MIN_VS_PREV_AVG *
+                   (prev2_metrics['body']+prev1_metrics['body'])/2. and
+           trend_shape_ok(metrics))
     # Il minimo dinamico e i campioni sufficienti rimangono obbligatori.
     # FAST: via A (accelerazione) OPPURE via B (volume >=2.50x sostenuto).
-    # TREND: resta SOLO la via A progressiva, con la sequenza di tre candele.
+    # TREND: resta SOLO la via A progressiva, sulla terza candela LIVE.
     volume_confirmation = 'PROGRESSIVO (A)'
     if fast or trend:
         if not volume['ready']:
@@ -630,9 +644,6 @@ def analyze_symbol(symbol,data,bias,btc15,btc30,btc1h,now,counters):
         # Se FAST e' vero ha precedenza sul TREND, come in V9.8.8.
         if not fast and trend and not volume['accel_ok']:
             counters['volume progressivo: accelerazione insufficiente']+=1
-            return None
-        if not fast and trend and not volume['trend_sequence_ok']:
-            counters['volume progressivo: sequenza TREND insufficiente']+=1
             return None
         if fast and not volume['accel_ok'] and volume['sustained_ok']:
             volume_confirmation = 'ALTO SOSTENUTO (B >=2.50x)'
@@ -683,8 +694,8 @@ def analyze_symbol(symbol,data,bias,btc15,btc30,btc1h,now,counters):
         counters['spazio tecnico insufficiente']+=1
         return None
     closed_vol=closed_volume_ratio(c15)
-    # In TREND conta la spinta della terza candela LIVE; non e' piu' obbligatorio
-    # il volume minimo della seconda candela. FAST conserva il filtro 0.80x.
+    # TREND: nessun vincolo sui volumi delle due candele chiuse.
+    # FAST conserva integralmente la condizione volume precedente >=0.80x.
     if fast and closed_vol<MIN_CLOSED_VOLUME_RATIO:
         counters['volume candela precedente insufficiente (FAST)']+=1
         return None
@@ -693,7 +704,9 @@ def analyze_symbol(symbol,data,bias,btc15,btc30,btc1h,now,counters):
     # Tutti gli altri punteggi restano identici alla V9.8.8.
     volume_quality_bonus = volume['growth']>=.25 or (fast and volume_confirmation.startswith('ALTO SOSTENUTO'))
     quality=5+int(volume['relative_pace']>=1.10)+int(volume_quality_bonus)+int(body>=.40)+int(body>=.65)
-    quality+=int(total_move>=.35)+int(closed_vol>=CLOSED_VOLUME_PREFERRED)
+    # Il punteggio TREND non dipende dal volume delle prime due candele.
+    # Si conserva il peso del punto di qualita' per mantenere la stessa scala.
+    quality+=int(total_move>=.35)+(int(closed_vol>=CLOSED_VOLUME_PREFERRED) if fast else 1)
     quality+=int(ctx==direction)+int(signed(sto[0]-sto[1],direction)>=2.)
     quality=min(quality,13)
     if quality<MIN_QUALITY:
@@ -819,20 +832,20 @@ def scan_market():
           f'durata {elapsed:.1f}s | target {SCAN_SECONDS}s | FAST/TREND attivi')
     diagnostic_totals.update(counters)
     if time.monotonic()-last_diag>=DIAGNOSTIC_EVERY_SECONDS:
-        print('DIAGNOSTICA V9.8.9 (questa scansione):',dict(counters))
-        print('DIAGNOSTICA V9.8.9 (cumulativa dall avvio):',dict(diagnostic_totals))
+        print('DIAGNOSTICA V9.9.0 (questa scansione):',dict(counters))
+        print('DIAGNOSTICA V9.9.0 (cumulativa dall avvio):',dict(diagnostic_totals))
         last_diag=time.monotonic()
 
 def main():
-    print('CryptoSignalAI V9.8.9 - FAST A/B VOLUME, TREND PROGRESSIVO')
+    print('CryptoSignalAI V9.9.0 - FAST A/B INVARIATO, TREND CORPI FORTI + WICK FAVOREVOLI')
     send_telegram(
-        'CryptoSignalAI V9.8.9 ONLINE (SPERIMENTALE)\n'
-        '25 coppie. FAST: prima live corpo >=0.70 ATR15 e >=80% candela.\n'
-        'TREND: prime due chiuse corpo >=0.20 ATR15, >=60% e chiusure progressive; terza LIVE >=0.50 ATR15, >=75%.\n'
-        'FAST: volume progressivo A OPPURE alto e sostenuto B >=2.50x, calo ritmo <=15% su 2 intervalli live.\n'
-        'TREND: volume progressivo A soltanto; media e mediana delle ultime 20 candele come riferimento dinamico.\n'
-        'TREND: progressione volumi fra le 3 candele con piccola tolleranza.\n'
-        'Volume candela precedente >=0.80x SOLO per FAST; non obbligatorio per TREND.\n'
+        'CryptoSignalAI V9.9.0 ONLINE (SPERIMENTALE)\n'
+        '25 coppie. FAST INVARIATO: prima live corpo >=0.70 ATR15 e >=80% candela.\n'
+        'TREND: 3 corpi >=0.35 ATR15, pieni >=75%, chiusure progressive; terza LIVE >=80% media corpi prime due.\n'
+        'TREND wick: favorevole <=20% range, contraria <=5% (LONG inferiore/SHORT superiore favorevole).\n'
+        'FAST volume: progressivo A OPPURE sostenuto B >=2.50x, calo ritmo <=15% su 2 intervalli live.\n'
+        'TREND: volume progressivo A SOLO sulla terza LIVE; nessun filtro volume sulle prime due.\n'
+        'Volume candela precedente >=0.80x SOLO per FAST.\n'
         'Nessuna attesa fissa 60/120s; campionamento volume minimo 15s.\n'
         'EMA20/50 15m e trend 1H, stocastico e BTC15 direzionale concordi.\n'
         'BTC15 FAST >=0.30 ATR; TREND >=0.15 ATR; bias BTC concorde.\n'
