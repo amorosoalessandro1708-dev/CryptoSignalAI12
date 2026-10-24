@@ -7,6 +7,9 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 import requests
 
+# V9.9.3: BTC15 TREND >=0.20 ATR + volume LIVE progressivo obbligatorio
+#          (solo TREND); scansioni REST senza pausa aggiuntiva oltre 0.2 s.
+#          SCAN_SECONDS=1 e' un obiettivo, NON garantisce un ciclo in 1 s.
 # V9.9.2: SOLO TREND: corpo >=80% del range e wick per lato <=15%.
 # V9.9.1: diagnostica ampliata SOLO INFORMATIVA; strategia identica alla V9.9.0.
 # V9.9.0: FAST identico alla V9.8.9 (volume A progressivo o B sostenuto >=2.50x).
@@ -25,7 +28,7 @@ SYMBOLS = [
     'TIAUSDT','SEIUSDT'
 ]
 KLINES_URL = 'https://fapi.binance.com/fapi/v1/klines'
-SCAN_SECONDS = 5
+SCAN_SECONDS = 1  # target; ogni scansione REST delle 25 coppie dura diversi secondi
 SCAN_WORKERS = 6
 CACHE_30M_SECONDS = 30
 CACHE_1H_SECONDS = 60
@@ -62,7 +65,8 @@ MIN_QUALITY = 9
 STOCH_K_PERIOD = 14
 STOCH_K_SMOOTH = 3
 STOCH_D_PERIOD = 3
-BTC15_DIRECTIONAL_BODY_ATR_MIN = .15
+BTC15_DIRECTIONAL_BODY_ATR_MIN = .20  # TREND BTC15: corpo LIVE >=0.20 ATR15
+BTC30_DIRECTIONAL_BODY_ATR_MIN = .15  # 30m solo informativo: invariato
 BTC15_STRONG_OPPOSITE_BODY_ATR_MIN = .45  # blocca solo corpo BTC15 opposto >= 0.45 ATR15
 # V9.7: stop strutturale ampliato e filtro continuazione su due candele.
 SL_STRUCTURE_LOOKBACK_BARS = 12      # struttura 15m piu ampia, solo candele chiuse
@@ -101,7 +105,7 @@ TREND_UPPER_WICK_MAX_RANGE = .15
 TREND_LOWER_WICK_MAX_RANGE = .15
 TREND_THIRD_MIN_VS_PREV_AVG = .80  # terza live >=80% della media dei due corpi
 TREND_MAX_EXTENSION_ATR = 2.20
-TREND_BTC15_BODY_ATR_MIN = .15
+TREND_BTC15_BODY_ATR_MIN = .20
 # BTC15 puo' essere NEUTRAL solo se non supera la soglia di forza;
 # per entrambi gli ingressi richiediamo invece direzione esplicita.
 # Minimo spazio tecnico resta 1.20R; leva early <= 15x.
@@ -384,7 +388,7 @@ def btc_30m_direction(candles):
     live=candles[-1]
     direction='LONG' if live['c']>live['o'] else 'SHORT'
     metrics=candle_metrics(live,direction,a)
-    return direction if metrics and metrics['body']>=BTC15_DIRECTIONAL_BODY_ATR_MIN else 'NEUTRAL'
+    return direction if metrics and metrics['body']>=BTC30_DIRECTIONAL_BODY_ATR_MIN else 'NEUTRAL'
 
 def btc15_direction(data):
     c=data['15m']
@@ -659,7 +663,7 @@ def diagnose_candle_setups(direction, live, prev1, prev2, metrics, prev1_metrics
         counters['DET TREND test: terza wick lunga'] += 1
 
 
-def analyze_symbol(symbol,data,bias,btc15,btc30,btc1h,now,counters):
+def analyze_symbol(symbol,data,bias,btc15,btc30,btc1h,now,counters,btc_volume=None,volume_override=None):
     """Due vie: FAST prima candela forte; TREND terza dello stesso colore.
 
     Nessuna attesa fissa; la candela live e' valutata a ogni scansione.
@@ -668,7 +672,10 @@ def analyze_symbol(symbol,data,bias,btc15,btc30,btc1h,now,counters):
     c15,c1h,c4h=data['15m'],data['1h'],data['4h']
     # Registra il volume a OGNI scansione, anche quando il trend 1H e' neutro.
     # Altrimenti perderemmo l'inizio dell'accelerazione per mancanza di storico.
-    volume=progressive_volume_metrics(symbol,c15,now)
+    # BTC gia' campionato all'inizio del ciclo. Non duplicare un campione
+    # con lo stesso volume vecchio quando le altre 24 coppie finiscono il download.
+    volume=(volume_override if volume_override is not None
+            else progressive_volume_metrics(symbol,c15,now))
     if min(len(c15),len(c1h),len(c4h))<55:
         counters['dati insufficienti']+=1
         return None
@@ -760,6 +767,19 @@ def analyze_symbol(symbol,data,bias,btc15,btc30,btc1h,now,counters):
     if btc15['directional']!=direction or btc15['body_atr']<btc_min:
         counters['BTC15 non forte/concorde']+=1
         return None
+    # Nuovo filtro V9.9.3 SOLO per TREND: stessa logica volume progressivo
+    # della terza candela (3 osservazioni, intensita e accelerazione +12%).
+    # FAST rimane invariato: BTC15 volume solamente informativo.
+    if mode == 'TREND ENTRY - TERZA CANDELA':
+        if not btc_volume or not btc_volume['ready']:
+            counters['BTC15 TREND: campioni volume insufficienti']+=1
+            return None
+        if not btc_volume['intensity_ok']:
+            counters['BTC15 TREND: volume sotto intensita minima']+=1
+            return None
+        if not btc_volume['accel_ok']:
+            counters['BTC15 TREND: volume non progressivo']+=1
+            return None
     # BTC1H puo' essere neutro, ma mai contrario. Bias BTC deve concordare.
     if btc1h not in (direction,'NEUTRAL') or not bias.startswith(direction+'_'):
         counters['BTC 1H/bias contrario']+=1
@@ -829,6 +849,9 @@ def analyze_symbol(symbol,data,bias,btc15,btc30,btc1h,now,counters):
             'btc15_direction':btc15['directional'],
             'btc15_body_atr':btc15['body_atr'],
             'btc15_volume_pace':btc15['volume_pace'],
+            'btc15_volume_progressive':bool(btc_volume and btc_volume['ready'] and
+                                            btc_volume['intensity_ok'] and btc_volume['accel_ok']),
+            'btc15_volume_growth':btc_volume['growth'] if btc_volume else 0.,
             'btc30_direction':btc30,'btc1h_direction':btc1h,
             'target_strength':strength,'check_seconds':int(elapsed),
             'room_r':room/risk if room!=float('inf') else None}
@@ -844,7 +867,7 @@ def build_message(symbol,s):
     italian_time=datetime.now(ZoneInfo('Europe/Rome')).strftime('%d/%m/%Y %H:%M:%S')
     room=f"{s['room_r']:.2f}R" if s['room_r'] is not None else 'nessun ostacolo rilevato'
     return (
-        f"🚀 FAST/TREND V9.9.2 (SPERIMENTALE)\n{pair} — {s['direction']}\n"
+        f"🚀 FAST/TREND V9.9.3 (SPERIMENTALE)\n{pair} — {s['direction']}\n"
         f"Orario Italia: {italian_time}\n"
         f"Setup: {s['mode']} | Qualita': {s['quality']}/13\n\n"
         f"ENTRY: {fmt_price(s['entry_low'])} - {fmt_price(s['entry_high'])}\n"
@@ -865,7 +888,9 @@ def build_message(symbol,s):
         f"Spazio tecnico storico: {room}\n\n"
         f"Trend 1H: {s['context1h']} | 4H: {s['context4h']}\n"
         f"BTC bias: {s['btc']}\n"
-        f"BTC15: {s['btc15_direction']} | BTC1H: {s['btc1h_direction']}\n"
+        f"BTC15: {s['btc15_direction']} (corpo {s['btc15_body_atr']:.2f} ATR) | BTC1H: {s['btc1h_direction']}\n"
+        f"BTC15 volume progressivo: {'SI' if s['btc15_volume_progressive'] else 'NO'} "
+        f"(+{s['btc15_volume_growth']*100:.0f}% ritmo; obbligatorio solo TREND)\n"
         f"BTC30 informativo: {s['btc30_direction']}\n"
         'Segnale anticipato non validato. Stop e leva non garantiscono protezione da liquidazione.'
     )
@@ -883,11 +908,18 @@ def scan_market():
     started=time.monotonic()
     counters=Counter()
     btc_data=market_data('BTCUSDT')
+    # Una misura del volume BTC all'inizio di OGNI ciclo, indipendentemente
+    # dalla presenza di setup sulle altcoin.
+    btc_volume=progressive_volume_metrics('BTCUSDT',btc_data['15m'],time.monotonic())
     bias=btc_bias(btc_data)
     btc15=btc15_direction(btc_data)
     btc30=btc_30m_direction(cached_candles('BTCUSDT','30m',CACHE_30M_SECONDS))
     btc1h=trend_1h(btc_data['1h'])
-    print(f"BTC: {bias} | BTC15: {btc15['directional']} | BTC30: {btc30} | BTC1H: {btc1h}")
+    btc_vol_status=('OK' if (btc_volume['ready'] and btc_volume['intensity_ok']
+                              and btc_volume['accel_ok']) else 'NON CONFERMATO')
+    print(f"BTC: {bias} | BTC15: {btc15['directional']} "
+          f"({btc15['body_atr']:.2f} ATR) | BTC15VOL: {btc_vol_status} "
+          f"| BTC30: {btc30} | BTC1H: {btc1h}")
     market={'BTCUSDT':btc_data}
     with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as pool:
         futures={pool.submit(market_data,s):s for s in SYMBOLS if s!='BTCUSDT'}
@@ -908,9 +940,11 @@ def scan_market():
         try:
             successful+=1
             data=market[symbol]
-            signal=analyze_symbol(symbol,data,bias,btc15,btc30,btc1h,now,counters)
+            signal=analyze_symbol(symbol,data,bias,btc15,btc30,btc1h,now,counters,
+                                  btc_volume=btc_volume,
+                                  volume_override=btc_volume if symbol=='BTCUSDT' else None)
             if signal and should_send(symbol,signal):
-                print(symbol,'FAST/TREND V9.9.2',signal['direction'],signal['mode'])
+                print(symbol,'FAST/TREND V9.9.3',signal['direction'],signal['mode'])
                 if send_telegram(build_message(symbol,signal)):
                     signal_state[(symbol,signal['direction'],signal['candle_time'])]=time.time()
             trend=trend_1h(data['1h'])
@@ -930,18 +964,18 @@ def scan_market():
         primary_scan={k:v for k,v in counters.items() if not k.startswith('DET ')}
         primary_total={k:v for k,v in diagnostic_totals.items() if not k.startswith('DET ')}
         detail_window={k:v for k,v in diagnostic_since_last.items() if k.startswith('DET ')}
-        print('DIAGNOSTICA V9.9.2 (questa scansione):',primary_scan)
-        print('DIAGNOSTICA V9.9.2 (cumulativa dall avvio):',primary_total)
-        print('DETTAGLIO CANDELE V9.9.2 (circa ultimi 60s):',
+        print('DIAGNOSTICA V9.9.3 (questa scansione):',primary_scan)
+        print('DIAGNOSTICA V9.9.3 (cumulativa dall avvio):',primary_total)
+        print('DETTAGLIO CANDELE V9.9.3 (circa ultimi 60s):',
               dict(sorted(detail_window.items(),key=lambda item:(-item[1],item[0]))))
         print('NOTA: DET FAST/TREND = primo ostacolo per modalita; DET test = non esclusivo.')
         diagnostic_since_last.clear()
         last_diag=time.monotonic()
 
 def main():
-    print('CryptoSignalAI V9.9.2 - TREND 80/15, FAST INVARIATO, DIAGNOSTICA ATTIVA')
+    print('CryptoSignalAI V9.9.3 - TREND 80/15, BTC15 TREND 0.20 ATR + VOLUME PROGRESSIVO, SCANSIONE CONTINUA')
     send_telegram(
-        'CryptoSignalAI V9.9.2 ONLINE - TREND 80/15 (SPERIMENTALE)\n'
+        'CryptoSignalAI V9.9.3 ONLINE - TREND 80/15 (SPERIMENTALE)\n'
         'FAST invariato; TREND pienezza 80% e wick per lato 15%; diagnostica Railway attiva.\n'
         '25 coppie. FAST INVARIATO: prima live corpo >=0.70 ATR15 e >=80% candela.\n'
         'TREND: 3 corpi >=0.35 ATR15, pieni >=80%, chiusure progressive; terza LIVE >=80% media corpi prime due.\n'
@@ -951,7 +985,9 @@ def main():
         'Volume candela precedente >=0.80x SOLO per FAST.\n'
         'Nessuna attesa fissa 60/120s; campionamento volume minimo 15s.\n'
         'EMA20/50 15m e trend 1H, stocastico e BTC15 direzionale concordi.\n'
-        'BTC15 FAST >=0.30 ATR; TREND >=0.15 ATR; bias BTC concorde.\n'
+        'BTC15 FAST >=0.30 ATR; TREND >=0.20 ATR + volume progressivo obbligatorio; bias BTC concorde.\n'
+        'BTC15 progressivo: 3 campioni live, intensita storica adeguata, velocita in aumento >=12%.\n'
+        'Scansioni REST: target 1s, senza sovrapposizioni; durata effettiva dipende da 25 download.\n'
         'SL strutturale 15m/1H massimo 4.50 ATR15; spazio >=1.20R. TP1 0.30R, TP2 0.45R, TP3 0.60R.\n'
         'Leva indicativa <=15x. Strategia non validata: testare in simulazione.')
     while True:
@@ -961,7 +997,7 @@ def main():
         except Exception as exc:
             print('Errore scansione generale:',exc)
             pending.clear()
-        time.sleep(max(1.,SCAN_SECONDS-(time.monotonic()-started)))
+        time.sleep(max(0.2,SCAN_SECONDS-(time.monotonic()-started)))
 
 if __name__=='__main__':
     main()
