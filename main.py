@@ -1,23 +1,20 @@
 import os
 import time
+import json
+import queue
 import threading
 from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from zoneinfo import ZoneInfo
 import requests
+import websocket  # pacchetto pip: websocket-client
 
-# V9.9.3: BTC15 TREND >=0.20 ATR + volume LIVE progressivo obbligatorio
-#          (solo TREND); scansioni REST senza pausa aggiuntiva oltre 0.2 s.
-#          SCAN_SECONDS=1 e' un obiettivo, NON garantisce un ciclo in 1 s.
-# V9.9.2: SOLO TREND: corpo >=80% del range e wick per lato <=15%.
-# V9.9.1: diagnostica ampliata SOLO INFORMATIVA; strategia identica alla V9.9.0.
-# V9.9.0: FAST identico alla V9.8.9 (volume A progressivo o B sostenuto >=2.50x).
-# TREND: tre candele direzionali quasi Marubozu, corpo >=0.35 ATR15 ciascuna;
-# corpo >=80% del range e wick SUPERIORE/INFERIORE <=15% del range ciascuna.
-# Terza LIVE >=80% della media dei primi due corpi e volume progressivo A.
-# Nessun requisito di volume sulle prime due candele TREND.
-# Segnali informativi: strategia non validata, testare in simulazione.
+# V9.9.4: lettura delle 25 candele 15m da Binance Futures WebSocket.
+# Analisi FAST/TREND a cadenza di 1 secondo, senza download REST per ciclo.
+# REST usato solo per caricamento storico, 1h/4h in background e recupero gap.
+# Strategia V9.9.3 INVARIATA: tutte le soglie di ingresso, SL/TP e volume.
+# NON e' trading automatico: segnali informativi da testare in simulazione.
 BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 SYMBOLS = [
@@ -28,8 +25,12 @@ SYMBOLS = [
     'TIAUSDT','SEIUSDT'
 ]
 KLINES_URL = 'https://fapi.binance.com/fapi/v1/klines'
-SCAN_SECONDS = 1  # target; ogni scansione REST delle 25 coppie dura diversi secondi
-SCAN_WORKERS = 6
+SCAN_SECONDS = 1  # intervallo tra i cicli di analisi dei dati gia' in RAM
+SCAN_WORKERS = 6 # solo download iniziali e aggiornamenti storici in background
+WS_URL = 'wss://fstream.binance.com/market/stream?streams='
+WS_STALE_SECONDS = 5.0 # niente segnali se la candela 15m non e' stata aggiornata
+WS_RECONNECT_MAX_SECONDS = 30
+SCAN_LOG_EVERY_SECONDS = 10 # evita di scrivere 25 righe di scarti ogni secondo
 CACHE_30M_SECONDS = 30
 CACHE_1H_SECONDS = 60
 CACHE_4H_SECONDS = 300
@@ -116,7 +117,14 @@ LEVERAGE_STEPS = (1,2,3,5,10,15,20,25,30,40,50,75,100)
 request_lock = threading.Lock()
 cache_lock = threading.Lock()
 last_rest_request = 0.
-market_cache = {}
+market_cache = {}  # (simbolo, timeframe) -> {'time': epoch, 'data': lista immutable per copia}
+ws_last_seen = {}  # (simbolo, timeframe) -> time.monotonic ultimo evento
+ws_gap_keys = set()  # richiedono ripristino dello storico prima di nuovi segnali
+websocket_status = {'connected': False, 'since': 0.}
+last_scan_log = 0.
+signals_queue = queue.Queue(maxsize=200)
+signals_lock = threading.Lock()
+signals_in_flight = set()
 pending = {}
 last_observed = {}
 signal_state = {}
@@ -188,6 +196,225 @@ def market_data(symbol):
     return {'15m':parse_candles(get_json(KLINES_URL,{'symbol':symbol,'interval':'15m','limit':120})),
             '1h':cached_candles(symbol,'1h',CACHE_1H_SECONDS),
             '4h':cached_candles(symbol,'4h',CACHE_4H_SECONDS)}
+
+# ----------------------------------------------------------
+# V9.9.4 - WebSocket 15m (25 coppie) + BTC 30m informativo
+# ----------------------------------------------------------
+
+def ws_stream_names():
+    return [f'{symbol.lower()}@kline_15m' for symbol in SYMBOLS] + ['btcusdt@kline_30m']
+
+def ws_update(payload):
+    """Aggiorna le candele in memoria; non aggiunge REST alla scansione 1s.
+
+    Scarta eventi piu' vecchi, rileva eventuali candele saltate,
+    e conserva le ultime 120 come nella versione REST originaria.
+    """
+    evt = payload.get('data', payload)
+    if evt.get('e') != 'kline':
+        return
+    k = evt.get('k') or {}
+    symbol = str(evt.get('s', k.get('s', ''))).upper()
+    interval = k.get('i')
+    if symbol not in SYMBOLS or (interval != '15m' and not (symbol == 'BTCUSDT' and interval == '30m')):
+        return
+    try:
+        candle = {'o': float(k['o']), 'h': float(k['h']),
+                  'l': float(k['l']), 'c': float(k['c']),
+                  'v': float(k['v']), 't': int(k['t'])}
+    except (KeyError, TypeError, ValueError):
+        return
+    if not (candle['l'] <= min(candle['o'], candle['c']) <= max(candle['o'], candle['c']) <= candle['h']):
+        return
+    key = (symbol, interval)
+    interval_ms = 900_000 if interval == '15m' else 1_800_000
+    now = time.monotonic()
+    with cache_lock:
+        entry = market_cache.get(key)
+        if not entry or not entry['data']:
+            ws_gap_keys.add(key)
+            return
+        old = entry['data']
+        last = old[-1]
+        if candle['t'] < last['t']:
+            return
+        if candle['t'] == last['t']:
+            # La quantita' della candela in corso cresce; ignora eventi arretrati.
+            if candle['v'] + 1e-10 < last['v']:
+                return
+            updated = old[:-1] + [candle]
+        elif candle['t'] == last['t'] + interval_ms:
+            updated = (old + [candle])[-120:]
+        else:
+            # Dopo un'interruzione lunga, evita indicatori con barre mancanti.
+            ws_gap_keys.add(key)
+            return
+        market_cache[key] = {'time': time.time(), 'data': updated}
+        ws_last_seen[key] = now
+        ws_gap_keys.discard(key)
+
+
+def ws_connection_worker():
+    streams = '/'.join(ws_stream_names())
+    reconnect_delay = 1
+    while True:
+        try:
+            def on_open(ws):
+                nonlocal reconnect_delay
+                reconnect_delay = 1
+                with cache_lock:
+                    websocket_status['connected'] = True
+                    websocket_status['since'] = time.monotonic()
+                print('WEBSOCKET CONNESSO: 25x15m + BTC30m (26 stream)', flush=True)
+
+            def on_message(ws, message):
+                try:
+                    ws_update(json.loads(message))
+                except (ValueError, TypeError) as exc:
+                    print('WS messaggio non valido:', exc, flush=True)
+
+            def on_error(ws, error):
+                print('ERRORE WebSocket:', error, flush=True)
+
+            def on_close(ws, code, reason):
+                with cache_lock:
+                    websocket_status['connected'] = False
+                print('WEBSOCKET DISCONNESSO:', code, reason, flush=True)
+
+            client = websocket.WebSocketApp(WS_URL + streams,
+                                            on_open=on_open, on_message=on_message,
+                                            on_error=on_error, on_close=on_close)
+            client.run_forever(ping_interval=120, ping_timeout=20)
+        except Exception as exc:
+            print('ERRORE CONNESSIONE WebSocket:', exc, flush=True)
+        finally:
+            with cache_lock:
+                websocket_status['connected'] = False
+        time.sleep(reconnect_delay)
+        reconnect_delay = min(WS_RECONNECT_MAX_SECONDS, reconnect_delay*2)
+
+
+def hydrate_cache(key, only_if_needed=False):
+    symbol, interval = key
+    rows = parse_candles(get_json(KLINES_URL, {'symbol': symbol, 'interval': interval, 'limit': 120}))
+    if len(rows) < 55:
+        raise ValueError(f'{symbol}/{interval}: storico troppo breve')
+    with cache_lock:
+        current = market_cache.get(key)
+        if only_if_needed and current:
+            # Non tornare indietro se nuovi dati WS sono arrivati durante il REST.
+            latest = current['data'][-1]
+            candidate = rows[-1]
+            if latest['t'] > candidate['t'] or (latest['t'] == candidate['t'] and latest['v'] > candidate['v']):
+                if key not in ws_gap_keys:
+                    return
+                # Se c'e' un gap, servono comunque i dati REST per ricostruirlo.
+        market_cache[key] = {'time': time.time(), 'data': rows}
+        ws_gap_keys.discard(key)
+        # NON simuliamo freschezza WebSocket: ogni 15m richiede un vero evento.
+    return True
+
+
+def bootstrap_history():
+    keys = [(symbol, interval) for symbol in SYMBOLS for interval in ('15m', '1h', '4h')]
+    keys.append(('BTCUSDT', '30m'))
+    failures = []
+    print('Caricamento storico Binance Futures:', len(keys), 'serie...', flush=True)
+    with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as pool:
+        futures = {pool.submit(hydrate_cache, key): key for key in keys}
+        for future in as_completed(futures):
+            try:
+                future.result()
+            except Exception as exc:
+                failures.append(futures[future])
+                print('ERRORE inizializzazione', futures[future], exc, flush=True)
+    if failures:
+        raise RuntimeError(f'Storico non disponibile per {len(failures)} timeframe; ritento all avvio')
+    print('STORICO PRONTO: 25 coppie e BTC30', flush=True)
+
+
+def rest_maintenance_worker():
+    """Aggiorna SOLO i contesti 1h/4h e ricuce eventuali buchi WS.
+    REST non blocca il ciclo di analisi e non aggiorna i 15m a ogni secondo.
+    """
+    last_1h = time.monotonic()
+    last_4h = time.monotonic()
+    last_gap_retry = 0.
+    while True:
+        now = time.monotonic()
+        keys = []
+        if now-last_1h >= CACHE_1H_SECONDS:
+            keys.extend((symbol, '1h') for symbol in SYMBOLS)
+            last_1h = now
+        if now-last_4h >= CACHE_4H_SECONDS:
+            keys.extend((symbol, '4h') for symbol in SYMBOLS)
+            last_4h = now
+        if now-last_gap_retry >= 15:
+            with cache_lock:
+                keys.extend(ws_gap_keys)
+            last_gap_retry = now
+        for key in dict.fromkeys(keys):
+            try:
+                hydrate_cache(key, only_if_needed=True)
+            except Exception as exc:
+                print('REST refresh FALLITO', key, exc, flush=True)
+        time.sleep(1)
+
+
+def market_snapshot():
+    """Ritorna una fotografia coerente della cache; scarta WS vecchi o gap."""
+    now = time.monotonic()
+    market = {}
+    with cache_lock:
+        online = websocket_status['connected']
+        btc30_item = market_cache.get(('BTCUSDT', '30m'))
+        btc30_fresh = now-ws_last_seen.get(('BTCUSDT', '30m'), -1e9) <= WS_STALE_SECONDS
+        btc30 = (btc30_item['data'] if btc30_item and btc30_fresh and ('BTCUSDT', '30m') not in ws_gap_keys else None)
+        for symbol in SYMBOLS:
+            keys = ((symbol, '15m'), (symbol, '1h'), (symbol, '4h'))
+            items = [market_cache.get(key) for key in keys]
+            if not online or any(x is None for x in items):
+                continue
+            if (keys[0] in ws_gap_keys or
+                    now-ws_last_seen.get(keys[0], -1e9) > WS_STALE_SECONDS):
+                continue
+            # Contesti lentissimi durante down REST non devono generare segnali.
+            if (time.time()-items[1]['time'] > 180 or
+                    time.time()-items[2]['time'] > 900):
+                continue
+            market[symbol] = {'15m': items[0]['data'], '1h': items[1]['data'], '4h': items[2]['data']}
+    return market, btc30
+
+
+def telegram_sender_worker():
+    while True:
+        key, message = signals_queue.get()
+        try:
+            if send_telegram(message):
+                with signals_lock:
+                    signal_state[key] = time.time()
+            else:
+                print('Invio Telegram fallito:', key, flush=True)
+        finally:
+            with signals_lock:
+                signals_in_flight.discard(key)
+            signals_queue.task_done()
+
+
+def queue_signal(symbol, signal):
+    key = (symbol, signal['direction'], signal['candle_time'])
+    with signals_lock:
+        if key in signals_in_flight or key in signal_state:
+            return False
+        signals_in_flight.add(key)
+    try:
+        signals_queue.put_nowait((key, build_message(symbol, signal)))
+        return True
+    except queue.Full:
+        with signals_lock:
+            signals_in_flight.discard(key)
+        print('CODA TELEGRAM PIENA: segnale non accodato', key, flush=True)
+        return False
 
 def ema(values, period):
     if len(values)<period:
@@ -867,7 +1094,7 @@ def build_message(symbol,s):
     italian_time=datetime.now(ZoneInfo('Europe/Rome')).strftime('%d/%m/%Y %H:%M:%S')
     room=f"{s['room_r']:.2f}R" if s['room_r'] is not None else 'nessun ostacolo rilevato'
     return (
-        f"🚀 FAST/TREND V9.9.3 (SPERIMENTALE)\n{pair} — {s['direction']}\n"
+        f"🚀 FAST/TREND V9.9.4 (SPERIMENTALE)\n{pair} — {s['direction']}\n"
         f"Orario Italia: {italian_time}\n"
         f"Setup: {s['mode']} | Qualita': {s['quality']}/13\n\n"
         f"ENTRY: {fmt_price(s['entry_low'])} - {fmt_price(s['entry_high'])}\n"
@@ -904,100 +1131,107 @@ def should_send(symbol,signal):
     return key not in signal_state
 
 def scan_market():
-    global last_diag
-    started=time.monotonic()
-    counters=Counter()
-    btc_data=market_data('BTCUSDT')
-    # Una misura del volume BTC all'inizio di OGNI ciclo, indipendentemente
-    # dalla presenza di setup sulle altcoin.
-    btc_volume=progressive_volume_metrics('BTCUSDT',btc_data['15m'],time.monotonic())
-    bias=btc_bias(btc_data)
-    btc15=btc15_direction(btc_data)
-    btc30=btc_30m_direction(cached_candles('BTCUSDT','30m',CACHE_30M_SECONDS))
-    btc1h=trend_1h(btc_data['1h'])
-    btc_vol_status=('OK' if (btc_volume['ready'] and btc_volume['intensity_ok']
-                              and btc_volume['accel_ok']) else 'NON CONFERMATO')
-    print(f"BTC: {bias} | BTC15: {btc15['directional']} "
-          f"({btc15['body_atr']:.2f} ATR) | BTC15VOL: {btc_vol_status} "
-          f"| BTC30: {btc30} | BTC1H: {btc1h}")
-    market={'BTCUSDT':btc_data}
-    with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as pool:
-        futures={pool.submit(market_data,s):s for s in SYMBOLS if s!='BTCUSDT'}
-        for future in as_completed(futures):
-            symbol=futures[future]
-            try:
-                market[symbol]=future.result()
-            except Exception as exc:
-                print(symbol,'ERRORE download:',exc)
-                counters['download fallito']+=1
-    now=time.monotonic()
-    successful=0
+    """Scansiona le 25 coppie IN MEMORIA ogni secondo; nessuna chiamata REST."""
+    global last_diag, last_scan_log
+    started = time.monotonic()
+    counters = Counter()
+    market, btc30_candles = market_snapshot()
+    now = time.monotonic()
+    btc_data = market.get('BTCUSDT')
+    if btc_data is None:
+        if now-last_scan_log >= SCAN_LOG_EVERY_SECONDS:
+            print('WS: BTC15 non disponibile/fresco; segnali sospesi fino al recupero', flush=True)
+            last_scan_log = now
+        return
+
+    btc_volume = progressive_volume_metrics('BTCUSDT', btc_data['15m'], now)
+    bias = btc_bias(btc_data)
+    btc15 = btc15_direction(btc_data)
+    btc30 = btc_30m_direction(btc30_candles) if btc30_candles else 'NEUTRAL'
+    btc1h = trend_1h(btc_data['1h'])
+    btc_vol_status = 'OK' if (btc_volume['ready'] and btc_volume['intensity_ok']
+                              and btc_volume['accel_ok']) else 'NON CONFERMATO'
+
+    successful = 0
     for symbol in SYMBOLS:
         if symbol not in market:
-            if symbol in pending:
-                invalidate(symbol,'download mancante',counters)
+            counters['WS dato assente/stale'] += 1
             continue
         try:
-            successful+=1
-            data=market[symbol]
-            signal=analyze_symbol(symbol,data,bias,btc15,btc30,btc1h,now,counters,
-                                  btc_volume=btc_volume,
-                                  volume_override=btc_volume if symbol=='BTCUSDT' else None)
-            if signal and should_send(symbol,signal):
-                print(symbol,'FAST/TREND V9.9.3',signal['direction'],signal['mode'])
-                if send_telegram(build_message(symbol,signal)):
-                    signal_state[(symbol,signal['direction'],signal['candle_time'])]=time.time()
-            trend=trend_1h(data['1h'])
-            last_observed[symbol]={'price':data['15m'][-1]['c'],'direction':trend}
+            successful += 1
+            data = market[symbol]
+            signal = analyze_symbol(symbol, data, bias, btc15, btc30, btc1h, now, counters,
+                                    btc_volume=btc_volume,
+                                    volume_override=btc_volume if symbol == 'BTCUSDT' else None)
+            if signal and queue_signal(symbol, signal):
+                print(symbol, 'FAST/TREND V9.9.4', signal['direction'], signal['mode'], flush=True)
+            trend = trend_1h(data['1h'])
+            last_observed[symbol] = {'price': data['15m'][-1]['c'], 'direction': trend}
         except Exception as exc:
-            print(symbol,'ERRORE analisi:',exc)
+            print(symbol, 'ERRORE analisi:', exc, flush=True)
             if symbol in pending:
-                invalidate(symbol,'errore analisi',counters)
-    elapsed=time.monotonic()-started
-    print(f'Scansione completata: {successful}/{len(SYMBOLS)} coppie | '
-          f'durata {elapsed:.1f}s | target {SCAN_SECONDS}s | FAST/TREND attivi')
+                invalidate(symbol, 'errore analisi', counters)
+
+    elapsed = time.monotonic()-started
+    if time.monotonic()-last_scan_log >= SCAN_LOG_EVERY_SECONDS:
+        print(f"BTC: {bias} | BTC15: {btc15['directional']} "
+              f"({btc15['body_atr']:.2f} ATR) | BTC15VOL: {btc_vol_status} "
+              f"| BTC30: {btc30} | BTC1H: {btc1h}", flush=True)
+        print(f'Scansione WS: {successful}/25 coppie | elaborazione {elapsed:.3f}s '
+              f'| intervallo {SCAN_SECONDS}s | FAST/TREND attivi', flush=True)
+        last_scan_log = time.monotonic()
     diagnostic_totals.update(counters)
     diagnostic_since_last.update(counters)
-    if time.monotonic()-last_diag>=DIAGNOSTIC_EVERY_SECONDS:
-        # Scarti originali: un motivo operativo per coppia/scansione.
-        # I dettagli DET sono conteggi INFORMATIVI e non vanno sommati agli scarti.
-        primary_scan={k:v for k,v in counters.items() if not k.startswith('DET ')}
-        primary_total={k:v for k,v in diagnostic_totals.items() if not k.startswith('DET ')}
-        detail_window={k:v for k,v in diagnostic_since_last.items() if k.startswith('DET ')}
-        print('DIAGNOSTICA V9.9.3 (questa scansione):',primary_scan)
-        print('DIAGNOSTICA V9.9.3 (cumulativa dall avvio):',primary_total)
-        print('DETTAGLIO CANDELE V9.9.3 (circa ultimi 60s):',
-              dict(sorted(detail_window.items(),key=lambda item:(-item[1],item[0]))))
-        print('NOTA: DET FAST/TREND = primo ostacolo per modalita; DET test = non esclusivo.')
+    if time.monotonic()-last_diag >= DIAGNOSTIC_EVERY_SECONDS:
+        primary_scan = {k:v for k,v in counters.items() if not k.startswith('DET ')}
+        primary_total = {k:v for k,v in diagnostic_totals.items() if not k.startswith('DET ')}
+        detail_window = {k:v for k,v in diagnostic_since_last.items() if k.startswith('DET ')}
+        print('DIAGNOSTICA V9.9.4 (questa scansione):', primary_scan, flush=True)
+        print('DIAGNOSTICA V9.9.4 (cumulativa dall avvio):', primary_total, flush=True)
+        print('DETTAGLIO CANDELE V9.9.4 (circa ultimi 60s):',
+              dict(sorted(detail_window.items(), key=lambda item:(-item[1], item[0]))), flush=True)
+        print('NOTA: DET FAST/TREND = primo ostacolo per modalita; DET test = non esclusivo.', flush=True)
         diagnostic_since_last.clear()
-        last_diag=time.monotonic()
+        last_diag = time.monotonic()
+
 
 def main():
-    print('CryptoSignalAI V9.9.3 - TREND 80/15, BTC15 TREND 0.20 ATR + VOLUME PROGRESSIVO, SCANSIONE CONTINUA')
+    print('CryptoSignalAI V9.9.4 - WEBSOCKET 25 coppie ogni secondo | strategia V9.9.3 invariata', flush=True)
     send_telegram(
-        'CryptoSignalAI V9.9.3 ONLINE - TREND 80/15 (SPERIMENTALE)\n'
-        'FAST invariato; TREND pienezza 80% e wick per lato 15%; diagnostica Railway attiva.\n'
-        '25 coppie. FAST INVARIATO: prima live corpo >=0.70 ATR15 e >=80% candela.\n'
-        'TREND: 3 corpi >=0.35 ATR15, pieni >=80%, chiusure progressive; terza LIVE >=80% media corpi prime due.\n'
-        'TREND wick: sia superiore sia inferiore <=15% del range per tutte e tre; corpi >=80% del range.\n'
-        'FAST volume: progressivo A OPPURE sostenuto B >=2.50x, calo ritmo <=15% su 2 intervalli live.\n'
-        'TREND: volume progressivo A SOLO sulla terza LIVE; nessun filtro volume sulle prime due.\n'
-        'Volume candela precedente >=0.80x SOLO per FAST.\n'
-        'Nessuna attesa fissa 60/120s; campionamento volume minimo 15s.\n'
-        'EMA20/50 15m e trend 1H, stocastico e BTC15 direzionale concordi.\n'
-        'BTC15 FAST >=0.30 ATR; TREND >=0.20 ATR + volume progressivo obbligatorio; bias BTC concorde.\n'
-        'BTC15 progressivo: 3 campioni live, intensita storica adeguata, velocita in aumento >=12%.\n'
-        'Scansioni REST: target 1s, senza sovrapposizioni; durata effettiva dipende da 25 download.\n'
-        'SL strutturale 15m/1H massimo 4.50 ATR15; spazio >=1.20R. TP1 0.30R, TP2 0.45R, TP3 0.60R.\n'
-        'Leva indicativa <=15x. Strategia non validata: testare in simulazione.')
+        'CryptoSignalAI V9.9.4 - SCANSIONE WEBSOCKET 1s (SPERIMENTALE)\n'
+        'Strategia FAST/TREND IDENTICA a V9.9.3.\n'
+        '25 coppie Binance Futures, candele 15m aggiornate in streaming.\n'
+        'TREND: 3 corpi >=0.35 ATR15, pieni >=80%, wick <=15% per lato; volume progressivo sulla terza LIVE.\n'
+        'BTC15 TREND >=0.20 ATR + volume progressivo obbligatorio (+12%).\n'
+        'FAST invariato, BTC15 FAST >=0.30 ATR.\n'
+        'Analisi ogni 1s in RAM; nessuna chiamata REST a ogni ciclo.\n'
+        'Storico e 1H/4H via REST in background; stop segnali se WS diventa obsoleto.\n'
+        'SL/TP, leva, filtri e diagnostica INVARIATI. Non validato: testare in simulazione.')
+    # Inizializza lo storico una sola volta; non inizia ad analizzare dati incompleti.
     while True:
-        started=time.monotonic()
+        try:
+            bootstrap_history()
+            break
+        except Exception as exc:
+            print('ERRORE bootstrap:', exc, '| nuovo tentativo fra 20s', flush=True)
+            time.sleep(20)
+    threading.Thread(target=telegram_sender_worker, name='telegram-out', daemon=True).start()
+    threading.Thread(target=rest_maintenance_worker, name='rest-maint', daemon=True).start()
+    threading.Thread(target=ws_connection_worker, name='binance-ws', daemon=True).start()
+    target = time.monotonic()
+    while True:
+        target += SCAN_SECONDS
         try:
             scan_market()
         except Exception as exc:
-            print('Errore scansione generale:',exc)
+            print('Errore scansione generale:', exc, flush=True)
             pending.clear()
-        time.sleep(max(0.2,SCAN_SECONDS-(time.monotonic()-started)))
+        remaining = target-time.monotonic()
+        if remaining > 0:
+            time.sleep(remaining)
+        else:
+            # Se Python e' in ritardo, non accodiamo scansioni vecchie.
+            target = time.monotonic()
 
-if __name__=='__main__':
+if __name__ == '__main__':
     main()
