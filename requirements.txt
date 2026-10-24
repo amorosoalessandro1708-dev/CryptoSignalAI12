@@ -1,2 +1,2 @@
-requests
-websocket-client
+requests>=2.31,<3
+websocket-client>=1.8,<2
