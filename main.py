@@ -7,6 +7,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 import requests
 
+# V9.9.1: diagnostica ampliata SOLO INFORMATIVA; strategia identica alla V9.9.0.
 # V9.9.0: FAST identico alla V9.8.9 (volume A progressivo o B sostenuto >=2.50x).
 # TREND: tre candele direzionali quasi Marubozu, corpo >=0.35 ATR15 ciascuna;
 # corpo >=90% del range e wick SUPERIORE/INFERIORE <=5% del range ciascuna.
@@ -116,6 +117,7 @@ last_observed = {}
 signal_state = {}
 last_diag = 0.
 diagnostic_totals = Counter()
+diagnostic_since_last = Counter()  # finestra circa 60s, solo visibilita' dei motivi
 # Campionamento in RAM per singola coppia; un riavvio richiede alcune scansioni
 # prima di avere due intervalli confrontabili sulla candela live.
 live_volume_samples = {}
@@ -566,6 +568,96 @@ def candle_color(c):
     return 'NEUTRAL'
 
 
+
+def diagnose_candle_setups(direction, live, prev1, prev2, metrics, prev1_metrics, prev2_metrics, counters):
+    """Diagnostica OSSERVATIVA: non abilita, modifica o blocca nessun segnale.
+
+    Dopo trend 1H valido, candela LIVE concorde e almeno 15 s di formazione,
+    analizza indipendentemente FAST e TREND. Per ciascuna modalita' registra
+    il PRIMO motivo di esclusione della struttura (un motivo per modalita').
+    Non interpreta questi controlli come trade persi: sono valutazioni ripetute.
+    I contatori 'test' sono aggiuntivi, non esclusivi, e servono a confrontare
+    separatamente pienezza e wick (una candela puo' fallire entrambi).
+    """
+    sign = 1 if direction == 'LONG' else -1
+
+    # FAST: la candela precedente non deve avere lo stesso colore; i valori
+    # vengono confrontati con le medesime soglie usate dalla strategia LIVE.
+    if candle_color(prev1) == direction:
+        fast_reason = 'precedente gia nella direzione'
+    elif metrics['body'] < FAST_BODY_ATR_MIN:
+        fast_reason = 'corpo LIVE sotto minimo'
+    elif metrics['body_fraction'] < FAST_BODY_FRACTION_MIN:
+        fast_reason = 'corpo LIVE poco pieno'
+    elif metrics['wick'] > FAST_WICK_MAX:
+        fast_reason = 'wick FAST eccessiva'
+    else:
+        fast_reason = 'struttura FAST VALIDA'
+    counters['DET FAST: ' + fast_reason] += 1
+
+    # TREND: le verifiche rispecchiano l'ordine delle condizioni gia' usate
+    # dalla V9.9.1. Nessuna variabile diagnostica entra nella decisione.
+    if prev2_metrics is None or prev1_metrics is None:
+        trend_reason = 'prime due: colori non concordi'
+    elif (prev2_metrics['body'] < TREND_PREV_BODY_ATR_MIN or
+          prev1_metrics['body'] < TREND_PREV_BODY_ATR_MIN):
+        trend_reason = 'prime due: corpo ATR insufficiente'
+    elif (prev2_metrics['body_fraction'] < TREND_PREV_BODY_FRACTION_MIN or
+          prev1_metrics['body_fraction'] < TREND_PREV_BODY_FRACTION_MIN):
+        trend_reason = 'prime due: pienezza insufficiente'
+    elif (prev2_metrics['upper_wick_range'] > TREND_UPPER_WICK_MAX_RANGE or
+          prev2_metrics['lower_wick_range'] > TREND_LOWER_WICK_MAX_RANGE or
+          prev1_metrics['upper_wick_range'] > TREND_UPPER_WICK_MAX_RANGE or
+          prev1_metrics['lower_wick_range'] > TREND_LOWER_WICK_MAX_RANGE):
+        trend_reason = 'prime due: wick eccessive'
+    elif (sign * (prev1['c']-prev2['c']) <= 0 or
+          sign * (live['c']-prev1['c']) <= 0):
+        trend_reason = 'chiusure non progressive'
+    elif metrics['body'] < TREND_BODY_ATR_MIN:
+        trend_reason = 'terza LIVE: corpo ATR insufficiente'
+    elif metrics['body'] < (TREND_THIRD_MIN_VS_PREV_AVG *
+                            (prev2_metrics['body']+prev1_metrics['body'])/2.):
+        trend_reason = 'terza LIVE: sotto 80pct media corpi'
+    elif metrics['body_fraction'] < TREND_BODY_FRACTION_MIN:
+        trend_reason = 'terza LIVE: pienezza insufficiente'
+    elif (metrics['upper_wick_range'] > TREND_UPPER_WICK_MAX_RANGE or
+          metrics['lower_wick_range'] > TREND_LOWER_WICK_MAX_RANGE):
+        trend_reason = 'terza LIVE: wick eccessive'
+    else:
+        trend_reason = 'struttura TREND VALIDA'
+    counters['DET TREND: ' + trend_reason] += 1
+
+    # Indicatori NON ESCLUSIVI della forma: utili anche quando un altro
+    # requisito e' gia' fallito. Vengono calcolati solo se la coppia delle
+    # prime due candele ha il colore corretto rispetto al trend 1H.
+    if prev2_metrics is not None and prev1_metrics is not None:
+        counters['DET TREND test: due chiuse stesso colore'] += 1
+        if (prev2_metrics['body'] < TREND_PREV_BODY_ATR_MIN or
+                prev1_metrics['body'] < TREND_PREV_BODY_ATR_MIN):
+            counters['DET TREND test: corpo prime due debole'] += 1
+        if (prev2_metrics['body_fraction'] < TREND_PREV_BODY_FRACTION_MIN or
+                prev1_metrics['body_fraction'] < TREND_PREV_BODY_FRACTION_MIN):
+            counters['DET TREND test: pienezza prime due scarsa'] += 1
+        if (prev2_metrics['upper_wick_range'] > TREND_UPPER_WICK_MAX_RANGE or
+                prev2_metrics['lower_wick_range'] > TREND_LOWER_WICK_MAX_RANGE or
+                prev1_metrics['upper_wick_range'] > TREND_UPPER_WICK_MAX_RANGE or
+                prev1_metrics['lower_wick_range'] > TREND_LOWER_WICK_MAX_RANGE):
+            counters['DET TREND test: wick prime due lunghe'] += 1
+        if (sign * (prev1['c']-prev2['c']) <= 0 or
+                sign * (live['c']-prev1['c']) <= 0):
+            counters['DET TREND test: progressione non valida'] += 1
+        if (metrics['body'] < TREND_THIRD_MIN_VS_PREV_AVG *
+                (prev2_metrics['body']+prev1_metrics['body'])/2.):
+            counters['DET TREND test: terza piccola vs prime due'] += 1
+    if metrics['body'] < TREND_BODY_ATR_MIN:
+        counters['DET TREND test: terza corpo sotto minimo'] += 1
+    if metrics['body_fraction'] < TREND_BODY_FRACTION_MIN:
+        counters['DET TREND test: terza pienezza scarsa'] += 1
+    if (metrics['upper_wick_range'] > TREND_UPPER_WICK_MAX_RANGE or
+            metrics['lower_wick_range'] > TREND_LOWER_WICK_MAX_RANGE):
+        counters['DET TREND test: terza wick lunga'] += 1
+
+
 def analyze_symbol(symbol,data,bias,btc15,btc30,btc1h,now,counters):
     """Due vie: FAST prima candela forte; TREND terza dello stesso colore.
 
@@ -622,6 +714,9 @@ def analyze_symbol(symbol,data,bias,btc15,btc30,btc1h,now,counters):
            metrics['body']>=TREND_THIRD_MIN_VS_PREV_AVG *
                    (prev2_metrics['body']+prev1_metrics['body'])/2. and
            trend_shape_ok(metrics))
+    # SOLO DIAGNOSTICA: nessuna modifica a FAST/TREND, volume o conferme.
+    diagnose_candle_setups(direction, live, prev1, prev2, metrics,
+                           prev1_metrics, prev2_metrics, counters)
     # Il minimo dinamico e i campioni sufficienti rimangono obbligatori.
     # FAST: via A (accelerazione) OPPURE via B (volume >=2.50x sostenuto).
     # TREND: resta SOLO la via A progressiva, sulla terza candela LIVE.
@@ -748,7 +843,7 @@ def build_message(symbol,s):
     italian_time=datetime.now(ZoneInfo('Europe/Rome')).strftime('%d/%m/%Y %H:%M:%S')
     room=f"{s['room_r']:.2f}R" if s['room_r'] is not None else 'nessun ostacolo rilevato'
     return (
-        f"🚀 FAST/TREND V9.9.0 (SPERIMENTALE)\n{pair} — {s['direction']}\n"
+        f"🚀 FAST/TREND V9.9.1 (SPERIMENTALE)\n{pair} — {s['direction']}\n"
         f"Orario Italia: {italian_time}\n"
         f"Setup: {s['mode']} | Qualita': {s['quality']}/13\n\n"
         f"ENTRY: {fmt_price(s['entry_low'])} - {fmt_price(s['entry_high'])}\n"
@@ -814,7 +909,7 @@ def scan_market():
             data=market[symbol]
             signal=analyze_symbol(symbol,data,bias,btc15,btc30,btc1h,now,counters)
             if signal and should_send(symbol,signal):
-                print(symbol,'FAST/TREND V9.9.0',signal['direction'],signal['mode'])
+                print(symbol,'FAST/TREND V9.9.1',signal['direction'],signal['mode'])
                 if send_telegram(build_message(symbol,signal)):
                     signal_state[(symbol,signal['direction'],signal['candle_time'])]=time.time()
             trend=trend_1h(data['1h'])
@@ -827,15 +922,26 @@ def scan_market():
     print(f'Scansione completata: {successful}/{len(SYMBOLS)} coppie | '
           f'durata {elapsed:.1f}s | target {SCAN_SECONDS}s | FAST/TREND attivi')
     diagnostic_totals.update(counters)
+    diagnostic_since_last.update(counters)
     if time.monotonic()-last_diag>=DIAGNOSTIC_EVERY_SECONDS:
-        print('DIAGNOSTICA V9.9.0 (questa scansione):',dict(counters))
-        print('DIAGNOSTICA V9.9.0 (cumulativa dall avvio):',dict(diagnostic_totals))
+        # Scarti originali: un motivo operativo per coppia/scansione.
+        # I dettagli DET sono conteggi INFORMATIVI e non vanno sommati agli scarti.
+        primary_scan={k:v for k,v in counters.items() if not k.startswith('DET ')}
+        primary_total={k:v for k,v in diagnostic_totals.items() if not k.startswith('DET ')}
+        detail_window={k:v for k,v in diagnostic_since_last.items() if k.startswith('DET ')}
+        print('DIAGNOSTICA V9.9.1 (questa scansione):',primary_scan)
+        print('DIAGNOSTICA V9.9.1 (cumulativa dall avvio):',primary_total)
+        print('DETTAGLIO CANDELE V9.9.1 (circa ultimi 60s):',
+              dict(sorted(detail_window.items(),key=lambda item:(-item[1],item[0]))))
+        print('NOTA: DET FAST/TREND = primo ostacolo per modalita; DET test = non esclusivo.')
+        diagnostic_since_last.clear()
         last_diag=time.monotonic()
 
 def main():
-    print('CryptoSignalAI V9.9.0 - FAST A/B INVARIATO, TREND 3 CANDELE QUASI MARUBOZU')
+    print('CryptoSignalAI V9.9.1 - SOLO DIAGNOSTICA, SEGNALI INVARIATI')
     send_telegram(
-        'CryptoSignalAI V9.9.0 ONLINE (SPERIMENTALE)\n'
+        'CryptoSignalAI V9.9.1 ONLINE - SOLO DIAGNOSTICA (SPERIMENTALE)\n'
+        'Filtri FAST/TREND identici alla V9.9.0; aggiunti dettagli scarti nei log Railway.\n'
         '25 coppie. FAST INVARIATO: prima live corpo >=0.70 ATR15 e >=80% candela.\n'
         'TREND: 3 corpi >=0.35 ATR15, pieni >=90%, chiusure progressive; terza LIVE >=80% media corpi prime due.\n'
         'TREND wick: sia superiore sia inferiore <=5% del range per tutte e tre; nessuna wick lunga ammessa.\n'
