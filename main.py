@@ -7,10 +7,11 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 import requests
 
+# V9.9.2: SOLO TREND: corpo >=80% del range e wick per lato <=15%.
 # V9.9.1: diagnostica ampliata SOLO INFORMATIVA; strategia identica alla V9.9.0.
 # V9.9.0: FAST identico alla V9.8.9 (volume A progressivo o B sostenuto >=2.50x).
 # TREND: tre candele direzionali quasi Marubozu, corpo >=0.35 ATR15 ciascuna;
-# corpo >=90% del range e wick SUPERIORE/INFERIORE <=5% del range ciascuna.
+# corpo >=80% del range e wick SUPERIORE/INFERIORE <=15% del range ciascuna.
 # Terza LIVE >=80% della media dei primi due corpi e volume progressivo A.
 # Nessun requisito di volume sulle prime due candele TREND.
 # Segnali informativi: strategia non validata, testare in simulazione.
@@ -90,14 +91,14 @@ FAST_WICK_MAX = .35
 FAST_MAX_EXTENSION_ATR = 1.40
 FAST_BTC15_BODY_ATR_MIN = .30
 # TREND: 3 candele quasi Marubozu, sia per LONG che per SHORT.
-# Corpo >=0.35 ATR15, pienezza >=90%, due wick <=5% del range ciascuna.
-# Nessuna wick lunga ammessa, neppure se nella direzione favorevole.
+# Corpo >=0.35 ATR15, pienezza >=80%, due wick <=15% del range ciascuna.
+# Restano controllate sia la wick superiore che quella inferiore.
 TREND_PREV_BODY_ATR_MIN = .35
-TREND_PREV_BODY_FRACTION_MIN = .90
+TREND_PREV_BODY_FRACTION_MIN = .80
 TREND_BODY_ATR_MIN = .35
-TREND_BODY_FRACTION_MIN = .90
-TREND_UPPER_WICK_MAX_RANGE = .05
-TREND_LOWER_WICK_MAX_RANGE = .05
+TREND_BODY_FRACTION_MIN = .80
+TREND_UPPER_WICK_MAX_RANGE = .15
+TREND_LOWER_WICK_MAX_RANGE = .15
 TREND_THIRD_MIN_VS_PREV_AVG = .80  # terza live >=80% della media dei due corpi
 TREND_MAX_EXTENSION_ATR = 2.20
 TREND_BTC15_BODY_ATR_MIN = .15
@@ -326,7 +327,7 @@ def candle_metrics(c, direction, a15):
             'upper_wick_range':upper_wick,'lower_wick_range':lower_wick}
 
 def trend_shape_ok(m):
-    """Entrambe le wick piccole (max 5% del range), LONG e SHORT uguali."""
+    """Entrambe le wick <=15% del range, LONG e SHORT uguali."""
     return (m is not None and
             m['body_fraction']>=TREND_BODY_FRACTION_MIN and
             m['upper_wick_range']<=TREND_UPPER_WICK_MAX_RANGE and
@@ -596,7 +597,7 @@ def diagnose_candle_setups(direction, live, prev1, prev2, metrics, prev1_metrics
     counters['DET FAST: ' + fast_reason] += 1
 
     # TREND: le verifiche rispecchiano l'ordine delle condizioni gia' usate
-    # dalla V9.9.1. Nessuna variabile diagnostica entra nella decisione.
+    # dalla strategia corrente. Nessuna variabile diagnostica entra nella decisione.
     if prev2_metrics is None or prev1_metrics is None:
         trend_reason = 'prime due: colori non concordi'
     elif (prev2_metrics['body'] < TREND_PREV_BODY_ATR_MIN or
@@ -697,7 +698,7 @@ def analyze_symbol(symbol,data,bias,btc15,btc30,btc1h,now,counters):
           metrics['body']>=FAST_BODY_ATR_MIN and
           metrics['body_fraction']>=FAST_BODY_FRACTION_MIN and
           metrics['wick']<=FAST_WICK_MAX)
-    # TREND: 3 corpi forti e wick <=5% su entrambi i lati (quasi Marubozu).
+    # TREND: 3 corpi forti e wick <=15% su entrambi i lati.
     # Le prime 2 sono chiuse; la terza e' LIVE: non attende la chiusura.
     # Nessun controllo volume sulle prime due; conta solo l'accelerazione LIVE.
     prev2_metrics=candle_metrics(prev2,direction,a15)
@@ -714,7 +715,7 @@ def analyze_symbol(symbol,data,bias,btc15,btc30,btc1h,now,counters):
            metrics['body']>=TREND_THIRD_MIN_VS_PREV_AVG *
                    (prev2_metrics['body']+prev1_metrics['body'])/2. and
            trend_shape_ok(metrics))
-    # SOLO DIAGNOSTICA: nessuna modifica a FAST/TREND, volume o conferme.
+    # La diagnostica e' osservativa; FAST, volume e conferme restano invariati.
     diagnose_candle_setups(direction, live, prev1, prev2, metrics,
                            prev1_metrics, prev2_metrics, counters)
     # Il minimo dinamico e i campioni sufficienti rimangono obbligatori.
@@ -843,7 +844,7 @@ def build_message(symbol,s):
     italian_time=datetime.now(ZoneInfo('Europe/Rome')).strftime('%d/%m/%Y %H:%M:%S')
     room=f"{s['room_r']:.2f}R" if s['room_r'] is not None else 'nessun ostacolo rilevato'
     return (
-        f"🚀 FAST/TREND V9.9.1 (SPERIMENTALE)\n{pair} — {s['direction']}\n"
+        f"🚀 FAST/TREND V9.9.2 (SPERIMENTALE)\n{pair} — {s['direction']}\n"
         f"Orario Italia: {italian_time}\n"
         f"Setup: {s['mode']} | Qualita': {s['quality']}/13\n\n"
         f"ENTRY: {fmt_price(s['entry_low'])} - {fmt_price(s['entry_high'])}\n"
@@ -909,7 +910,7 @@ def scan_market():
             data=market[symbol]
             signal=analyze_symbol(symbol,data,bias,btc15,btc30,btc1h,now,counters)
             if signal and should_send(symbol,signal):
-                print(symbol,'FAST/TREND V9.9.1',signal['direction'],signal['mode'])
+                print(symbol,'FAST/TREND V9.9.2',signal['direction'],signal['mode'])
                 if send_telegram(build_message(symbol,signal)):
                     signal_state[(symbol,signal['direction'],signal['candle_time'])]=time.time()
             trend=trend_1h(data['1h'])
@@ -929,22 +930,22 @@ def scan_market():
         primary_scan={k:v for k,v in counters.items() if not k.startswith('DET ')}
         primary_total={k:v for k,v in diagnostic_totals.items() if not k.startswith('DET ')}
         detail_window={k:v for k,v in diagnostic_since_last.items() if k.startswith('DET ')}
-        print('DIAGNOSTICA V9.9.1 (questa scansione):',primary_scan)
-        print('DIAGNOSTICA V9.9.1 (cumulativa dall avvio):',primary_total)
-        print('DETTAGLIO CANDELE V9.9.1 (circa ultimi 60s):',
+        print('DIAGNOSTICA V9.9.2 (questa scansione):',primary_scan)
+        print('DIAGNOSTICA V9.9.2 (cumulativa dall avvio):',primary_total)
+        print('DETTAGLIO CANDELE V9.9.2 (circa ultimi 60s):',
               dict(sorted(detail_window.items(),key=lambda item:(-item[1],item[0]))))
         print('NOTA: DET FAST/TREND = primo ostacolo per modalita; DET test = non esclusivo.')
         diagnostic_since_last.clear()
         last_diag=time.monotonic()
 
 def main():
-    print('CryptoSignalAI V9.9.1 - SOLO DIAGNOSTICA, SEGNALI INVARIATI')
+    print('CryptoSignalAI V9.9.2 - TREND 80/15, FAST INVARIATO, DIAGNOSTICA ATTIVA')
     send_telegram(
-        'CryptoSignalAI V9.9.1 ONLINE - SOLO DIAGNOSTICA (SPERIMENTALE)\n'
-        'Filtri FAST/TREND identici alla V9.9.0; aggiunti dettagli scarti nei log Railway.\n'
+        'CryptoSignalAI V9.9.2 ONLINE - TREND 80/15 (SPERIMENTALE)\n'
+        'FAST invariato; TREND pienezza 80% e wick per lato 15%; diagnostica Railway attiva.\n'
         '25 coppie. FAST INVARIATO: prima live corpo >=0.70 ATR15 e >=80% candela.\n'
-        'TREND: 3 corpi >=0.35 ATR15, pieni >=90%, chiusure progressive; terza LIVE >=80% media corpi prime due.\n'
-        'TREND wick: sia superiore sia inferiore <=5% del range per tutte e tre; nessuna wick lunga ammessa.\n'
+        'TREND: 3 corpi >=0.35 ATR15, pieni >=80%, chiusure progressive; terza LIVE >=80% media corpi prime due.\n'
+        'TREND wick: sia superiore sia inferiore <=15% del range per tutte e tre; corpi >=80% del range.\n'
         'FAST volume: progressivo A OPPURE sostenuto B >=2.50x, calo ritmo <=15% su 2 intervalli live.\n'
         'TREND: volume progressivo A SOLO sulla terza LIVE; nessun filtro volume sulle prime due.\n'
         'Volume candela precedente >=0.80x SOLO per FAST.\n'
