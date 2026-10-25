@@ -1,4 +1,4 @@
-# V10.1.1 SNELLA: Stocastico in rafforzamento obbligatorio solo su TREND
+# V10.1.2 SNELLA: SL strutturale 1H su FAST e TREND; Stoch progressivo solo TREND
 import os
 import time
 import json
@@ -41,12 +41,13 @@ STOCH_TREND_MIN_STRENGTHENING = 0.5  # incremento minimo punti K-D vs seconda ca
 BTC15_DIRECTIONAL_BODY_ATR_MIN = 0.2
 BTC30_DIRECTIONAL_BODY_ATR_MIN = 0.15
 SL_STRUCTURE_LOOKBACK_BARS = 12
-SL_1H_LOOKBACK_BARS = 5
+SL_1H_LOOKBACK_BARS = 3          # Ultime 3 candele orarie CHIUSE, FAST e TREND
+SL_BUFFER_ATR1H = 0.15          # Margine oltre il massimo/minimo 1H
 SL_BUFFER_STRONG_TREND_ATR15 = 0.5
 SL_BUFFER_NORMAL_TREND_ATR15 = 0.45
 SL_BUFFER_NEUTRAL_4H_ATR15 = 0.3
 SL_MIN_DISTANCE_ATR15 = 1.2
-SL_MAX_DISTANCE_ATR15 = 4.5
+SL_MAX_DISTANCE_ATR15 = 6.0     # Prima 4.5; oltre il limite il segnale viene scartato
 VOLUME_SAMPLE_MIN_GAP_SECONDS = 4.0
 VOLUME_SAMPLE_MAX_GAP_SECONDS = 60.0
 VOLUME_SAMPLE_LOOKBACK_SECONDS = 120.0
@@ -505,42 +506,55 @@ def stochastic(candles):
 def signed(value, direction):
     return value if direction == 'LONG' else -value
 def intelligent_stop(direction, entry, level, live, a15, recent, ctx, bias, one_hour):
-    if ctx == direction and bias.startswith(direction):
-        buffer = SL_BUFFER_STRONG_TREND_ATR15
-    elif ctx == 'NEUTRAL':
-        buffer = SL_BUFFER_NEUTRAL_4H_ATR15
-    else:
-        buffer = SL_BUFFER_NORMAL_TREND_ATR15
+    """SL 1H per FAST e TREND: struttura delle 3 ultime candele 1H chiuse.
+
+    Il livello 15m rimane una protezione aggiuntiva: lo stop non viene mai
+    avvicinato rispetto alla vecchia logica strutturale 15m.
+    Un livello 1H troppo distante NON viene avvicinato artificialmente:
+    in quel caso il segnale e' scartato.
+    """
+    if not a15 or a15 <= 0 or entry <= 0:
+        return None
+    closed1h = one_hour[:-1]
     closed15 = recent[-SL_STRUCTURE_LOOKBACK_BARS:]
-    closed1h = one_hour[:-1][-SL_1H_LOOKBACK_BARS:]
-    if not closed15:
+    if len(closed1h) < max(15, SL_1H_LOOKBACK_BARS) or not closed15:
         return None
-    margin = a15 * buffer
-    maximum = a15 * SL_MAX_DISTANCE_ATR15
-    if direction == 'LONG':
-        support15 = min([live['l'], level] + [x['l'] for x in closed15])
-        structural = support15 - margin
-        if closed1h:
-            support1h = min((x['l'] for x in closed1h))
-            candidate = support1h - margin
-            if 0 < entry - candidate <= maximum:
-                structural = min(structural, candidate)
-        raw = entry - structural
+    a1h = atr(closed1h, 14)
+    if not a1h or a1h <= 0:
+        return None
+    structure1h = closed1h[-SL_1H_LOOKBACK_BARS:]
+    if ctx == direction and bias.startswith(direction):
+        buffer15 = SL_BUFFER_STRONG_TREND_ATR15
+    elif ctx == 'NEUTRAL':
+        buffer15 = SL_BUFFER_NEUTRAL_4H_ATR15
     else:
-        resistance15 = max([live['h'], level] + [x['h'] for x in closed15])
-        structural = resistance15 + margin
-        if closed1h:
-            resistance1h = max((x['h'] for x in closed1h))
-            candidate = resistance1h + margin
-            if 0 < candidate - entry <= maximum:
-                structural = max(structural, candidate)
-        raw = structural - entry
-    if raw <= 0 or raw > maximum:
+        buffer15 = SL_BUFFER_NORMAL_TREND_ATR15
+
+    # Lo SL segue il supporto/resistenza 1H + 0.15 ATR1H.
+    margin1h = a1h * SL_BUFFER_ATR1H
+    margin15 = a15 * buffer15
+    if direction == 'LONG':
+        structure_level1h = min(c['l'] for c in structure1h)
+        stop1h = structure_level1h - margin1h
+        stop15 = min([live['l'], level] + [c['l'] for c in closed15]) - margin15
+        structural_stop = min(stop1h, stop15)
+        raw_distance = entry - structural_stop
+    elif direction == 'SHORT':
+        structure_level1h = max(c['h'] for c in structure1h)
+        stop1h = structure_level1h + margin1h
+        stop15 = max([live['h'], level] + [c['h'] for c in closed15]) + margin15
+        structural_stop = max(stop1h, stop15)
+        raw_distance = structural_stop - entry
+    else:
         return None
-    distance = max(raw, a15 * SL_MIN_DISTANCE_ATR15)
-    if distance > maximum:
+
+    if raw_distance <= 0:
+        return None
+    distance = max(raw_distance, a15 * SL_MIN_DISTANCE_ATR15)
+    if distance > a15 * SL_MAX_DISTANCE_ATR15:
         return None
     return entry - distance if direction == 'LONG' else entry + distance
+
 def available_room(c15, direction, entry, risk):
     history = c15[:-1]
     older = history[-(RESISTANCE_LOOKBACK_BARS + STRUCTURE_BARS):-STRUCTURE_BARS]
@@ -755,7 +769,7 @@ def build_message(symbol, s):
     trend_bodies = s.get('trend_bodies_atr')
     strength_note = f"Stoch rafforzamento TREND: +{s['stoch_strength_delta']:.2f} punti K-D\n" if s.get('stoch_strength_delta') is not None else ''
     body_note = f"Corpi 1/2/3: {trend_bodies[0]:.2f} / {trend_bodies[1]:.2f} / {trend_bodies[2]:.2f} ATR | {s['trend_body_regime']}\n" if trend_bodies else ''
-    return f"🚀 FAST/TREND V10.1.1 (SPERIMENTALE)\n{pair} — {s['direction']}\nOrario Italia: {italian_time}\nSetup: {s['mode']} | Qualita': {s['quality']}/13\n\nENTRY: {fmt_price(s['entry_low'])} - {fmt_price(s['entry_high'])}\nSL strutturale 15m/1H: {fmt_price(s['sl'])}\n\nTP1: {fmt_price(s['tp1'])}\nTP2: {fmt_price(s['tp2'])}\nTP3: {fmt_price(s['tp3'])}\n\nLeva indicativa: {s['leverage']}x\nCandela live in corso da: {s['check_seconds']}s\nLivello: {fmt_price(s['level'])}\nVolume LIVE: {s['live_volume_pace']:.2f}x\nVolume soglia dinamica: {s['volume_dynamic_floor']:.2f}x\nConferma volume: {s['volume_confirmation']}\nVariazione velocita' volume: {s['volume_acceleration'] * 100:+.0f}%\nVolume chiuso: {s['closed_volume_ratio']:.2f}x\nProgressione: {s['price_progress_atr']:+.3f} ATR15\n{body_note}Estensione: {s['follow_through_atr']:.2f} ATR15\nStoch K/D: {s['stoch_k']:.1f}/{s['stoch_d']:.1f}\n{strength_note}Spazio tecnico storico: {room}\n\nTrend 1H: {s['context1h']} | 4H: {s['context4h']}\nBTC bias: {s['btc']}\nBTC15: {s['btc15_direction']} (corpo {s['btc15_body_atr']:.2f} ATR) | BTC1H: {s['btc1h_direction']}\nBTC15 volume progressivo: {('SI' if s['btc15_volume_progressive'] else 'NO')} (+{s['btc15_volume_growth'] * 100:.0f}% ritmo; obbligatorio solo TREND)\nBTC30 informativo: {s['btc30_direction']}\n{adaptive_note}Segnale anticipato non validato. Stop e leva non garantiscono protezione da liquidazione."
+    return f"🚀 FAST/TREND V10.1.2 (SPERIMENTALE)\n{pair} — {s['direction']}\nOrario Italia: {italian_time}\nSetup: {s['mode']} | Qualita': {s['quality']}/13\n\nENTRY: {fmt_price(s['entry_low'])} - {fmt_price(s['entry_high'])}\nSL strutturale 1H (FAST/TREND): {fmt_price(s['sl'])}\n\nTP1: {fmt_price(s['tp1'])}\nTP2: {fmt_price(s['tp2'])}\nTP3: {fmt_price(s['tp3'])}\n\nLeva indicativa: {s['leverage']}x\nCandela live in corso da: {s['check_seconds']}s\nLivello: {fmt_price(s['level'])}\nVolume LIVE: {s['live_volume_pace']:.2f}x\nVolume soglia dinamica: {s['volume_dynamic_floor']:.2f}x\nConferma volume: {s['volume_confirmation']}\nVariazione velocita' volume: {s['volume_acceleration'] * 100:+.0f}%\nVolume chiuso: {s['closed_volume_ratio']:.2f}x\nProgressione: {s['price_progress_atr']:+.3f} ATR15\n{body_note}Estensione: {s['follow_through_atr']:.2f} ATR15\nStoch K/D: {s['stoch_k']:.1f}/{s['stoch_d']:.1f}\n{strength_note}Spazio tecnico storico: {room}\n\nTrend 1H: {s['context1h']} | 4H: {s['context4h']}\nBTC bias: {s['btc']}\nBTC15: {s['btc15_direction']} (corpo {s['btc15_body_atr']:.2f} ATR) | BTC1H: {s['btc1h_direction']}\nBTC15 volume progressivo: {('SI' if s['btc15_volume_progressive'] else 'NO')} (+{s['btc15_volume_growth'] * 100:.0f}% ritmo; obbligatorio solo TREND)\nBTC30 informativo: {s['btc30_direction']}\n{adaptive_note}Segnale anticipato non validato. Stop e leva non garantiscono protezione da liquidazione."
 def scan_market():
     global last_scan_log, last_diag
     now = time.monotonic()
@@ -789,7 +803,7 @@ def scan_market():
         diagnostic_totals.clear()
         last_diag = now
 def main():
-    print('CryptoSignalAI V10.1.1 SNELLA - Stoch TREND progressivo | FAST/TREND 25 coppie | WebSocket 1s', flush=True)
+    print('CryptoSignalAI V10.1.2 SNELLA - SL 1H FAST/TREND | Stoch TREND progressivo | FAST/TREND 25 coppie | WebSocket 1s', flush=True)
     while True:
         try:
             bootstrap_history()
@@ -800,7 +814,7 @@ def main():
     threading.Thread(target=telegram_sender_worker, daemon=True).start()
     threading.Thread(target=rest_maintenance_worker, daemon=True).start()
     threading.Thread(target=ws_connection_worker, daemon=True).start()
-    send_telegram('Bot V10.1.1 SNELLA avviato. Stocastico in rafforzamento su TREND (+0.5 punti K-D); FAST invariato. 25 crypto, WebSocket 1s. Usare in simulazione.')
+    send_telegram('Bot V10.1.2 SNELLA avviato. SL strutturale 1H su FAST e TREND (3 candele chiuse + buffer ATR1H, cap 6 ATR15); Stoch in rafforzamento solo TREND (+0.5 punti K-D). 25 crypto, WebSocket 1s. Usare in simulazione.')
     next_scan = time.monotonic()
     while True:
         next_scan += SCAN_SECONDS
