@@ -1,1237 +1,176 @@
-import os
-import time
-import json
-import queue
-import threading
-from collections import Counter, deque
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
-from zoneinfo import ZoneInfo
-import requests
-import websocket  # pacchetto pip: websocket-client
-
-# V9.9.4: lettura delle 25 candele 15m da Binance Futures WebSocket.
-# Analisi FAST/TREND a cadenza di 1 secondo, senza download REST per ciclo.
-# REST usato solo per caricamento storico, 1h/4h in background e recupero gap.
-# Strategia V9.9.3 INVARIATA: tutte le soglie di ingresso, SL/TP e volume.
-# NON e' trading automatico: segnali informativi da testare in simulazione.
-BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
-SYMBOLS = [
-    'SOLUSDT','BTCUSDT','ETHUSDT','XRPUSDT','BNBUSDT','DOGEUSDT',
-    'AVAXUSDT','SUIUSDT','LINKUSDT','ADAUSDT','NEARUSDT','UNIUSDT',
-    'LTCUSDT','DOTUSDT','APTUSDT','ARBUSDT','OPUSDT','INJUSDT',
-    'RENDERUSDT','1000PEPEUSDT','FILUSDT','ETCUSDT','AAVEUSDT',
-    'TIAUSDT','SEIUSDT'
-]
-KLINES_URL = 'https://fapi.binance.com/fapi/v1/klines'
-SCAN_SECONDS = 1  # intervallo tra i cicli di analisi dei dati gia' in RAM
-SCAN_WORKERS = 6 # solo download iniziali e aggiornamenti storici in background
-WS_URL = 'wss://fstream.binance.com/market/stream?streams='
-WS_STALE_SECONDS = 5.0 # niente segnali se la candela 15m non e' stata aggiornata
-WS_RECONNECT_MAX_SECONDS = 30
-SCAN_LOG_EVERY_SECONDS = 10 # evita di scrivere 25 righe di scarti ogni secondo
-CACHE_30M_SECONDS = 30
-CACHE_1H_SECONDS = 60
-CACHE_4H_SECONDS = 300
-MIN_REST_GAP_SECONDS = .30
-RETRY_FALLBACK_SECONDS = (5,10,20,30)
-MAX_RETRIES = 4
-DIAGNOSTIC_EVERY_SECONDS = 60
-# Breve conferma, senza attesa di 5 minuti
-CHECK_MIN_SECONDS = 20
-CHECK_MAX_SECONDS = 55  # margine per scansioni da 7-14s; conferma appena >=20s
-CHECK_MAX_GAP_SECONDS = 45
-CHECK_LEVEL_TOLERANCE_ATR = .08  # oscillazione moderata attorno al livello
-CHECK_MIN_PROGRESS_ATR = .015
-BREAKOUT_MIN_ATR = .02
-BREAKOUT_START_MAX_EXTENSION_ATR = .45
-CHECK_MAX_EXTENSION_ATR = .75
-BREAKOUT_VOLUME_PACE_MIN = 1.20
-BREAKOUT_BODY_ATR_MIN = .15  # conferma finale: candela non eccessivamente debole
-BREAKOUT_CLOSE_POSITION_MIN = .60
-BREAKOUT_WICK_MAX = .85
-MIN_CANDLE_ELAPSED_SECONDS = 15  # solo alla conferma; breakout rilevato anche prima
-LIVE_VOLUME_MIN_ELAPSED_SECONDS = 15
-LIVE_VOLUME_PACE_CAP = 20.
-CLOSED_VOLUME_PREFERRED = 1.10
-MIN_CLOSED_VOLUME_RATIO = .80  # soglia sulla candela chiusa precedente, SOLO per FAST
-STRUCTURE_BARS = 6
-PULLBACK_TOUCH_TOLERANCE_ATR = .35
-PULLBACK_TRIGGER_BARS = 3
-PULLBACK_LOOKBACK_BARS = 5
-RESISTANCE_LOOKBACK_BARS = 48
-MIN_ROOM_R = 1.20
-MIN_QUALITY = 9
-STOCH_K_PERIOD = 14
-STOCH_K_SMOOTH = 3
-STOCH_D_PERIOD = 3
-BTC15_DIRECTIONAL_BODY_ATR_MIN = .20  # TREND BTC15: corpo LIVE >=0.20 ATR15
-BTC30_DIRECTIONAL_BODY_ATR_MIN = .15  # 30m solo informativo: invariato
-BTC15_STRONG_OPPOSITE_BODY_ATR_MIN = .45  # blocca solo corpo BTC15 opposto >= 0.45 ATR15
-# V9.7: stop strutturale ampliato e filtro continuazione su due candele.
-SL_STRUCTURE_LOOKBACK_BARS = 12      # struttura 15m piu ampia, solo candele chiuse
-SL_1H_LOOKBACK_BARS = 5            # controllo livelli 1h recenti, solo candele chiuse
-SL_BUFFER_STRONG_TREND_ATR15 = .50
-SL_BUFFER_NORMAL_TREND_ATR15 = .45
-SL_BUFFER_NEUTRAL_4H_ATR15 = .30
-SL_MIN_DISTANCE_ATR15 = 1.20
-SL_MAX_DISTANCE_ATR15 = 4.50       # limite massimo, non stop obbligatorio
-# V9.8.9: volume LIVE progressivo A; soglia 2.50x SOLO per il FAST B.
-# Il minimo dinamico deriva da media e mediana delle ultime 20 candele chiuse.
-# Per accelerare, la velocita' degli scambi deve aumentare fra due intervalli
-# temporali consecutivi osservati (NON il volume cumulativo, che sale sempre).
-# Il volume resta un filtro: una crescita da valori troppo bassi non e' valida.
-VOLUME_SAMPLE_MIN_GAP_SECONDS = 4.0
-VOLUME_SAMPLE_MAX_GAP_SECONDS = 60.0
-VOLUME_SAMPLE_LOOKBACK_SECONDS = 120.0
-VOLUME_ACCEL_MIN_GROWTH = .12       # accelerazione di almeno +12%, NON soglia di volume
-VOLUME_RECENT_RATE_FLOOR_PART = .75 # recente >=75% della velocita' storica dinamica
-# SOLO FAST, opzione B: volume molto alto e stabile (nessun segnale separato).
-FAST_SUSTAINED_VOLUME_MULTIPLIER = 2.50 # intensita >=2.50x vs media+mediana storico
-FAST_SUSTAINED_MAX_RATE_DROP = .15   # calo velocita' max 15% fra due intervalli
-FAST_BODY_ATR_MIN = .70
-FAST_BODY_FRACTION_MIN = .80  # corpo almeno 80% del range totale
-FAST_WICK_MAX = .35
-FAST_MAX_EXTENSION_ATR = 1.40
-FAST_BTC15_BODY_ATR_MIN = .30
-# TREND: 3 candele quasi Marubozu, sia per LONG che per SHORT.
-# Corpo >=0.35 ATR15, pienezza >=80%, due wick <=15% del range ciascuna.
-# Restano controllate sia la wick superiore che quella inferiore.
-TREND_PREV_BODY_ATR_MIN = .35
-TREND_PREV_BODY_FRACTION_MIN = .80
-TREND_BODY_ATR_MIN = .35
-TREND_BODY_FRACTION_MIN = .80
-TREND_UPPER_WICK_MAX_RANGE = .15
-TREND_LOWER_WICK_MAX_RANGE = .15
-TREND_THIRD_MIN_VS_PREV_AVG = .80  # terza live >=80% della media dei due corpi
-TREND_MAX_EXTENSION_ATR = 2.20
-TREND_BTC15_BODY_ATR_MIN = .20
-# BTC15 puo' essere NEUTRAL solo se non supera la soglia di forza;
-# per entrambi gli ingressi richiediamo invece direzione esplicita.
-# Minimo spazio tecnico resta 1.20R; leva early <= 15x.
-TP_MIN_NET_PCT = .0015
-LEVERAGE_SAFETY = .35
-LEVERAGE_STEPS = (1,2,3,5,10,15,20,25,30,40,50,75,100)
-
-request_lock = threading.Lock()
-cache_lock = threading.Lock()
-last_rest_request = 0.
-market_cache = {}  # (simbolo, timeframe) -> {'time': epoch, 'data': lista immutable per copia}
-ws_last_seen = {}  # (simbolo, timeframe) -> time.monotonic ultimo evento
-ws_gap_keys = set()  # richiedono ripristino dello storico prima di nuovi segnali
-websocket_status = {'connected': False, 'since': 0.}
-last_scan_log = 0.
-signals_queue = queue.Queue(maxsize=200)
-signals_lock = threading.Lock()
-signals_in_flight = set()
-pending = {}
-last_observed = {}
-signal_state = {}
-last_diag = 0.
-diagnostic_totals = Counter()
-diagnostic_since_last = Counter()  # finestra circa 60s, solo visibilita' dei motivi
-# Campionamento in RAM per singola coppia; un riavvio richiede alcune scansioni
-# prima di avere due intervalli confrontabili sulla candela live.
-live_volume_samples = {}
-volume_samples_lock = threading.Lock()
-
-def send_telegram(message):
-    if not BOT_TOKEN or not CHAT_ID:
-        print('Telegram non configurato')
-        return False
-    try:
-        r = requests.post(f'https://api.telegram.org/bot{BOT_TOKEN}/sendMessage',
-                          data={'chat_id':CHAT_ID,'text':message}, timeout=20)
-        r.raise_for_status()
-        return bool(r.json().get('ok'))
-    except Exception as exc:
-        print('Errore Telegram:', exc)
-        return False
-
-def get_json(url, params):
-    global last_rest_request
-    error = None
-    for attempt in range(MAX_RETRIES):
-        with request_lock:
-            wait = MIN_REST_GAP_SECONDS - (time.monotonic() - last_rest_request)
-            if wait > 0:
-                time.sleep(wait)
-            last_rest_request = time.monotonic()
-        try:
-            r = requests.get(url, params=params, timeout=15)
-            if r.status_code in (418,429):
-                try:
-                    delay = max(5.,float(r.headers.get('Retry-After')))
-                except (TypeError,ValueError):
-                    delay = RETRY_FALLBACK_SECONDS[min(attempt,3)]
-                print('Rate limit Binance',r.status_code,'attesa',delay)
-                time.sleep(delay)
-                error = RuntimeError(f'HTTP {r.status_code}')
-                continue
-            r.raise_for_status()
-            return r.json()
-        except requests.RequestException as exc:
-            error = exc
-            if attempt < MAX_RETRIES-1:
-                time.sleep(RETRY_FALLBACK_SECONDS[min(attempt,3)])
-    raise error or RuntimeError('Binance non disponibile')
-
-def parse_candles(raw):
-    return [{'o':float(x[1]),'h':float(x[2]),'l':float(x[3]),
-             'c':float(x[4]),'v':float(x[5]),'t':int(x[0])} for x in raw]
-
-def cached_candles(symbol, interval, lifetime):
-    key = (symbol,interval)
-    with cache_lock:
-        cached = market_cache.get(key)
-        if cached and time.time()-cached['time'] < lifetime:
-            return cached['data']
-    data = parse_candles(get_json(KLINES_URL,{'symbol':symbol,'interval':interval,'limit':120}))
-    with cache_lock:
-        market_cache[key] = {'time':time.time(),'data':data}
-    return data
-
-def market_data(symbol):
-    return {'15m':parse_candles(get_json(KLINES_URL,{'symbol':symbol,'interval':'15m','limit':120})),
-            '1h':cached_candles(symbol,'1h',CACHE_1H_SECONDS),
-            '4h':cached_candles(symbol,'4h',CACHE_4H_SECONDS)}
-
-# ----------------------------------------------------------
-# V9.9.4 - WebSocket 15m (25 coppie) + BTC 30m informativo
-# ----------------------------------------------------------
-
-def ws_stream_names():
-    return [f'{symbol.lower()}@kline_15m' for symbol in SYMBOLS] + ['btcusdt@kline_30m']
-
-def ws_update(payload):
-    """Aggiorna le candele in memoria; non aggiunge REST alla scansione 1s.
-
-    Scarta eventi piu' vecchi, rileva eventuali candele saltate,
-    e conserva le ultime 120 come nella versione REST originaria.
-    """
-    evt = payload.get('data', payload)
-    if evt.get('e') != 'kline':
-        return
-    k = evt.get('k') or {}
-    symbol = str(evt.get('s', k.get('s', ''))).upper()
-    interval = k.get('i')
-    if symbol not in SYMBOLS or (interval != '15m' and not (symbol == 'BTCUSDT' and interval == '30m')):
-        return
-    try:
-        candle = {'o': float(k['o']), 'h': float(k['h']),
-                  'l': float(k['l']), 'c': float(k['c']),
-                  'v': float(k['v']), 't': int(k['t'])}
-    except (KeyError, TypeError, ValueError):
-        return
-    if not (candle['l'] <= min(candle['o'], candle['c']) <= max(candle['o'], candle['c']) <= candle['h']):
-        return
-    key = (symbol, interval)
-    interval_ms = 900_000 if interval == '15m' else 1_800_000
-    now = time.monotonic()
-    with cache_lock:
-        entry = market_cache.get(key)
-        if not entry or not entry['data']:
-            ws_gap_keys.add(key)
-            return
-        old = entry['data']
-        last = old[-1]
-        if candle['t'] < last['t']:
-            return
-        if candle['t'] == last['t']:
-            # La quantita' della candela in corso cresce; ignora eventi arretrati.
-            if candle['v'] + 1e-10 < last['v']:
-                return
-            updated = old[:-1] + [candle]
-        elif candle['t'] == last['t'] + interval_ms:
-            updated = (old + [candle])[-120:]
-        else:
-            # Dopo un'interruzione lunga, evita indicatori con barre mancanti.
-            ws_gap_keys.add(key)
-            return
-        market_cache[key] = {'time': time.time(), 'data': updated}
-        ws_last_seen[key] = now
-        ws_gap_keys.discard(key)
-
-
-def ws_connection_worker():
-    streams = '/'.join(ws_stream_names())
-    reconnect_delay = 1
-    while True:
-        try:
-            def on_open(ws):
-                nonlocal reconnect_delay
-                reconnect_delay = 1
-                with cache_lock:
-                    websocket_status['connected'] = True
-                    websocket_status['since'] = time.monotonic()
-                print('WEBSOCKET CONNESSO: 25x15m + BTC30m (26 stream)', flush=True)
-
-            def on_message(ws, message):
-                try:
-                    ws_update(json.loads(message))
-                except (ValueError, TypeError) as exc:
-                    print('WS messaggio non valido:', exc, flush=True)
-
-            def on_error(ws, error):
-                print('ERRORE WebSocket:', error, flush=True)
-
-            def on_close(ws, code, reason):
-                with cache_lock:
-                    websocket_status['connected'] = False
-                print('WEBSOCKET DISCONNESSO:', code, reason, flush=True)
-
-            client = websocket.WebSocketApp(WS_URL + streams,
-                                            on_open=on_open, on_message=on_message,
-                                            on_error=on_error, on_close=on_close)
-            client.run_forever(ping_interval=120, ping_timeout=20)
-        except Exception as exc:
-            print('ERRORE CONNESSIONE WebSocket:', exc, flush=True)
-        finally:
-            with cache_lock:
-                websocket_status['connected'] = False
-        time.sleep(reconnect_delay)
-        reconnect_delay = min(WS_RECONNECT_MAX_SECONDS, reconnect_delay*2)
-
-
-def hydrate_cache(key, only_if_needed=False):
-    symbol, interval = key
-    rows = parse_candles(get_json(KLINES_URL, {'symbol': symbol, 'interval': interval, 'limit': 120}))
-    if len(rows) < 55:
-        raise ValueError(f'{symbol}/{interval}: storico troppo breve')
-    with cache_lock:
-        current = market_cache.get(key)
-        if only_if_needed and current:
-            # Non tornare indietro se nuovi dati WS sono arrivati durante il REST.
-            latest = current['data'][-1]
-            candidate = rows[-1]
-            if latest['t'] > candidate['t'] or (latest['t'] == candidate['t'] and latest['v'] > candidate['v']):
-                if key not in ws_gap_keys:
-                    return
-                # Se c'e' un gap, servono comunque i dati REST per ricostruirlo.
-        market_cache[key] = {'time': time.time(), 'data': rows}
-        ws_gap_keys.discard(key)
-        # NON simuliamo freschezza WebSocket: ogni 15m richiede un vero evento.
-    return True
-
-
-def bootstrap_history():
-    keys = [(symbol, interval) for symbol in SYMBOLS for interval in ('15m', '1h', '4h')]
-    keys.append(('BTCUSDT', '30m'))
-    failures = []
-    print('Caricamento storico Binance Futures:', len(keys), 'serie...', flush=True)
-    with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as pool:
-        futures = {pool.submit(hydrate_cache, key): key for key in keys}
-        for future in as_completed(futures):
-            try:
-                future.result()
-            except Exception as exc:
-                failures.append(futures[future])
-                print('ERRORE inizializzazione', futures[future], exc, flush=True)
-    if failures:
-        raise RuntimeError(f'Storico non disponibile per {len(failures)} timeframe; ritento all avvio')
-    print('STORICO PRONTO: 25 coppie e BTC30', flush=True)
-
-
-def rest_maintenance_worker():
-    """Aggiorna SOLO i contesti 1h/4h e ricuce eventuali buchi WS.
-    REST non blocca il ciclo di analisi e non aggiorna i 15m a ogni secondo.
-    """
-    last_1h = time.monotonic()
-    last_4h = time.monotonic()
-    last_gap_retry = 0.
-    while True:
-        now = time.monotonic()
-        keys = []
-        if now-last_1h >= CACHE_1H_SECONDS:
-            keys.extend((symbol, '1h') for symbol in SYMBOLS)
-            last_1h = now
-        if now-last_4h >= CACHE_4H_SECONDS:
-            keys.extend((symbol, '4h') for symbol in SYMBOLS)
-            last_4h = now
-        if now-last_gap_retry >= 15:
-            with cache_lock:
-                keys.extend(ws_gap_keys)
-            last_gap_retry = now
-        for key in dict.fromkeys(keys):
-            try:
-                hydrate_cache(key, only_if_needed=True)
-            except Exception as exc:
-                print('REST refresh FALLITO', key, exc, flush=True)
-        time.sleep(1)
-
-
-def market_snapshot():
-    """Ritorna una fotografia coerente della cache; scarta WS vecchi o gap."""
-    now = time.monotonic()
-    market = {}
-    with cache_lock:
-        online = websocket_status['connected']
-        btc30_item = market_cache.get(('BTCUSDT', '30m'))
-        btc30_fresh = now-ws_last_seen.get(('BTCUSDT', '30m'), -1e9) <= WS_STALE_SECONDS
-        btc30 = (btc30_item['data'] if btc30_item and btc30_fresh and ('BTCUSDT', '30m') not in ws_gap_keys else None)
-        for symbol in SYMBOLS:
-            keys = ((symbol, '15m'), (symbol, '1h'), (symbol, '4h'))
-            items = [market_cache.get(key) for key in keys]
-            if not online or any(x is None for x in items):
-                continue
-            if (keys[0] in ws_gap_keys or
-                    now-ws_last_seen.get(keys[0], -1e9) > WS_STALE_SECONDS):
-                continue
-            # Contesti lentissimi durante down REST non devono generare segnali.
-            if (time.time()-items[1]['time'] > 180 or
-                    time.time()-items[2]['time'] > 900):
-                continue
-            market[symbol] = {'15m': items[0]['data'], '1h': items[1]['data'], '4h': items[2]['data']}
-    return market, btc30
-
-
-def telegram_sender_worker():
-    while True:
-        key, message = signals_queue.get()
-        try:
-            if send_telegram(message):
-                with signals_lock:
-                    signal_state[key] = time.time()
-            else:
-                print('Invio Telegram fallito:', key, flush=True)
-        finally:
-            with signals_lock:
-                signals_in_flight.discard(key)
-            signals_queue.task_done()
-
-
-def queue_signal(symbol, signal):
-    key = (symbol, signal['direction'], signal['candle_time'])
-    with signals_lock:
-        if key in signals_in_flight or key in signal_state:
-            return False
-        signals_in_flight.add(key)
-    try:
-        signals_queue.put_nowait((key, build_message(symbol, signal)))
-        return True
-    except queue.Full:
-        with signals_lock:
-            signals_in_flight.discard(key)
-        print('CODA TELEGRAM PIENA: segnale non accodato', key, flush=True)
-        return False
-
-def ema(values, period):
-    if len(values)<period:
-        return None
-    result = sum(values[:period])/period
-    alpha = 2/(period+1)
-    for value in values[period:]:
-        result = alpha*value+(1-alpha)*result
-    return result
-
-def atr(candles, period=14):
-    if len(candles)<period+1:
-        return None
-    ranges = [max(candles[i]['h']-candles[i]['l'],
-                  abs(candles[i]['h']-candles[i-1]['c']),
-                  abs(candles[i]['l']-candles[i-1]['c'])) for i in range(1,len(candles))]
-    return sum(ranges[-period:])/period
-
-def live_volume_ratio(candles):
-    if len(candles)<22:
-        return 0.,0.
-    avg = sum(x['v'] for x in candles[-21:-1])/20
-    live = candles[-1]
-    elapsed = max(0.,min((time.time()*1000-live['t'])/1000,900.))
-    if avg<=0 or elapsed<LIVE_VOLUME_MIN_ELAPSED_SECONDS:
-        return 0.,elapsed
-    return min(live['v']/(avg*max(elapsed/900.,.01)),LIVE_VOLUME_PACE_CAP),elapsed
-
-def progressive_volume_metrics(symbol, candles, now):
-    """Controlla volume LIVE senza soglie x fisse, usando due campioni di velocita'.
-
-    - Livello: proiezione della candela 15m vs media+mediana volumi storici.
-    - Accelerazione: velocita' degli scambi nell'ultimo intervallo vs precedente.
-    - FAST B: volume >=2.50x e ritmo alto in entrambe le finestre consecutive
-      senza rallentare oltre il 15%; solo FAST, non TREND.
-    - TREND: verifica esclusivamente il ritmo progressivo della terza LIVE;
-      nessun vincolo su volume delle prime due candele chiuse.
-    Tutti i campioni si riferiscono ALLA STESSA candela Binance, senza
-    interpolare tra chiusura e apertura di due candele differenti.
-    """
-    result = {'ready': False, 'accel_ok': False, 'intensity_ok': False,
-              'sustained_ok': False,
-              'pace': 0., 'relative_pace': 0.,
-              'dynamic_floor': 0., 'growth': 0., 'recent_rate': 0.,
-              'prior_rate': 0., 'projected': 0.}
-    if len(candles) < 22:
-        return result
-
-    live = candles[-1]
-    elapsed = max(0., min((time.time()*1000-live['t'])/1000., 900.))
-    prior = [max(0., x['v']) for x in candles[-21:-1]]
-    avg = sum(prior)/len(prior)
-    sorted_prior = sorted(prior)
-    median = (sorted_prior[9]+sorted_prior[10])/2.
-    reference = (avg+median)/2.
-    # Memorizza anche i campioni iniziali (<15s), senza usarli per segnalare.
-    # Usare tempo monotonic per i delta, tempo UNIX solo per il minuto candela.
-    with volume_samples_lock:
-        state = live_volume_samples.get(symbol)
-        if (state is None or state['candle_time'] != live['t'] or
-                (state['samples'] and live['v'] < state['samples'][-1][1])):
-            state = {'candle_time': live['t'], 'samples': deque(maxlen=16)}
-            live_volume_samples[symbol] = state
-        samples = state['samples']
-        while samples and now-samples[0][0] > VOLUME_SAMPLE_LOOKBACK_SECONDS:
-            samples.popleft()
-        if not samples or now-samples[-1][0] >= VOLUME_SAMPLE_MIN_GAP_SECONDS:
-            samples.append((now, max(0., live['v'])))
-        points = tuple(samples)
-
-    if avg <= 0 or reference <= 0 or elapsed < LIVE_VOLUME_MIN_ELAPSED_SECONDS:
-        return result
-
-    # Proiezione su 900s con il volume accumulato nei secondi effettivi.
-    projected = max(0., live['v'])*900./elapsed
-    pace = min(projected/avg, LIVE_VOLUME_PACE_CAP)
-    dyn_floor = reference/avg
-    relative = projected/reference
-    result.update(pace=pace, dynamic_floor=dyn_floor,
-                  relative_pace=relative, projected=projected,
-                  intensity_ok=(projected >= reference))
-
-    # Minimo 3 osservazioni e 2 finestre temporali comparabili.
-    if len(points) < 3:
-        return result
-    t0,v0 = points[-3]
-    t1,v1 = points[-2]
-    t2,v2 = points[-1]
-    dt_prev,dt_new = t1-t0,t2-t1
-    if (not (VOLUME_SAMPLE_MIN_GAP_SECONDS <= dt_prev <= VOLUME_SAMPLE_MAX_GAP_SECONDS)
-            or not (VOLUME_SAMPLE_MIN_GAP_SECONDS <= dt_new <= VOLUME_SAMPLE_MAX_GAP_SECONDS)):
-        return result
-    prev_rate = max(0., v1-v0)/dt_prev
-    new_rate = max(0., v2-v1)/dt_new
-    # La crescita percentuale e' significativa solo se il nuovo ritmo e'
-    # abbastanza elevato in assoluto rispetto alla storia della coppia.
-    historical_rate = reference/900.
-    # Se il ritmo precedente era zero, usiamo una base piccola ma non nulla
-    # derivata dallo storico: evita valori infiniti nel messaggio Telegram.
-    growth = min(3., new_rate/max(prev_rate, historical_rate*.10)-1.) if new_rate>0 else 0.
-    accel_ok = (new_rate > 0 and new_rate >= prev_rate*(1.+VOLUME_ACCEL_MIN_GROWTH)
-                and new_rate >= historical_rate*VOLUME_RECENT_RATE_FLOOR_PART)
-    # Via B: almeno 2.50x dello storico sia sul totale live proiettato,
-    # sia SU ENTRAMBI gli intervalli consecutivi misurati. Il ritmo puo'
-    # essere stabile o calare fino al 15%, ma non deve crollare.
-    # Un picco isolato di una sola scansione NON conferma il volume sostenuto.
-    sustained_min_rate = historical_rate*FAST_SUSTAINED_VOLUME_MULTIPLIER
-    sustained_ok = (relative >= FAST_SUSTAINED_VOLUME_MULTIPLIER and
-                    prev_rate >= sustained_min_rate and
-                    new_rate >= sustained_min_rate and
-                    new_rate >= prev_rate*(1.-FAST_SUSTAINED_MAX_RATE_DROP))
-    result.update(ready=True, accel_ok=accel_ok, sustained_ok=sustained_ok,
-                  growth=growth,
-                  recent_rate=new_rate, prior_rate=prev_rate)
-    return result
-
-def closed_volume_ratio(candles):
-    if len(candles)<22:
-        return 0.
-    avg = sum(x['v'] for x in candles[-22:-2])/20
-    return candles[-2]['v']/avg if avg>0 else 0.
-
-def candle_metrics(c, direction, a15):
-    body=abs(c['c']-c['o'])
-    span=c['h']-c['l']
-    if body<=0 or span<=0 or a15<=0:
-        return None
-    if direction=='LONG':
-        if c['c']<=c['o']:
-            return None
-        pos=(c['c']-c['l'])/span
-        wick=max(0.,c['h']-c['c'])/body
-    else:
-        if c['c']>=c['o']:
-            return None
-        pos=(c['h']-c['c'])/span
-        wick=max(0.,c['c']-c['l'])/body
-    upper_wick=max(0., c['h']-max(c['o'], c['c']))/span
-    lower_wick=max(0., min(c['o'], c['c'])-c['l'])/span
-    return {'body':body/a15,'close':pos,'wick':wick,'body_fraction':body/span,
-            'upper_wick_range':upper_wick,'lower_wick_range':lower_wick}
-
-def trend_shape_ok(m):
-    """Entrambe le wick <=15% del range, LONG e SHORT uguali."""
-    return (m is not None and
-            m['body_fraction']>=TREND_BODY_FRACTION_MIN and
-            m['upper_wick_range']<=TREND_UPPER_WICK_MAX_RANGE and
-            m['lower_wick_range']<=TREND_LOWER_WICK_MAX_RANGE)
-
-def trend_1h(candles):
-    closes=[x['c'] for x in candles[:-1]]
-    e20,e50,prev=ema(closes,20),ema(closes,50),ema(closes[:-1],20)
-    if None in (e20,e50,prev):
-        return 'NEUTRAL'
-    price=candles[-2]['c']
-    if price>e20>e50 and e20>=prev:
-        return 'LONG'
-    if price<e20<e50 and e20<=prev:
-        return 'SHORT'
-    return 'NEUTRAL'
-
-def context_4h(candles):
-    closes=[x['c'] for x in candles[:-1]]
-    e20,e50=ema(closes,20),ema(closes,50)
-    if e20 is None or e50 is None:
-        return 'NEUTRAL'
-    if candles[-2]['c']>e20>e50:
-        return 'LONG'
-    if candles[-2]['c']<e20<e50:
-        return 'SHORT'
-    return 'NEUTRAL'
-
-def btc_bias(data):
-    one,four=data['1h'],data['4h']
-    close1=[x['c'] for x in one[:-1]]
-    close4=[x['c'] for x in four[:-1]]
-    a,b=ema(close1,20),ema(close1,50)
-    c,d=ema(close4,20),ema(close4,50)
-    prev=ema(close1[:-1],20)
-    if None in (a,b,c,d,prev):
-        return 'NEUTRAL_STABLE'
-    if one[-2]['c']>a>b and a>prev and four[-2]['c']>c:
-        return 'LONG_STRONG'
-    if one[-2]['c']<a<b and a<prev and four[-2]['c']<c:
-        return 'SHORT_STRONG'
-    if one[-2]['c']>a and a>prev:
-        return 'LONG_LIGHT'
-    if one[-2]['c']<a and a<prev:
-        return 'SHORT_LIGHT'
-    return 'NEUTRAL_STABLE'
-
-def btc_30m_direction(candles):
-    if len(candles)<22:
-        return 'NEUTRAL'
-    a=atr(candles[:-1])
-    if not a:
-        return 'NEUTRAL'
-    live=candles[-1]
-    direction='LONG' if live['c']>live['o'] else 'SHORT'
-    metrics=candle_metrics(live,direction,a)
-    return direction if metrics and metrics['body']>=BTC30_DIRECTIONAL_BODY_ATR_MIN else 'NEUTRAL'
-
-def btc15_direction(data):
-    c=data['15m']
-    a=atr(c[:-1])
-    pace,_=live_volume_ratio(c)
-    result={'directional':'NEUTRAL','body_atr':0.,'volume_pace':pace}
-    if not a:
-        return result
-    live=c[-1]
-    direction='LONG' if live['c']>live['o'] else 'SHORT'
-    m=candle_metrics(live,direction,a)
-    if m:
-        result['body_atr']=m['body']
-        if m['body']>=BTC15_DIRECTIONAL_BODY_ATR_MIN:
-            result['directional']=direction
-    return result
-
-def stochastic(candles):
-    if len(candles)<STOCH_K_PERIOD+STOCH_K_SMOOTH+STOCH_D_PERIOD-2:
-        return None
-    fast=[]
-    for end in range(STOCH_K_PERIOD-1,len(candles)):
-        window=candles[end-STOCH_K_PERIOD+1:end+1]
-        high=max(x['h'] for x in window)
-        low=min(x['l'] for x in window)
-        fast.append(50. if high<=low else 100*(candles[end]['c']-low)/(high-low))
-    slow=[sum(fast[i-STOCH_K_SMOOTH+1:i+1])/STOCH_K_SMOOTH
-          for i in range(STOCH_K_SMOOTH-1,len(fast))]
-    if len(slow)<STOCH_D_PERIOD:
-        return None
-    return slow[-1],sum(slow[-STOCH_D_PERIOD:])/STOCH_D_PERIOD
-
-def signed(value,direction):
-    return value if direction=='LONG' else -value
-
-def aligned_ema(c15,direction):
-    closes=[x['c'] for x in c15]
-    e20=ema(closes,20)
-    prev=ema(closes[:-1],20)
-    if e20 is None or prev is None:
-        return False
-    return (closes[-1]>e20 and e20>prev) if direction=='LONG' else (closes[-1]<e20 and e20<prev)
-
-def opportunity_level(c15,direction,a15):
-    closed=c15[:-1]
-    long=direction=='LONG'
-    structure=closed[-STRUCTURE_BARS:]
-    breakout=max(x['h'] for x in structure) if long else min(x['l'] for x in structure)
-    levels=[('BREAKOUT',breakout)]
-    e20=ema([x['c'] for x in closed],20)
-    if e20 is None:
-        return levels
-    recent=closed[-PULLBACK_LOOKBACK_BARS:]
-    touch=(min(x['l'] for x in recent)<=e20+PULLBACK_TOUCH_TOLERANCE_ATR*a15
-           if long else max(x['h'] for x in recent)>=e20-PULLBACK_TOUCH_TOLERANCE_ATR*a15)
-    recovery=closed[-1]['c']>e20 if long else closed[-1]['c']<e20
-    if touch and recovery:
-        trigger=closed[-PULLBACK_TRIGGER_BARS:]
-        level=max(x['h'] for x in trigger) if long else min(x['l'] for x in trigger)
-        if abs(level-breakout)>.02*a15:
-            levels.append(('RIPRESA TREND',level))
-    return levels
-
-# Stop strutturale invariato dalla V9.8.7.
-def intelligent_stop(direction,entry,level,live,a15,recent,ctx,bias,one_hour):
-    if ctx==direction and bias.startswith(direction):
-        buffer=SL_BUFFER_STRONG_TREND_ATR15
-    elif ctx=='NEUTRAL':
-        buffer=SL_BUFFER_NEUTRAL_4H_ATR15
-    else:
-        buffer=SL_BUFFER_NORMAL_TREND_ATR15
-
-    closed15=recent[-SL_STRUCTURE_LOOKBACK_BARS:]
-    closed1h=one_hour[:-1][-SL_1H_LOOKBACK_BARS:]
-    if not closed15:
-        return None
-    margin=a15*buffer
-    maximum=a15*SL_MAX_DISTANCE_ATR15
-
-    if direction=='LONG':
-        support15=min([live['l'],level]+[x['l'] for x in closed15])
-        structural=support15-margin
-        # Il supporto 1h si usa solo se e' sotto l'entry e rientra nel rischio massimo.
-        if closed1h:
-            support1h=min(x['l'] for x in closed1h)
-            candidate=support1h-margin
-            if 0 < entry-candidate <= maximum:
-                structural=min(structural,candidate)
-        raw=entry-structural
-    else:
-        resistance15=max([live['h'],level]+[x['h'] for x in closed15])
-        structural=resistance15+margin
-        # La resistenza 1h si usa solo se e' sopra l'entry e rientra nel rischio massimo.
-        if closed1h:
-            resistance1h=max(x['h'] for x in closed1h)
-            candidate=resistance1h+margin
-            if 0 < candidate-entry <= maximum:
-                structural=max(structural,candidate)
-        raw=structural-entry
-
-    if raw<=0 or raw>maximum:
-        return None
-    distance=max(raw,a15*SL_MIN_DISTANCE_ATR15)
-    if distance>maximum:
-        return None
-    return entry-distance if direction=='LONG' else entry+distance
-
-def available_room(c15,direction,entry,risk):
-    history=c15[:-1]
-    older=history[-(RESISTANCE_LOOKBACK_BARS+STRUCTURE_BARS):-STRUCTURE_BARS]
-    if direction=='LONG':
-        levels=[x['h'] for x in older if x['h']>entry]
-        return min(levels)-entry if levels else float('inf')
-    levels=[x['l'] for x in older if x['l']<entry]
-    return entry-max(levels) if levels else float('inf')
-
-def clamp(v,lo,hi):
-    return max(lo,min(hi,v))
-
-def adaptive_targets(direction,entry,stop,a15,quality,pace,body,follow,ctx,bias):
-    risk=abs(entry-stop)
-    if risk<=0:
-        return None
-    strength=clamp((pace-1.2)/2.5,0,1)*.30
-    strength+=clamp((body-.16)/.70,0,1)*.25
-    strength+=clamp((follow-.06)/.60,0,1)*.20
-    strength+=clamp((quality-7)/6,0,1)*.15
-    strength+=.05*int(ctx==direction)+.05*int(bias.startswith(direction))
-    strength=clamp(strength,0,1)
-    adjusted=clamp(strength*(1-.35*clamp((body-1.2)/.35,0,1)),0,1)
-    d1=max(risk*.30,entry*TP_MIN_NET_PCT)
-    # Mantieni TP2 e TP3 IDENTICI alla V9.8.6 anche quando scatta il
-    # pavimento TP_MIN_NET_PCT: usa la vecchia distanza TP1 solo per lo spacing.
-    previous_tp1_distance=max(risk*.35,entry*TP_MIN_NET_PCT)
-    d2=max(risk*.45,previous_tp1_distance*1.15)
-    d3=max(risk*.60,d2*1.15)
-    sign=1 if direction=='LONG' else -1
-    return entry+sign*d1,entry+sign*d2,entry+sign*d3,strength
-
-def leverage_cap(q):
-    if q>=13:return 100
-    if q>=12:return 75
-    if q>=11:return 50
-    if q>=10:return 30
-    if q>=9:return 20
-    return 15
-
-def calculate_leverage(entry,stop,quality,aggressive_ok):
-    stop_pct=abs(entry-stop)/entry
-    if stop_pct<=0:
-        return 1
-    cap=leverage_cap(quality)
-    if not aggressive_ok:
-        cap=min(cap,15)
-    allowed=min(int(LEVERAGE_SAFETY/stop_pct),cap,100)
-    return max((x for x in LEVERAGE_STEPS if x<=allowed),default=1)
-
-def invalidate(symbol,reason,counters):
-    if symbol in pending:
-        old=pending.pop(symbol)
-        print(f'{symbol}: CHECK ANNULLATO ({reason}) {old["direction"]}')
-    counters[reason]+=1
-
-def trend_15m(candles, direction):
-    """Prezzo, EMA20/EMA50 e pendenza EMA20 coerenti sul 15m live."""
-    closes = [x['c'] for x in candles]
-    e20 = ema(closes, 20)
-    e50 = ema(closes, 50)
-    prev20 = ema(closes[:-1], 20)
-    if None in (e20, e50, prev20):
-        return False
-    if direction == 'LONG':
-        return closes[-1] > e20 > e50 and e20 > prev20
-    return closes[-1] < e20 < e50 and e20 < prev20
-
-
-def candle_color(c):
-    if c['c'] > c['o']:
-        return 'LONG'
-    if c['c'] < c['o']:
-        return 'SHORT'
-    return 'NEUTRAL'
-
-
-
-def diagnose_candle_setups(direction, live, prev1, prev2, metrics, prev1_metrics, prev2_metrics, counters):
-    """Diagnostica OSSERVATIVA: non abilita, modifica o blocca nessun segnale.
-
-    Dopo trend 1H valido, candela LIVE concorde e almeno 15 s di formazione,
-    analizza indipendentemente FAST e TREND. Per ciascuna modalita' registra
-    il PRIMO motivo di esclusione della struttura (un motivo per modalita').
-    Non interpreta questi controlli come trade persi: sono valutazioni ripetute.
-    I contatori 'test' sono aggiuntivi, non esclusivi, e servono a confrontare
-    separatamente pienezza e wick (una candela puo' fallire entrambi).
-    """
-    sign = 1 if direction == 'LONG' else -1
-
-    # FAST: la candela precedente non deve avere lo stesso colore; i valori
-    # vengono confrontati con le medesime soglie usate dalla strategia LIVE.
-    if candle_color(prev1) == direction:
-        fast_reason = 'precedente gia nella direzione'
-    elif metrics['body'] < FAST_BODY_ATR_MIN:
-        fast_reason = 'corpo LIVE sotto minimo'
-    elif metrics['body_fraction'] < FAST_BODY_FRACTION_MIN:
-        fast_reason = 'corpo LIVE poco pieno'
-    elif metrics['wick'] > FAST_WICK_MAX:
-        fast_reason = 'wick FAST eccessiva'
-    else:
-        fast_reason = 'struttura FAST VALIDA'
-    counters['DET FAST: ' + fast_reason] += 1
-
-    # TREND: le verifiche rispecchiano l'ordine delle condizioni gia' usate
-    # dalla strategia corrente. Nessuna variabile diagnostica entra nella decisione.
-    if prev2_metrics is None or prev1_metrics is None:
-        trend_reason = 'prime due: colori non concordi'
-    elif (prev2_metrics['body'] < TREND_PREV_BODY_ATR_MIN or
-          prev1_metrics['body'] < TREND_PREV_BODY_ATR_MIN):
-        trend_reason = 'prime due: corpo ATR insufficiente'
-    elif (prev2_metrics['body_fraction'] < TREND_PREV_BODY_FRACTION_MIN or
-          prev1_metrics['body_fraction'] < TREND_PREV_BODY_FRACTION_MIN):
-        trend_reason = 'prime due: pienezza insufficiente'
-    elif (prev2_metrics['upper_wick_range'] > TREND_UPPER_WICK_MAX_RANGE or
-          prev2_metrics['lower_wick_range'] > TREND_LOWER_WICK_MAX_RANGE or
-          prev1_metrics['upper_wick_range'] > TREND_UPPER_WICK_MAX_RANGE or
-          prev1_metrics['lower_wick_range'] > TREND_LOWER_WICK_MAX_RANGE):
-        trend_reason = 'prime due: wick eccessive'
-    elif (sign * (prev1['c']-prev2['c']) <= 0 or
-          sign * (live['c']-prev1['c']) <= 0):
-        trend_reason = 'chiusure non progressive'
-    elif metrics['body'] < TREND_BODY_ATR_MIN:
-        trend_reason = 'terza LIVE: corpo ATR insufficiente'
-    elif metrics['body'] < (TREND_THIRD_MIN_VS_PREV_AVG *
-                            (prev2_metrics['body']+prev1_metrics['body'])/2.):
-        trend_reason = 'terza LIVE: sotto 80pct media corpi'
-    elif metrics['body_fraction'] < TREND_BODY_FRACTION_MIN:
-        trend_reason = 'terza LIVE: pienezza insufficiente'
-    elif (metrics['upper_wick_range'] > TREND_UPPER_WICK_MAX_RANGE or
-          metrics['lower_wick_range'] > TREND_LOWER_WICK_MAX_RANGE):
-        trend_reason = 'terza LIVE: wick eccessive'
-    else:
-        trend_reason = 'struttura TREND VALIDA'
-    counters['DET TREND: ' + trend_reason] += 1
-
-    # Indicatori NON ESCLUSIVI della forma: utili anche quando un altro
-    # requisito e' gia' fallito. Vengono calcolati solo se la coppia delle
-    # prime due candele ha il colore corretto rispetto al trend 1H.
-    if prev2_metrics is not None and prev1_metrics is not None:
-        counters['DET TREND test: due chiuse stesso colore'] += 1
-        if (prev2_metrics['body'] < TREND_PREV_BODY_ATR_MIN or
-                prev1_metrics['body'] < TREND_PREV_BODY_ATR_MIN):
-            counters['DET TREND test: corpo prime due debole'] += 1
-        if (prev2_metrics['body_fraction'] < TREND_PREV_BODY_FRACTION_MIN or
-                prev1_metrics['body_fraction'] < TREND_PREV_BODY_FRACTION_MIN):
-            counters['DET TREND test: pienezza prime due scarsa'] += 1
-        if (prev2_metrics['upper_wick_range'] > TREND_UPPER_WICK_MAX_RANGE or
-                prev2_metrics['lower_wick_range'] > TREND_LOWER_WICK_MAX_RANGE or
-                prev1_metrics['upper_wick_range'] > TREND_UPPER_WICK_MAX_RANGE or
-                prev1_metrics['lower_wick_range'] > TREND_LOWER_WICK_MAX_RANGE):
-            counters['DET TREND test: wick prime due lunghe'] += 1
-        if (sign * (prev1['c']-prev2['c']) <= 0 or
-                sign * (live['c']-prev1['c']) <= 0):
-            counters['DET TREND test: progressione non valida'] += 1
-        if (metrics['body'] < TREND_THIRD_MIN_VS_PREV_AVG *
-                (prev2_metrics['body']+prev1_metrics['body'])/2.):
-            counters['DET TREND test: terza piccola vs prime due'] += 1
-    if metrics['body'] < TREND_BODY_ATR_MIN:
-        counters['DET TREND test: terza corpo sotto minimo'] += 1
-    if metrics['body_fraction'] < TREND_BODY_FRACTION_MIN:
-        counters['DET TREND test: terza pienezza scarsa'] += 1
-    if (metrics['upper_wick_range'] > TREND_UPPER_WICK_MAX_RANGE or
-            metrics['lower_wick_range'] > TREND_LOWER_WICK_MAX_RANGE):
-        counters['DET TREND test: terza wick lunga'] += 1
-
-
-def analyze_symbol(symbol,data,bias,btc15,btc30,btc1h,now,counters,btc_volume=None,volume_override=None):
-    """Due vie: FAST prima candela forte; TREND terza dello stesso colore.
-
-    Nessuna attesa fissa; la candela live e' valutata a ogni scansione.
-    Deduplica per simbolo/direzione/candela dopo invio Telegram riuscito.
-    """
-    c15,c1h,c4h=data['15m'],data['1h'],data['4h']
-    # Registra il volume a OGNI scansione, anche quando il trend 1H e' neutro.
-    # Altrimenti perderemmo l'inizio dell'accelerazione per mancanza di storico.
-    # BTC gia' campionato all'inizio del ciclo. Non duplicare un campione
-    # con lo stesso volume vecchio quando le altre 24 coppie finiscono il download.
-    volume=(volume_override if volume_override is not None
-            else progressive_volume_metrics(symbol,c15,now))
-    if min(len(c15),len(c1h),len(c4h))<55:
-        counters['dati insufficienti']+=1
-        return None
-    direction=trend_1h(c1h)
-    if direction=='NEUTRAL':
-        counters['trend 1H neutro']+=1
-        return None
-    sign=1 if direction=='LONG' else -1
-    live=c15[-1]
-    prev1,prev2=c15[-2],c15[-3]
-    a15=atr(c15[:-1])
-    if not a15 or a15<=0:
-        counters['ATR mancante']+=1
-        return None
-    metrics=candle_metrics(live,direction,a15)
-    if metrics is None:
-        counters['candela live contraria']+=1
-        return None
-    pace,elapsed=live_volume_ratio(c15)
-    if elapsed<LIVE_VOLUME_MIN_ELAPSED_SECONDS:
-        counters['volume live in formazione']+=1
-        return None
-
-    # FAST: prima candela direzionale dopo una candela chiusa non concorde.
-    # TREND: due candele chiuse e la terza live dello stesso colore.
-    fast=(candle_color(prev1)!=direction and
-          metrics['body']>=FAST_BODY_ATR_MIN and
-          metrics['body_fraction']>=FAST_BODY_FRACTION_MIN and
-          metrics['wick']<=FAST_WICK_MAX)
-    # TREND: 3 corpi forti e wick <=15% su entrambi i lati.
-    # Le prime 2 sono chiuse; la terza e' LIVE: non attende la chiusura.
-    # Nessun controllo volume sulle prime due; conta solo l'accelerazione LIVE.
-    prev2_metrics=candle_metrics(prev2,direction,a15)
-    prev1_metrics=candle_metrics(prev1,direction,a15)
-    trend=(prev2_metrics is not None and prev1_metrics is not None and
-           prev2_metrics['body']>=TREND_PREV_BODY_ATR_MIN and
-           prev1_metrics['body']>=TREND_PREV_BODY_ATR_MIN and
-           prev2_metrics['body_fraction']>=TREND_PREV_BODY_FRACTION_MIN and
-           prev1_metrics['body_fraction']>=TREND_PREV_BODY_FRACTION_MIN and
-           trend_shape_ok(prev2_metrics) and trend_shape_ok(prev1_metrics) and
-           sign*(prev1['c']-prev2['c'])>0 and
-           sign*(live['c']-prev1['c'])>0 and
-           metrics['body']>=TREND_BODY_ATR_MIN and
-           metrics['body']>=TREND_THIRD_MIN_VS_PREV_AVG *
-                   (prev2_metrics['body']+prev1_metrics['body'])/2. and
-           trend_shape_ok(metrics))
-    # La diagnostica e' osservativa; FAST, volume e conferme restano invariati.
-    diagnose_candle_setups(direction, live, prev1, prev2, metrics,
-                           prev1_metrics, prev2_metrics, counters)
-    # Il minimo dinamico e i campioni sufficienti rimangono obbligatori.
-    # FAST: via A (accelerazione) OPPURE via B (volume >=2.50x sostenuto).
-    # TREND: resta SOLO la via A progressiva, sulla terza candela LIVE.
-    volume_confirmation = 'PROGRESSIVO (A)'
-    if fast or trend:
-        if not volume['ready']:
-            counters['volume progressivo: campioni insufficienti']+=1
-            return None
-        if not volume['intensity_ok']:
-            counters['volume progressivo: intensita insufficiente']+=1
-            return None
-        fast_volume_ok = volume['accel_ok'] or volume['sustained_ok']
-        if fast and not fast_volume_ok:
-            counters['volume FAST: ne progressivo ne alto sostenuto']+=1
-            return None
-        # Se FAST e' vero ha precedenza sul TREND, come in V9.8.8.
-        if not fast and trend and not volume['accel_ok']:
-            counters['volume progressivo: accelerazione insufficiente']+=1
-            return None
-        if fast and not volume['accel_ok'] and volume['sustained_ok']:
-            volume_confirmation = 'ALTO SOSTENUTO (B >=2.50x)'
-    if fast:
-        mode='FAST ENTRY - PRIMA CANDELA'
-        reference=live['o']
-        max_extension=FAST_MAX_EXTENSION_ATR
-        btc_min=FAST_BTC15_BODY_ATR_MIN
-    elif trend:
-        mode='TREND ENTRY - TERZA CANDELA'
-        reference=prev2['o']
-        max_extension=TREND_MAX_EXTENSION_ATR
-        btc_min=TREND_BTC15_BODY_ATR_MIN
-    else:
-        counters['setup FAST/TREND non valido']+=1
-        return None
-
-    total_move=sign*(live['c']-reference)/a15
-    if total_move>max_extension:
-        counters['impulso troppo esteso']+=1
-        return None
-    if btc15['directional']!=direction or btc15['body_atr']<btc_min:
-        counters['BTC15 non forte/concorde']+=1
-        return None
-    # Nuovo filtro V9.9.3 SOLO per TREND: stessa logica volume progressivo
-    # della terza candela (3 osservazioni, intensita e accelerazione +12%).
-    # FAST rimane invariato: BTC15 volume solamente informativo.
-    if mode == 'TREND ENTRY - TERZA CANDELA':
-        if not btc_volume or not btc_volume['ready']:
-            counters['BTC15 TREND: campioni volume insufficienti']+=1
-            return None
-        if not btc_volume['intensity_ok']:
-            counters['BTC15 TREND: volume sotto intensita minima']+=1
-            return None
-        if not btc_volume['accel_ok']:
-            counters['BTC15 TREND: volume non progressivo']+=1
-            return None
-    # BTC1H puo' essere neutro, ma mai contrario. Bias BTC deve concordare.
-    if btc1h not in (direction,'NEUTRAL') or not bias.startswith(direction+'_'):
-        counters['BTC 1H/bias contrario']+=1
-        return None
-    if not trend_15m(c15,direction):
-        counters['EMA20/50 15m contrarie']+=1
-        return None
-    sto=stochastic(c15)
-    if sto is None or signed(sto[0]-sto[1],direction)<=0:
-        counters['stocastico contrario']+=1
-        return None
-
-    ctx=context_4h(c4h)
-    entry=live['c']
-    # Il livello e' la partenza dell'impulso, non richiede un nuovo breakout.
-    level=reference
-    stop=intelligent_stop(direction,entry,level,live,a15,c15[:-1],ctx,bias,c1h)
-    if stop is None:
-        counters['stop strutturale fuori range']+=1
-        return None
-    risk=abs(entry-stop)
-    room=available_room(c15,direction,entry,risk)
-    if room<MIN_ROOM_R*risk:
-        counters['spazio tecnico insufficiente']+=1
-        return None
-    closed_vol=closed_volume_ratio(c15)
-    # TREND: nessun vincolo sui volumi delle due candele chiuse.
-    # FAST conserva integralmente la condizione volume precedente >=0.80x.
-    if fast and closed_vol<MIN_CLOSED_VOLUME_RATIO:
-        counters['volume candela precedente insufficiente (FAST)']+=1
-        return None
-    body=metrics['body']
-    # FAST B forte e sostenuto prende il punto volume anche se non accelera.
-    # Tutti gli altri punteggi restano identici alla V9.8.8.
-    volume_quality_bonus = volume['growth']>=.25 or (fast and volume_confirmation.startswith('ALTO SOSTENUTO'))
-    quality=5+int(volume['relative_pace']>=1.10)+int(volume_quality_bonus)+int(body>=.40)+int(body>=.65)
-    # Il punteggio TREND non dipende dal volume delle prime due candele.
-    # Si conserva il peso del punto di qualita' per mantenere la stessa scala.
-    quality+=int(total_move>=.35)+(int(closed_vol>=CLOSED_VOLUME_PREFERRED) if fast else 1)
-    quality+=int(ctx==direction)+int(signed(sto[0]-sto[1],direction)>=2.)
-    quality=min(quality,13)
-    if quality<MIN_QUALITY:
-        counters['qualita insufficiente']+=1
-        return None
-    # Leva indicativa limitata a 15x; non e' un dimensionamento posizione.
-    leverage=calculate_leverage(entry,stop,quality,False)
-    targets=adaptive_targets(direction,entry,stop,a15,quality,pace,body,total_move,ctx,bias)
-    if targets is None:
-        counters['target non valido']+=1
-        return None
-    tp1,tp2,tp3,strength=targets
-    counters['segnali idonei '+mode]+=1
-    return {'direction':direction,'mode':mode,
-            'price':entry,'entry_low':entry-a15*.06,'entry_high':entry+a15*.06,
-            'sl':stop,'tp1':tp1,'tp2':tp2,'tp3':tp3,
-            'leverage':leverage,'quality':quality,'level':level,
-            'candle_time':live['t'],
-            'live_volume_pace':pace,'closed_volume_ratio':closed_vol,
-            'volume_dynamic_floor':volume['dynamic_floor'],
-            'volume_acceleration':volume['growth'],
-            'volume_confirmation':volume_confirmation,
-            'volume_relative_strength':volume['relative_pace'],
-            'live_body_atr':body,'follow_through_atr':total_move,
-            'rejection_wick_ratio':metrics['wick'],'price_progress_atr':total_move,
-            'stoch_k':sto[0],'stoch_d':sto[1],
-            'context1h':direction,'context4h':ctx,'btc':bias,
-            'btc15_direction':btc15['directional'],
-            'btc15_body_atr':btc15['body_atr'],
-            'btc15_volume_pace':btc15['volume_pace'],
-            'btc15_volume_progressive':bool(btc_volume and btc_volume['ready'] and
-                                            btc_volume['intensity_ok'] and btc_volume['accel_ok']),
-            'btc15_volume_growth':btc_volume['growth'] if btc_volume else 0.,
-            'btc30_direction':btc30,'btc1h_direction':btc1h,
-            'target_strength':strength,'check_seconds':int(elapsed),
-            'room_r':room/risk if room!=float('inf') else None}
-
-def fmt_price(v):
-    if v>=1000:return f'{v:.2f}'
-    if v>=1:return f'{v:.4f}'
-    if v>=.01:return f'{v:.6f}'
-    return f'{v:.9f}'
-
-def build_message(symbol,s):
-    pair=symbol.replace('USDT','/USDT')
-    italian_time=datetime.now(ZoneInfo('Europe/Rome')).strftime('%d/%m/%Y %H:%M:%S')
-    room=f"{s['room_r']:.2f}R" if s['room_r'] is not None else 'nessun ostacolo rilevato'
-    return (
-        f"🚀 FAST/TREND V9.9.4 (SPERIMENTALE)\n{pair} — {s['direction']}\n"
-        f"Orario Italia: {italian_time}\n"
-        f"Setup: {s['mode']} | Qualita': {s['quality']}/13\n\n"
-        f"ENTRY: {fmt_price(s['entry_low'])} - {fmt_price(s['entry_high'])}\n"
-        f"SL strutturale 15m/1H: {fmt_price(s['sl'])}\n\n"
-        f"TP1: {fmt_price(s['tp1'])}\nTP2: {fmt_price(s['tp2'])}\n"
-        f"TP3: {fmt_price(s['tp3'])}\n\n"
-        f"Leva indicativa: {s['leverage']}x\n"
-        f"Candela live in corso da: {s['check_seconds']}s\n"
-        f"Livello: {fmt_price(s['level'])}\n"
-        f"Volume LIVE: {s['live_volume_pace']:.2f}x\n"
-        f"Volume soglia dinamica: {s['volume_dynamic_floor']:.2f}x\n"
-        f"Conferma volume: {s['volume_confirmation']}\n"
-        f"Variazione velocita' volume: {s['volume_acceleration']*100:+.0f}%\n"
-        f"Volume chiuso: {s['closed_volume_ratio']:.2f}x\n"
-        f"Progressione: {s['price_progress_atr']:+.3f} ATR15\n"
-        f"Estensione: {s['follow_through_atr']:.2f} ATR15\n"
-        f"Stoch K/D: {s['stoch_k']:.1f}/{s['stoch_d']:.1f}\n"
-        f"Spazio tecnico storico: {room}\n\n"
-        f"Trend 1H: {s['context1h']} | 4H: {s['context4h']}\n"
-        f"BTC bias: {s['btc']}\n"
-        f"BTC15: {s['btc15_direction']} (corpo {s['btc15_body_atr']:.2f} ATR) | BTC1H: {s['btc1h_direction']}\n"
-        f"BTC15 volume progressivo: {'SI' if s['btc15_volume_progressive'] else 'NO'} "
-        f"(+{s['btc15_volume_growth']*100:.0f}% ritmo; obbligatorio solo TREND)\n"
-        f"BTC30 informativo: {s['btc30_direction']}\n"
-        'Segnale anticipato non validato. Stop e leva non garantiscono protezione da liquidazione.'
-    )
-
-def should_send(symbol,signal):
-    now=time.time()
-    for key,ts in list(signal_state.items()):
-        if now-ts>12*3600:
-            del signal_state[key]
-    key=(symbol,signal['direction'],signal['candle_time'])
-    return key not in signal_state
-
-def scan_market():
-    """Scansiona le 25 coppie IN MEMORIA ogni secondo; nessuna chiamata REST."""
-    global last_diag, last_scan_log
-    started = time.monotonic()
-    counters = Counter()
-    market, btc30_candles = market_snapshot()
-    now = time.monotonic()
-    btc_data = market.get('BTCUSDT')
-    if btc_data is None:
-        if now-last_scan_log >= SCAN_LOG_EVERY_SECONDS:
-            print('WS: BTC15 non disponibile/fresco; segnali sospesi fino al recupero', flush=True)
-            last_scan_log = now
-        return
-
-    btc_volume = progressive_volume_metrics('BTCUSDT', btc_data['15m'], now)
-    bias = btc_bias(btc_data)
-    btc15 = btc15_direction(btc_data)
-    btc30 = btc_30m_direction(btc30_candles) if btc30_candles else 'NEUTRAL'
-    btc1h = trend_1h(btc_data['1h'])
-    btc_vol_status = 'OK' if (btc_volume['ready'] and btc_volume['intensity_ok']
-                              and btc_volume['accel_ok']) else 'NON CONFERMATO'
-
-    successful = 0
-    for symbol in SYMBOLS:
-        if symbol not in market:
-            counters['WS dato assente/stale'] += 1
-            continue
-        try:
-            successful += 1
-            data = market[symbol]
-            signal = analyze_symbol(symbol, data, bias, btc15, btc30, btc1h, now, counters,
-                                    btc_volume=btc_volume,
-                                    volume_override=btc_volume if symbol == 'BTCUSDT' else None)
-            if signal and queue_signal(symbol, signal):
-                print(symbol, 'FAST/TREND V9.9.4', signal['direction'], signal['mode'], flush=True)
-            trend = trend_1h(data['1h'])
-            last_observed[symbol] = {'price': data['15m'][-1]['c'], 'direction': trend}
-        except Exception as exc:
-            print(symbol, 'ERRORE analisi:', exc, flush=True)
-            if symbol in pending:
-                invalidate(symbol, 'errore analisi', counters)
-
-    elapsed = time.monotonic()-started
-    if time.monotonic()-last_scan_log >= SCAN_LOG_EVERY_SECONDS:
-        print(f"BTC: {bias} | BTC15: {btc15['directional']} "
-              f"({btc15['body_atr']:.2f} ATR) | BTC15VOL: {btc_vol_status} "
-              f"| BTC30: {btc30} | BTC1H: {btc1h}", flush=True)
-        print(f'Scansione WS: {successful}/25 coppie | elaborazione {elapsed:.3f}s '
-              f'| intervallo {SCAN_SECONDS}s | FAST/TREND attivi', flush=True)
-        last_scan_log = time.monotonic()
-    diagnostic_totals.update(counters)
-    diagnostic_since_last.update(counters)
-    if time.monotonic()-last_diag >= DIAGNOSTIC_EVERY_SECONDS:
-        primary_scan = {k:v for k,v in counters.items() if not k.startswith('DET ')}
-        primary_total = {k:v for k,v in diagnostic_totals.items() if not k.startswith('DET ')}
-        detail_window = {k:v for k,v in diagnostic_since_last.items() if k.startswith('DET ')}
-        print('DIAGNOSTICA V9.9.4 (questa scansione):', primary_scan, flush=True)
-        print('DIAGNOSTICA V9.9.4 (cumulativa dall avvio):', primary_total, flush=True)
-        print('DETTAGLIO CANDELE V9.9.4 (circa ultimi 60s):',
-              dict(sorted(detail_window.items(), key=lambda item:(-item[1], item[0]))), flush=True)
-        print('NOTA: DET FAST/TREND = primo ostacolo per modalita; DET test = non esclusivo.', flush=True)
-        diagnostic_since_last.clear()
-        last_diag = time.monotonic()
-
-
-def main():
-    print('CryptoSignalAI V9.9.4 - WEBSOCKET 25 coppie ogni secondo | strategia V9.9.3 invariata', flush=True)
-    send_telegram(
-        'CryptoSignalAI V9.9.4 - SCANSIONE WEBSOCKET 1s (SPERIMENTALE)\n'
-        'Strategia FAST/TREND IDENTICA a V9.9.3.\n'
-        '25 coppie Binance Futures, candele 15m aggiornate in streaming.\n'
-        'TREND: 3 corpi >=0.35 ATR15, pieni >=80%, wick <=15% per lato; volume progressivo sulla terza LIVE.\n'
-        'BTC15 TREND >=0.20 ATR + volume progressivo obbligatorio (+12%).\n'
-        'FAST invariato, BTC15 FAST >=0.30 ATR.\n'
-        'Analisi ogni 1s in RAM; nessuna chiamata REST a ogni ciclo.\n'
-        'Storico e 1H/4H via REST in background; stop segnali se WS diventa obsoleto.\n'
-        'SL/TP, leva, filtri e diagnostica INVARIATI. Non validato: testare in simulazione.')
-    # Inizializza lo storico una sola volta; non inizia ad analizzare dati incompleti.
-    while True:
-        try:
-            bootstrap_history()
-            break
-        except Exception as exc:
-            print('ERRORE bootstrap:', exc, '| nuovo tentativo fra 20s', flush=True)
-            time.sleep(20)
-    threading.Thread(target=telegram_sender_worker, name='telegram-out', daemon=True).start()
-    threading.Thread(target=rest_maintenance_worker, name='rest-maint', daemon=True).start()
-    threading.Thread(target=ws_connection_worker, name='binance-ws', daemon=True).start()
-    target = time.monotonic()
-    while True:
-        target += SCAN_SECONDS
-        try:
-            scan_market()
-        except Exception as exc:
-            print('Errore scansione generale:', exc, flush=True)
-            pending.clear()
-        remaining = target-time.monotonic()
-        if remaining > 0:
-            time.sleep(remaining)
-        else:
-            # Se Python e' in ritardo, non accodiamo scansioni vecchie.
-            target = time.monotonic()
-
-if __name__ == '__main__':
-    main()
+import base64,bz2,hashlib
+CODICE_COMPRESSO=(
+"QlpoOTFBWSZTWb8+5hMAFW7/4fZUQAB6/////////r////9AAAQQkABAAGBNns5OjettvOO68x7vuLxoSo9DQ9jSDpy4LoZCuzPXoHX1YNgd88dB4iAfWlCv"
+"l5fTb16Z2uvveNnbvvZ9uHfB9vmXYLM+wHubb2u53uub1Pfe9et10986MrU+sOO729zy59w+fVvXYvnd3a9O6260rt117t5uAU9nte3WrVnp7pvMNubVxffP"
+"c8fbe3q62e7e7PZ2rl573d71kBm1wn3xw7xm3d195jmSPbd6Zxu5eozwc9xp7vbu916965puwbtNbe3uJ6xp99w00QCAEAJghME0aEZNGJTxJmkaaep6T1NP"
+"UNDRkGEpoETQgQSqf4hipp+qnqNtNTZUfqaT1MNTQehqaAHoNIaGICQiITUyaEzVPUp/qjU9pqnp6nkpk9TZpqT9KGnhTQNPUDQAAAEmkiSYQhoRkZGqep5T"
+"Qeo9QaGgA0GgDJoAAACJIgjQho0AE0CTMp5U9poJPTRqZpM1NoQAGgeoaaBEiIECDQSp/opT0/UyptE0zQ0aRiME2o0MgYJgTBMakVV6CIqMICDzgb3xvR1f"
+"4/o++/3dH+dFBX7Gxd0XhTlH8y/Sv1oKv3RsuaetO/PVg6sBu57EJhJ084WF1iNkdETT7Kka7VGUH6sP1PlcdXMY1rg7VzBsdsmYF/phB0dlVvBQ/ucHvqC/"
+"NHP9P7YsduXIzw6+6uTZiTdzR57K/zumLOScL7oPO1p7ZihU2kXqZUS805lYpwwvPJGavGQQrNb7rC36JhKE3pVZpeVt0J0uE/NDok567UV8Jvi4fwLMus03"
+"Vz+CxvirPwcikJhaqVugwcUEdb8LPZ/1W9O+mPHpE4qNxQTUPxcJGVjh/Lrzm9fje+cxwOdkcQ6TVzt1u7bhHtjXKr7F0rG6S/k4z30UxwswjPZ57YuOifbx"
+"HdOmOE/36xQ/8tz1NhoTM2ZbbdT4HbK0hK8rrLMMc61Jd8wq6sjfGZrkU3sbwOZKruI1t5GFlcXkXuyNrbY2GhpKWrIqAGa6K6a8IsUpcCHVWYOqfctttx6K"
+"TbQAvkERbj4P+z6yUQiEOyR55hhK05yNEVBEzlc4KSgw7rQbKmO6ymGjSt12+w6Tv6UN/P4ysLSlNJPnnsjtPRwtc5ze2rHn2YxTKnX5d9tXcPbwEPs6IW2v"
+"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"
+)
+sorgente=bz2.decompress(base64.b64decode(CODICE_COMPRESSO))
+assert hashlib.sha256(sorgente).hexdigest()=="b58f33763f67fd8b8bc84b0099240ff6576d9d949d2eccfd3c3310ea52ca06b2"
+exec(compile(sorgente,"main.py","exec"))
