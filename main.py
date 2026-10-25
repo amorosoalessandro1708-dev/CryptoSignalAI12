@@ -1,4 +1,4 @@
-# V10.1 SNELLA: segnalazione FAST/TREND; diagnostica shadow rimossa
+# V10.1.1 SNELLA: Stocastico in rafforzamento obbligatorio solo su TREND
 import os
 import time
 import json
@@ -37,6 +37,7 @@ MIN_QUALITY = 9
 STOCH_K_PERIOD = 14
 STOCH_K_SMOOTH = 3
 STOCH_D_PERIOD = 3
+STOCH_TREND_MIN_STRENGTHENING = 0.5  # incremento minimo punti K-D vs seconda candela chiusa
 BTC15_DIRECTIONAL_BODY_ATR_MIN = 0.2
 BTC30_DIRECTIONAL_BODY_ATR_MIN = 0.15
 SL_STRUCTURE_LOOKBACK_BARS = 12
@@ -691,6 +692,19 @@ def analyze_symbol(symbol, data, bias, btc15, btc30, btc1h, now, counters, btc_v
     if sto is None or signed(sto[0] - sto[1], direction) <= 0:
         counters['stocastico contrario'] += 1
         return None
+    stoch_strength_delta = None
+    if mode == 'TREND ENTRY - TERZA CANDELA':
+        # Confronta la terza candela LIVE con la seconda gia chiusa.
+        previous_sto = stochastic(c15[:-1])
+        if previous_sto is None:
+            counters['stocastico TREND: storico insufficiente'] += 1
+            return None
+        previous_gap = signed(previous_sto[0] - previous_sto[1], direction)
+        live_gap = signed(sto[0] - sto[1], direction)
+        stoch_strength_delta = live_gap - previous_gap
+        if stoch_strength_delta < STOCH_TREND_MIN_STRENGTHENING:
+            counters['stocastico TREND: non si rafforza'] += 1
+            return None
     ctx = context_4h(c4h)
     entry = live['c']
     level = reference
@@ -723,7 +737,7 @@ def analyze_symbol(symbol, data, bias, btc15, btc30, btc1h, now, counters, btc_v
         return None
     tp1, tp2, tp3, strength = targets
     counters['segnali idonei ' + mode] += 1
-    return {'direction': direction, 'mode': mode, 'price': entry, 'entry_low': entry - a15 * 0.06, 'entry_high': entry + a15 * 0.06, 'sl': stop, 'tp1': tp1, 'tp2': tp2, 'tp3': tp3, 'leverage': leverage, 'quality': quality, 'level': level, 'candle_time': live['t'], 'live_volume_pace': pace, 'closed_volume_ratio': closed_vol, 'volume_dynamic_floor': volume['dynamic_floor'], 'volume_acceleration': volume['growth'], 'volume_confirmation': volume_confirmation, 'volume_relative_strength': volume['relative_pace'], 'live_body_atr': body, 'follow_through_atr': total_move, 'trend_bodies_atr': (round(prev2_metrics['body'], 3), round(prev1_metrics['body'], 3), round(body, 3)) if trend and (not fast) else None, 'trend_body_regime': trend_body_regime(prev2_metrics['body'], prev1_metrics['body'], body) if trend and (not fast) else None, 'rejection_wick_ratio': metrics['wick'], 'price_progress_atr': total_move, 'stoch_k': sto[0], 'stoch_d': sto[1], 'context1h': direction, 'context4h': ctx, 'btc': bias, 'btc15_direction': btc15['directional'], 'btc15_body_atr': btc15['body_atr'], 'btc15_volume_pace': btc15['volume_pace'], 'btc15_volume_progressive': bool(btc_volume and btc_volume['ready'] and btc_volume['intensity_ok'] and btc_volume['accel_ok']), 'btc15_volume_growth': btc_volume['growth'] if btc_volume else 0.0, 'btc30_direction': btc30, 'btc1h_direction': btc1h, 'target_strength': strength, 'check_seconds': int(elapsed), 'room_r': room / risk if room != float('inf') else None}
+    return {'direction': direction, 'mode': mode, 'price': entry, 'entry_low': entry - a15 * 0.06, 'entry_high': entry + a15 * 0.06, 'sl': stop, 'tp1': tp1, 'tp2': tp2, 'tp3': tp3, 'leverage': leverage, 'quality': quality, 'level': level, 'candle_time': live['t'], 'live_volume_pace': pace, 'closed_volume_ratio': closed_vol, 'volume_dynamic_floor': volume['dynamic_floor'], 'volume_acceleration': volume['growth'], 'volume_confirmation': volume_confirmation, 'volume_relative_strength': volume['relative_pace'], 'live_body_atr': body, 'follow_through_atr': total_move, 'trend_bodies_atr': (round(prev2_metrics['body'], 3), round(prev1_metrics['body'], 3), round(body, 3)) if trend and (not fast) else None, 'trend_body_regime': trend_body_regime(prev2_metrics['body'], prev1_metrics['body'], body) if trend and (not fast) else None, 'rejection_wick_ratio': metrics['wick'], 'price_progress_atr': total_move, 'stoch_k': sto[0], 'stoch_d': sto[1], 'stoch_strength_delta': stoch_strength_delta, 'context1h': direction, 'context4h': ctx, 'btc': bias, 'btc15_direction': btc15['directional'], 'btc15_body_atr': btc15['body_atr'], 'btc15_volume_pace': btc15['volume_pace'], 'btc15_volume_progressive': bool(btc_volume and btc_volume['ready'] and btc_volume['intensity_ok'] and btc_volume['accel_ok']), 'btc15_volume_growth': btc_volume['growth'] if btc_volume else 0.0, 'btc30_direction': btc30, 'btc1h_direction': btc1h, 'target_strength': strength, 'check_seconds': int(elapsed), 'room_r': room / risk if room != float('inf') else None}
 def fmt_price(v):
     if v >= 1000:
         return f'{v:.2f}'
@@ -739,8 +753,9 @@ def build_message(symbol, s):
     adapt = s.get('adaptive')
     adaptive_note = f"V10 PROGRESSIVO (solo osservazione): {adapt['score']}/100, \nregime {adapt['regime']}, fattori in miglioramento {adapt['improving']}/6\n" if adapt else ''
     trend_bodies = s.get('trend_bodies_atr')
+    strength_note = f"Stoch rafforzamento TREND: +{s['stoch_strength_delta']:.2f} punti K-D\n" if s.get('stoch_strength_delta') is not None else ''
     body_note = f"Corpi 1/2/3: {trend_bodies[0]:.2f} / {trend_bodies[1]:.2f} / {trend_bodies[2]:.2f} ATR | {s['trend_body_regime']}\n" if trend_bodies else ''
-    return f"🚀 FAST/TREND V10.1.0 (SPERIMENTALE)\n{pair} — {s['direction']}\nOrario Italia: {italian_time}\nSetup: {s['mode']} | Qualita': {s['quality']}/13\n\nENTRY: {fmt_price(s['entry_low'])} - {fmt_price(s['entry_high'])}\nSL strutturale 15m/1H: {fmt_price(s['sl'])}\n\nTP1: {fmt_price(s['tp1'])}\nTP2: {fmt_price(s['tp2'])}\nTP3: {fmt_price(s['tp3'])}\n\nLeva indicativa: {s['leverage']}x\nCandela live in corso da: {s['check_seconds']}s\nLivello: {fmt_price(s['level'])}\nVolume LIVE: {s['live_volume_pace']:.2f}x\nVolume soglia dinamica: {s['volume_dynamic_floor']:.2f}x\nConferma volume: {s['volume_confirmation']}\nVariazione velocita' volume: {s['volume_acceleration'] * 100:+.0f}%\nVolume chiuso: {s['closed_volume_ratio']:.2f}x\nProgressione: {s['price_progress_atr']:+.3f} ATR15\n{body_note}Estensione: {s['follow_through_atr']:.2f} ATR15\nStoch K/D: {s['stoch_k']:.1f}/{s['stoch_d']:.1f}\nSpazio tecnico storico: {room}\n\nTrend 1H: {s['context1h']} | 4H: {s['context4h']}\nBTC bias: {s['btc']}\nBTC15: {s['btc15_direction']} (corpo {s['btc15_body_atr']:.2f} ATR) | BTC1H: {s['btc1h_direction']}\nBTC15 volume progressivo: {('SI' if s['btc15_volume_progressive'] else 'NO')} (+{s['btc15_volume_growth'] * 100:.0f}% ritmo; obbligatorio solo TREND)\nBTC30 informativo: {s['btc30_direction']}\n{adaptive_note}Segnale anticipato non validato. Stop e leva non garantiscono protezione da liquidazione."
+    return f"🚀 FAST/TREND V10.1.1 (SPERIMENTALE)\n{pair} — {s['direction']}\nOrario Italia: {italian_time}\nSetup: {s['mode']} | Qualita': {s['quality']}/13\n\nENTRY: {fmt_price(s['entry_low'])} - {fmt_price(s['entry_high'])}\nSL strutturale 15m/1H: {fmt_price(s['sl'])}\n\nTP1: {fmt_price(s['tp1'])}\nTP2: {fmt_price(s['tp2'])}\nTP3: {fmt_price(s['tp3'])}\n\nLeva indicativa: {s['leverage']}x\nCandela live in corso da: {s['check_seconds']}s\nLivello: {fmt_price(s['level'])}\nVolume LIVE: {s['live_volume_pace']:.2f}x\nVolume soglia dinamica: {s['volume_dynamic_floor']:.2f}x\nConferma volume: {s['volume_confirmation']}\nVariazione velocita' volume: {s['volume_acceleration'] * 100:+.0f}%\nVolume chiuso: {s['closed_volume_ratio']:.2f}x\nProgressione: {s['price_progress_atr']:+.3f} ATR15\n{body_note}Estensione: {s['follow_through_atr']:.2f} ATR15\nStoch K/D: {s['stoch_k']:.1f}/{s['stoch_d']:.1f}\n{strength_note}Spazio tecnico storico: {room}\n\nTrend 1H: {s['context1h']} | 4H: {s['context4h']}\nBTC bias: {s['btc']}\nBTC15: {s['btc15_direction']} (corpo {s['btc15_body_atr']:.2f} ATR) | BTC1H: {s['btc1h_direction']}\nBTC15 volume progressivo: {('SI' if s['btc15_volume_progressive'] else 'NO')} (+{s['btc15_volume_growth'] * 100:.0f}% ritmo; obbligatorio solo TREND)\nBTC30 informativo: {s['btc30_direction']}\n{adaptive_note}Segnale anticipato non validato. Stop e leva non garantiscono protezione da liquidazione."
 def scan_market():
     global last_scan_log, last_diag
     now = time.monotonic()
@@ -774,7 +789,7 @@ def scan_market():
         diagnostic_totals.clear()
         last_diag = now
 def main():
-    print('CryptoSignalAI V10.1 SNELLA - FAST/TREND 25 coppie | WebSocket 1s', flush=True)
+    print('CryptoSignalAI V10.1.1 SNELLA - Stoch TREND progressivo | FAST/TREND 25 coppie | WebSocket 1s', flush=True)
     while True:
         try:
             bootstrap_history()
@@ -785,7 +800,7 @@ def main():
     threading.Thread(target=telegram_sender_worker, daemon=True).start()
     threading.Thread(target=rest_maintenance_worker, daemon=True).start()
     threading.Thread(target=ws_connection_worker, daemon=True).start()
-    send_telegram('Bot V10.1 SNELLA sperimentale avviato. FAST/TREND, 25 crypto, WebSocket 1s. Usare in simulazione.')
+    send_telegram('Bot V10.1.1 SNELLA avviato. Stocastico in rafforzamento su TREND (+0.5 punti K-D); FAST invariato. 25 crypto, WebSocket 1s. Usare in simulazione.')
     next_scan = time.monotonic()
     while True:
         next_scan += SCAN_SECONDS
