@@ -551,7 +551,7 @@ def scan_market():
 
 def main():
     log('CryptoSignalAI RESET - 1 solo segnale LONG/SHORT | 25 crypto WS 1s')
-    log('PARAMETRI: corpo>=90%, wick direzionale<=3%, opposto<=5%,',
+    log('PARAMETRI: corpo>=90%, wick direzionale<=4%, opposto<=6%,',
         'close>=95%, corpo>=0.8ATR15, volume pace>=2.50x, BTC15 concorde,',
         'SL=5 candele 1H chiuse +0.20 ATR1H; TP1=0.30R, TP2=0.45R, TP3=0.60R')
     if not BOT_TOKEN or not CHAT_ID:
