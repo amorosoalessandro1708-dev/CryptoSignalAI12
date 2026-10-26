@@ -1,16 +1,21 @@
-"""CryptoSignalAI RESET: un unico segnale FAST CANDLE LONG/SHORT.
+"""CryptoSignalAI MOMENTUM ONE - segnale LONG/SHORT sulla prima candela forte.
 
-Strategia sperimentale NON validata, da usare prima in simulazione.
-Requisiti per entrambi i versi, sulla candela 15m LIVE:
-- corpo >=90% del range e >=0.80 ATR(14) su candele precedenti CHIUSE;
-- wick in direzione del movimento <=4% del range; altro wick <=6%;
-- prezzo nel 5% finale del range, verso la direzione del movimento;
-- volume progressivo >=2.50 volte media 10 candele 15m CHIUSE;
-- BTC 15m LIVE nella medesima direzione (prezzo vs apertura).
-Analisi ogni ~1s su dati WebSocket Binance Futures; 25 coppie.
-SL largo sotto/sopra gli estremi delle ultime 5 candele 1H CHIUSE + 0.20 ATR1H.
-TP1=0.30R, TP2=0.45R, TP3=0.60R.
-Nessun altro indicatore, trend, punteggio o filtro di ingresso.
+Strategia SPERIMENTALE, NON validata. Solo avvisi informativi Telegram.
+25 coppie Binance USD-M Futures, WebSocket 15m, scansione circa 1 secondo.
+
+Ingresso su candela 15m LIVE (entrambi i versi):
+- corpo >= 0.65 ATR15 calcolato sulle candele CHIUSE;
+- corpo >= 82% del range, wick direzionale <= 8%, opposto <= 10%;
+- volume PROGRESSIVO >= 1.80 volte media delle 10 precedenti 15m chiuse;
+- almeno 60 secondi trascorsi dall'apertura della candela;
+- conferma ininterrotta delle condizioni per almeno 10 secondi;
+- prezzo live oltre massimo/minimo della precedente candela 15m CHIUSA;
+- BTC15 concorde O neutro (neutro = corpo live < 0.20 ATR15).
+
+SL strutturale: ultime 5 candele 1H CHIUSE +/- 0.20 ATR1H.
+TP1=0.30R, TP2=0.80R, TP3=1.50R. Uno stesso alert massimo per coppia/candela.
+Nessun EMA/MACD/Stoch, no 1H/4H come filtri direzionali, nessun retest.
+Gli SL/TP sono livelli informativi: questo bot NON apre ordini e NON imposta stop in borsa.
 """
 
 import json
@@ -38,15 +43,17 @@ SYMBOLS = [
     'FILUSDT', 'ETCUSDT', 'AAVEUSDT', 'TIAUSDT', 'SEIUSDT',
 ]
 
-# Gli UNICI criteri per il segnale
+# Soli filtri di INGRESSO (uguali per LONG e SHORT)
 SCAN_SECONDS = 1.0
 TIMEFRAME_SECONDS = 15 * 60
-BODY_FRACTION_MIN = 0.90
-LEADING_WICK_MAX = 0.04    # LONG sopra; SHORT sotto
-TRAILING_WICK_MAX = 0.06   # LONG sotto; SHORT sopra
-CLOSE_POSITION_MIN = 0.95  # LONG parte superiore; SHORT parte inferiore
-BODY_ATR_MIN = 0.80
-VOLUME_RATIO_MIN = 2.50
+BODY_FRACTION_MIN = 0.82
+LEADING_WICK_MAX = 0.08     # LONG wick alto; SHORT wick basso
+TRAILING_WICK_MAX = 0.10    # LONG wick basso; SHORT wick alto
+BODY_ATR_MIN = 0.65
+VOLUME_RATIO_MIN = 1.80
+MIN_CANDLE_AGE_SECONDS = 60.0
+CONFIRM_SECONDS = 10.0
+BTC_NEUTRAL_BODY_ATR_MAX = 0.20  # neutralita' di BTC 15m live
 ATR_PERIOD = 14
 VOLUME_AVG_BARS = 10
 
@@ -54,8 +61,8 @@ VOLUME_AVG_BARS = 10
 SL_HOURLY_LOOKBACK = 5       # 5 candele orarie complete, NON quella live
 SL_BUFFER_ATR1H = 0.20       # oltre i minimi/massimi di struttura 1H
 TP1_R = 0.30
-TP2_R = 0.45
-TP3_R = 0.60
+TP2_R = 0.80
+TP3_R = 1.50
 HOUR_MS = 60 * 60 * 1000
 FIFTEEN_MIN_MS = TIMEFRAME_SECONDS * 1000
 
@@ -85,6 +92,7 @@ sent_alerts = set()           # (symbol, apertura della candela)
 pending_alerts = set()
 failed_alert_times = {}
 telegram_queue = queue.Queue(maxsize=100)
+confirmation_started = {}      # {(symbol, candle_t): istante monotonic primo check OK}
 
 
 def log(*parts):
@@ -363,13 +371,23 @@ def hourly_structural_stop(candles_15m, direction):
     return {'sl': sl, 'atr1h': atr1h, 'structure_extreme': extreme}
 
 
-def btc15_direction(btc_live):
-    """Unica conferma esterna: soltanto il colore della candela BTC 15m LIVE."""
-    if btc_live['c'] > btc_live['o']:
-        return 'LONG'
-    if btc_live['c'] < btc_live['o']:
-        return 'SHORT'
-    return 'NEUTRAL'
+def btc15_direction(btc_candles):
+    """BTC concorde oppure neutro; BTC opposto non neutro blocca il segnale.
+
+    BTC e' neutro se il corpo live e' <0.20 ATR15 sulle sole chiuse.
+    Se l'ATR non e' disponibile, restituisce None: niente segnali.
+    Non richiede volume BTC, medie o conferme 1H.
+    """
+    if len(btc_candles) < ATR_PERIOD + 2:
+        return None
+    atr15 = true_range_atr(btc_candles[:-1])
+    if atr15 is None or atr15 <= 0:
+        return None
+    live = btc_candles[-1]
+    displacement = live['c'] - live['o']
+    if abs(displacement) / atr15 < BTC_NEUTRAL_BODY_ATR_MAX:
+        return 'NEUTRAL'
+    return 'LONG' if displacement > 0 else 'SHORT'
 
 
 def analyze_candle(symbol, candles, btc_direction, now_ms):
@@ -383,7 +401,18 @@ def analyze_candle(symbol, candles, btc_direction, now_ms):
     if closing == opening:
         return None
     direction = 'LONG' if closing > opening else 'SHORT'
-    if btc_direction != direction:
+    if btc_direction not in (direction, 'NEUTRAL'):
+        return None
+    elapsed = (now_ms - current['t']) / 1000.0
+    if elapsed < MIN_CANDLE_AGE_SECONDS:
+        return None
+    previous = candles[-2]
+    if previous['t'] + FIFTEEN_MIN_MS != current['t']:
+        return None
+    # Breakout REALE sulla candela LIVE: oltre il massimo/minimo della precedente.
+    if direction == 'LONG' and closing <= previous['h']:
+        return None
+    if direction == 'SHORT' and closing >= previous['l']:
         return None
     span = current['h'] - current['l']
     if span <= 0:
@@ -397,9 +426,6 @@ def analyze_candle(symbol, candles, btc_direction, now_ms):
     leading_wick = upper_wick if direction == 'LONG' else lower_wick
     trailing_wick = lower_wick if direction == 'LONG' else upper_wick
     if leading_wick > LEADING_WICK_MAX or trailing_wick > TRAILING_WICK_MAX:
-        return None
-    close_position = ((closing-current['l']) / span) if direction == 'LONG' else ((current['h']-closing) / span)
-    if close_position < CLOSE_POSITION_MIN:
         return None
     atr15 = true_range_atr(candles[:-1])
     if not atr15 or body / atr15 < BODY_ATR_MIN:
@@ -416,9 +442,9 @@ def analyze_candle(symbol, candles, btc_direction, now_ms):
         'candle_start': current['t'], 'candle_high': current['h'],
         'candle_low': current['l'], 'body_fraction': body_fraction,
         'body_atr': body / atr15, 'leading_wick': leading_wick,
-        'trailing_wick': trailing_wick, 'close_position': close_position,
+        'trailing_wick': trailing_wick,
         'volume_pace': volume_pace, 'btc_direction': btc_direction,
-        'elapsed': min(TIMEFRAME_SECONDS, max(0.0, (now_ms - current['t']) / 1000)),
+        'elapsed': elapsed,
         'atr15': atr15, 'sl': hourly_stop['sl'],
         'atr1h': hourly_stop['atr1h'],
         'structure_extreme': hourly_stop['structure_extreme'],
@@ -436,7 +462,7 @@ def price_format(price):
 
 
 def message_for(signal):
-    """SL su 5 candele 1H chiuse, TP1/2/3 in R; nessuna leva consigliata."""
+    """SL basato su 5 candele 1H chiuse; TP in R, no ordini automatici."""
     s = signal
     d = 1 if s['direction'] == 'LONG' else -1
     sl = s['sl']
@@ -447,24 +473,26 @@ def message_for(signal):
     now_italy = datetime.now(ITALY).strftime('%d/%m/%Y %H:%M:%S')
     candle_italy = datetime.fromtimestamp(s['candle_start'] / 1000, ITALY).strftime('%H:%M')
     return (
-        f"FAST CANDLE 15M - {s['direction']} [TEST]\n"
+        f"MOMENTUM ONE 15M - {s['direction']} [SIMULAZIONE]\n"
         f"{s['symbol'].replace('USDT', '/USDT')}\n"
         f"Orario Italia: {now_italy}\n"
         f"Candela LIVE iniziata alle: {candle_italy}\n"
         f"ENTRY indicativa: {price_format(s['entry'])}\n"
         f"SL largo 1H (5 candele chiuse + 0.20 ATR1H): {price_format(sl)}\n"
         f"TP1 (0.30R): {price_format(tp1)}\n"
-        f"TP2 (0.45R): {price_format(tp2)}\n"
-        f"TP3 (0.60R): {price_format(tp3)}\n\n"
+        f"TP2 (0.80R): {price_format(tp2)}\n"
+        f"TP3 (1.50R): {price_format(tp3)}\n\n"
         f"Corpo pieno: {s['body_fraction']*100:.1f}%\n"
         f"Corpo / ATR15: {s['body_atr']:.2f}x\n"
-        f"Wick direzionale: {s['leading_wick']*100:.1f}% (max 4%)\n"
-        f"Wick opposto: {s['trailing_wick']*100:.1f}% (max 6%)\n"
-        f"Volume progressivo: {s['volume_pace']:.2f}x (min 2.50x)\n"
-        f"BTC 15m LIVE: {s['btc_direction']}\n"
-        f"Tempo candela: {s['elapsed']:.0f}s\n"
+        f"Wick direzionale: {s['leading_wick']*100:.1f}% (max 8%)\n"
+        f"Wick opposto: {s['trailing_wick']*100:.1f}% (max 10%)\n"
+        f"Volume progressivo: {s['volume_pace']:.2f}x (min 1.80x)\n"
+        f"Breakout: oltre max/min candela precedente\n"
+        f"BTC 15m LIVE: {s['btc_direction']} (neutro <0.20 ATR15)\n"
+        f"Tempo candela: {s['elapsed']:.0f}s, conferma >=10s\n"
         f"Strategia sperimentale. Volume proiettato e candela non ancora chiusi.\n"
-        f"SL/TP non garantiscono esecuzione o protezione da liquidazione."
+        f"Nessun ordine automatico. Rischio indicativo per operazione: massimo 0.5% capitale, "
+        f"da dimensionare manualmente; SL/TP non garantiscono esecuzione."
     )
 
 
@@ -519,28 +547,59 @@ def current_snapshot():
 
 
 def scan_market():
+    """Scansione rapida in RAM, con conferma 10s continua e deduplica.
+
+    Le candele arrivano dai WebSocket; lo scan a 1s NON significa che
+    Binance invii nuovi prezzi ogni secondo esatto.
+    """
     snapshot = current_snapshot()
     if 'BTCUSDT' not in snapshot:
+        confirmation_started.clear()
         return 0
     now_ms = int(time.time() * 1000)
-    btc_live = snapshot['BTCUSDT'][-1]
-    if not (btc_live['t'] <= now_ms < btc_live['t'] + TIMEFRAME_SECONDS * 1000):
+    btc_candles = snapshot['BTCUSDT']
+    btc_live = btc_candles[-1]
+    if not (btc_live['t'] <= now_ms < btc_live['t'] + FIFTEEN_MIN_MS):
+        confirmation_started.clear()
         return 0
-    btc_direction = btc15_direction(btc_live)
-    if btc_direction == 'NEUTRAL':
+    btc_direction = btc15_direction(btc_candles)
+    if btc_direction is None:
+        confirmation_started.clear()
         return 0
+
+    now_mono = time.monotonic()
+    valid_this_scan = set()
     queued = 0
     for symbol, candles in snapshot.items():
         if candles[-1]['t'] != btc_live['t']:
             continue
+        key = (symbol, candles[-1]['t'])
+        # Per candela/coppia una sola notifica, anche se il verso cambia.
+        with alert_lock:
+            already_queued = key in sent_alerts or key in pending_alerts
+        if already_queued:
+            continue
         signal = analyze_candle(symbol, candles, btc_direction, now_ms)
-        if signal and enqueue_alert(signal):
+        if signal is None:
+            continue
+        valid_this_scan.add(key)
+        started = confirmation_started.setdefault(key, now_mono)
+        if now_mono - started < CONFIRM_SECONDS:
+            continue
+        if enqueue_alert(signal):
             queued += 1
             log('SEGNALE', signal['direction'], symbol,
                 '| volume', f"{signal['volume_pace']:.2f}x",
-                '| corpo', f"{signal['body_fraction']*100:.1f}%")
-    # Liberiamo deduplica di sessioni vecchie, senza riavvisi nella stessa candela.
-    oldest_allowed = btc_live['t'] - 4 * 60 * 60 * 1000
+                '| corpo', f"{signal['body_fraction']*100:.1f}%",
+                '| BTC15', btc_direction)
+
+    # Ogni condizione deve restare vera a OGNI scansione per 10 secondi.
+    # Un prezzo che rientra, un BTC contrario o un feed stale azzera il timer.
+    for key in list(confirmation_started):
+        if key not in valid_this_scan:
+            del confirmation_started[key]
+
+    oldest_allowed = btc_live['t'] - 4 * HOUR_MS
     with alert_lock:
         sent_alerts.intersection_update({k for k in sent_alerts if k[1] >= oldest_allowed})
         for key in list(failed_alert_times):
@@ -550,12 +609,12 @@ def scan_market():
 
 
 def main():
-    log('CryptoSignalAI RESET - 1 solo segnale LONG/SHORT | 25 crypto WS 1s')
-    log('PARAMETRI: corpo>=90%, wick direzionale<=4%, opposto<=6%,',
-        'close>=95%, corpo>=0.8ATR15, volume pace>=2.50x, BTC15 concorde,',
-        'SL=5 candele 1H chiuse +0.20 ATR1H; TP1=0.30R, TP2=0.45R, TP3=0.60R')
+    log('CryptoSignalAI MOMENTUM ONE | solo LONG/SHORT | 25 crypto WS, scansione ~1s')
+    log('PARAMETRI: corpo >=82%, wick 8%/10%, corpo >=0.65 ATR15, volume >=1.80x;',
+        'candela >=60s, conferma >=10s, breakout precedente, BTC15 concorde/neutro;',
+        'SL 5 candele 1H chiuse +0.20 ATR1H; TP 0.30R/0.80R/1.50R')
     if not BOT_TOKEN or not CHAT_ID:
-        log('ATTENZIONE: mancano variabili ambiente Telegram; niente notifiche.')
+        log('ATTENZIONE: mancano variabili ambiente Telegram; nessuna notifica.')
     while True:
         try:
             initialize_history()
@@ -567,11 +626,12 @@ def main():
     threading.Thread(target=telegram_worker, daemon=True).start()
     threading.Thread(target=history_worker, daemon=True).start()
     threading.Thread(target=websocket_worker, daemon=True).start()
-    send_telegram('CryptoSignalAI RESET AVVIATO. Un solo FAST CANDLE LONG/SHORT. '
-                  '25 crypto; scansione 1s; corpo 90%, wick 4%/6%, '
-                  'corpo >=0.80 ATR, volume progressivo >=2.50x, solo BTC15 concorde. '
-                  'SL 5 candele 1H chiuse + 0.20 ATR1H. TP: 0.30R / 0.45R / 0.60R. '
-                  'Strategia sperimentale: testare in simulazione.')
+    send_telegram('MOMENTUM ONE AVVIATO [SIMULAZIONE]. 25 crypto; scansione ~1s; '
+                  'candela 15m corpo >=82%, wick 8%/10%, corpo >=0.65ATR, '
+                  'volume progressivo >=1.80x, prima candela live dopo 60s e conferma >=10s. '
+                  'Breakout precedente; BTC 15m concorde o neutro (<0.20ATR). '
+                  'SL 5 candele 1H chiuse +0.20 ATR1H. TP 0.30R / 0.80R / 1.50R. '
+                  'Solo segnali, nessun ordine automatico.')
     next_scan = time.monotonic()
     last_log = next_scan
     while True:
@@ -583,8 +643,8 @@ def main():
         now = time.monotonic()
         if now - last_log >= LOG_INTERVAL_SECONDS:
             snap = current_snapshot()
-            b = btc15_direction(snap['BTCUSDT'][-1]) if 'BTCUSDT' in snap else 'DATI NON FRESCHI'
-            log('Scansione 1s | feed attivi:', len(snap), '/25 | BTC15:', b)
+            b = btc15_direction(snap['BTCUSDT']) if 'BTCUSDT' in snap else 'DATI NON FRESCHI'
+            log('Scansione ~1s | feed attivi:', len(snap), '/25 | BTC15:', b)
             last_log = now
         time.sleep(max(0.0, next_scan - time.monotonic()))
         if next_scan < time.monotonic() - SCAN_SECONDS:
