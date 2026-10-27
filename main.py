@@ -68,7 +68,7 @@ FIFTEEN_MIN_MS = TIMEFRAME_SECONDS * 1000
 
 # Solo affidabilita'/trasporto, NON filtri di strategia
 KLINES_URL = 'https://fapi.binance.com/fapi/v1/klines'
-WS_BASE_URL = 'wss://fstream.binance.com/stream?streams='
+WS_BASE_URL = 'wss://fstream.binance.com/market/stream?streams='
 WS_STALE_SECONDS = 5.0
 WS_MAX_RECONNECT_SECONDS = 30
 REST_GAP_SECONDS = 0.30
