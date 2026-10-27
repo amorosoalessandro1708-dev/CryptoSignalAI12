@@ -8,14 +8,16 @@ Ingresso su candela 15m LIVE (entrambi i versi):
 - corpo >= 82% del range, wick direzionale <= 8%, opposto <= 10%;
 - volume PROGRESSIVO >= 1.80 volte media delle 10 precedenti 15m chiuse;
 - almeno 60 secondi trascorsi dall'apertura della candela;
-- conferma ininterrotta delle condizioni per almeno 10 secondi;
-- prezzo live oltre massimo/minimo delle 3 precedenti candele 15m CHIUSE
-  di almeno 0.05 ATR15;
-- resistenza/supporto delle ultime 3 candele 1H CHIUSE: se e' prima
-  di TP1, la rottura oltre quel livello richiede 0.05 ATR15;
+- conferma ininterrotta delle condizioni per almeno 20 secondi;
+- prezzo live oltre massimo/minimo delle precedenti 16 candele 15m CHIUSE
+  (ultime 4 ore di mercato) di almeno 0.05 ATR15;
+- permanenza oltre il livello di breakout per 20 secondi, insieme agli altri filtri;
+- nessuna resistenza legata alla posizione del TP1: l'ostacolo 4h deve
+  essere superato PRIMA del segnale;
 - BTC15 concorde O neutro (neutro = corpo live < 0.20 ATR15).
 
-SL strutturale: ultime 5 candele 1H CHIUSE +/- 0.20 ATR1H.
+SL strutturale: ultime 2 candele 4H CHIUSE +/- 0.10 ATR4H.
+Nessun limite percentuale massimo alla distanza dello stop strutturale.
 TP1=0.30R, TP2=0.80R, TP3=1.50R. Uno stesso alert massimo per coppia/candela.
 Nessun EMA/MACD/Stoch, no 1H/4H come filtri direzionali, nessun retest.
 Gli SL/TP sono livelli informativi: questo bot NON apre ordini e NON imposta stop in borsa.
@@ -55,21 +57,19 @@ TRAILING_WICK_MAX = 0.10    # LONG wick basso; SHORT wick alto
 BODY_ATR_MIN = 0.65
 VOLUME_RATIO_MIN = 1.80
 MIN_CANDLE_AGE_SECONDS = 60.0
-CONFIRM_SECONDS = 10.0
+CONFIRM_SECONDS = 20.0
 BTC_NEUTRAL_BODY_ATR_MAX = 0.20  # neutralita' di BTC 15m live
 ATR_PERIOD = 14
 VOLUME_AVG_BARS = 10
-BREAKOUT_15M_LOOKBACK = 3      # massimo/minimo ultime 3 candele 15m CHIUSE
+BREAKOUT_15M_LOOKBACK = 16     # 4 ore = 16 candele 15m CHIUSE
 BREAKOUT_BUFFER_ATR15 = 0.05  # distanza minima oltre il livello
-HOURLY_OBSTACLE_LOOKBACK = 3   # resistenza/supporto su 3 candele 1H CHIUSE
-
-# SL/TP e livello orario di contesto (nessun filtro trend 1H)
-SL_HOURLY_LOOKBACK = 5       # 5 candele orarie complete, NON quella live
-SL_BUFFER_ATR1H = 0.20       # oltre i minimi/massimi di struttura 1H
+# SL/TP calcolati sul timeframe 4H, senza filtri direzionali su 4H.
+SL_4H_LOOKBACK = 2          # ultime 2 candele 4H COMPLETE
+SL_BUFFER_ATR4H = 0.10      # buffer oltre struttura 4H
 TP1_R = 0.30
 TP2_R = 0.80
 TP3_R = 1.50
-HOUR_MS = 60 * 60 * 1000
+FOUR_HOURS_MS = 4 * 60 * 60 * 1000
 FIFTEEN_MIN_MS = TIMEFRAME_SECONDS * 1000
 
 # Solo affidabilita'/trasporto, NON filtri di strategia
@@ -83,7 +83,7 @@ REST_REFRESH_SECONDS = 300
 GAP_REFRESH_SECONDS = 15
 LOG_INTERVAL_SECONDS = 15
 TELEGRAM_RETRY_SECONDS = 30
-HISTORY_MAXLEN = 120
+HISTORY_MAXLEN = 320  # necessario per ricostruire ATR14 sul timeframe 4H
 ITALY = ZoneInfo('Europe/Rome')
 
 cache_lock = threading.RLock()
@@ -329,25 +329,26 @@ def live_volume_pace(candles, now_ms):
 
 
 
-def hourly_closed_candles(candles_15m):
-    """Ricostruisce vere OHLC 1H usando esclusivamente quartetti 15m CHIUSI.
+def four_hour_closed_candles(candles_15m):
+    """Ricostruisce 4H da 16 candele 15m chiuse, allineate alle 00/04/08 UTC.
 
-    Il gruppo 1H parziale (inizio/fine dello storico e ora in corso) non
-    viene incluso. L'allineamento e' alle ore UTC, come su Binance.
+    Esclude la candela 15m LIVE e i blocchi 4H parziali/incompleti.
+    Con 320 candele 15m in memoria si hanno almeno 15 candele 4H
+    complete anche ai margini temporali, sufficienti per ATR14.
     """
     groups = {}
-    for c in candles_15m[:-1]:  # esclusa sempre la 15m live
-        hour_t = (c['t'] // HOUR_MS) * HOUR_MS
-        groups.setdefault(hour_t, []).append(c)
+    for candle in candles_15m[:-1]:
+        block_t = (candle['t'] // FOUR_HOURS_MS) * FOUR_HOURS_MS
+        groups.setdefault(block_t, []).append(candle)
     result = []
-    for hour_t, group in sorted(groups.items()):
-        if len(group) != 4:
+    for block_t, group in sorted(groups.items()):
+        if len(group) != 16:
             continue
         group.sort(key=lambda c: c['t'])
-        if [c['t'] for c in group] != [hour_t + i * FIFTEEN_MIN_MS for i in range(4)]:
+        if any(c['t'] != block_t + i * FIFTEEN_MIN_MS for i, c in enumerate(group)):
             continue
         result.append({
-            't': hour_t,
+            't': block_t,
             'o': group[0]['o'],
             'h': max(c['h'] for c in group),
             'l': min(c['l'] for c in group),
@@ -357,24 +358,27 @@ def hourly_closed_candles(candles_15m):
     return result
 
 
-def hourly_structural_stop(candles_15m, direction):
-    """Stop largo basato su 5 ore chiuse + 0.20 ATR1H; mai su 1H parziale."""
-    bars_1h = hourly_closed_candles(candles_15m)
-    if len(bars_1h) < max(SL_HOURLY_LOOKBACK, ATR_PERIOD + 1):
+def four_hour_structural_stop(candles_15m, direction):
+    """Stop oltre 2 candele 4H CHIUSE +0.10 ATR4H, senza stop artificiali.
+
+    Considera anche l'estremo gia' realizzato sulla 15m LIVE per non
+    collocare lo stop dentro il range della candela di ingresso.
+    """
+    closed_4h = four_hour_closed_candles(candles_15m)
+    if len(closed_4h) < max(SL_4H_LOOKBACK, ATR_PERIOD + 1):
         return None
-    atr1h = true_range_atr(bars_1h)
-    if not atr1h or atr1h <= 0:
+    atr4h = true_range_atr(closed_4h)
+    if atr4h is None or atr4h <= 0:
         return None
-    structural = bars_1h[-SL_HOURLY_LOOKBACK:]
+    structural = closed_4h[-SL_4H_LOOKBACK:]
     live = candles_15m[-1]
     if direction == 'LONG':
-        # Non collocare mai lo stop sopra il minimo della candela di entrata.
         extreme = min(min(c['l'] for c in structural), live['l'])
-        sl = extreme - SL_BUFFER_ATR1H * atr1h
+        sl = extreme - SL_BUFFER_ATR4H * atr4h
     else:
         extreme = max(max(c['h'] for c in structural), live['h'])
-        sl = extreme + SL_BUFFER_ATR1H * atr1h
-    return {'sl': sl, 'atr1h': atr1h, 'structure_extreme': extreme}
+        sl = extreme + SL_BUFFER_ATR4H * atr4h
+    return {'sl': sl, 'atr4h': atr4h, 'structure_extreme': extreme}
 
 
 def btc15_direction(btc_candles):
@@ -396,36 +400,6 @@ def btc15_direction(btc_candles):
     return 'LONG' if displacement > 0 else 'SHORT'
 
 
-def hourly_obstacle_allows_entry(candles_15m, direction, entry, tp1, atr_buffer):
-    """Controlla la barriera 1H solo quando puo' ostacolare TP1.
-
-    LONG: resistenza = max(high) delle 3 ultime 1H chiuse.
-    SHORT: supporto = min(low) delle 3 ultime 1H chiuse.
-    Se la barriera e' oltre TP1, non blocca; se e' prima del TP1,
-    il prezzo deve averla superata di almeno 0.05 ATR15.
-    Si usa sempre la stessa barriera su 3 candele orarie chiuse,
-    senza imporre il trend orario.
-    """
-    hourly = hourly_closed_candles(candles_15m)
-    if len(hourly) < HOURLY_OBSTACLE_LOOKBACK:
-        return {'allowed': False, 'level': None, 'status': 'STORICO_1H_INSUFFICIENTE'}
-    bars = hourly[-HOURLY_OBSTACLE_LOOKBACK:]
-    if direction == 'LONG':
-        resistance = max(c['h'] for c in bars)
-        if entry >= resistance + atr_buffer:
-            return {'allowed': True, 'level': resistance, 'status': 'ROTTA'}
-        if resistance < tp1:
-            return {'allowed': False, 'level': resistance, 'status': 'RESISTENZA_PRIMA_TP1'}
-        return {'allowed': True, 'level': resistance, 'status': 'OLTRE_TP1'}
-
-    support = min(c['l'] for c in bars)
-    if entry <= support - atr_buffer:
-        return {'allowed': True, 'level': support, 'status': 'ROTTO'}
-    if support > tp1:
-        return {'allowed': False, 'level': support, 'status': 'SUPPORTO_PRIMA_TP1'}
-    return {'allowed': True, 'level': support, 'status': 'OLTRE_TP1'}
-
-
 def analyze_candle(symbol, candles, btc_direction, now_ms):
     """Segnale quando condizioni live, breakout e ostacoli 1H concordano."""
     required = max(ATR_PERIOD + 2, VOLUME_AVG_BARS + 1, BREAKOUT_15M_LOOKBACK + 1)
@@ -444,7 +418,7 @@ def analyze_candle(symbol, candles, btc_direction, now_ms):
     if elapsed < MIN_CANDLE_AGE_SECONDS:
         return None
 
-    # Tre candele PRECEDENTI gia' chiuse e consecutive, mai quella LIVE.
+    # Ultime 16 candele 15m CHIUSE consecutive = resistenza/supporto ultime 4 ore.
     previous = candles[-(BREAKOUT_15M_LOOKBACK + 1):-1]
     if any(previous[i]['t'] + FIFTEEN_MIN_MS != previous[i + 1]['t']
            for i in range(len(previous) - 1)):
@@ -481,16 +455,15 @@ def analyze_candle(symbol, candles, btc_direction, now_ms):
     volume_pace = live_volume_pace(candles, now_ms)
     if volume_pace < VOLUME_RATIO_MIN:
         return None
-    hourly_stop = hourly_structural_stop(candles, direction)
-    if not hourly_stop:
+    stop_4h = four_hour_structural_stop(candles, direction)
+    if not stop_4h:
         return None
-    risk = abs(closing - hourly_stop['sl'])
+    # Stop strutturale sul lato corretto del prezzo; nessun tetto percentuale.
+    risk = closing - stop_4h['sl'] if direction == 'LONG' else stop_4h['sl'] - closing
     if risk <= 0:
         return None
+    stop_distance_pct = risk / closing
     tp1 = closing + (1 if direction == 'LONG' else -1) * TP1_R * risk
-    obstacle = hourly_obstacle_allows_entry(candles, direction, closing, tp1, buffer15)
-    if not obstacle['allowed']:
-        return None
 
     return {
         'symbol': symbol, 'direction': direction, 'entry': closing,
@@ -500,12 +473,10 @@ def analyze_candle(symbol, candles, btc_direction, now_ms):
         'trailing_wick': trailing_wick,
         'volume_pace': volume_pace, 'btc_direction': btc_direction,
         'elapsed': elapsed,
-        'atr15': atr15, 'sl': hourly_stop['sl'], 'tp1': tp1,
-        'atr1h': hourly_stop['atr1h'],
-        'structure_extreme': hourly_stop['structure_extreme'],
+        'atr15': atr15, 'sl': stop_4h['sl'], 'tp1': tp1,
+        'atr4h': stop_4h['atr4h'], 'stop_distance_pct': stop_distance_pct,
+        'structure_extreme': stop_4h['structure_extreme'],
         'breakout_level': breakout_level, 'breakout_buffer': buffer15,
-        'hourly_obstacle_level': obstacle['level'],
-        'hourly_obstacle_status': obstacle['status'],
     }
 
 
@@ -520,7 +491,7 @@ def price_format(price):
 
 
 def message_for(signal):
-    """SL basato su 5 candele 1H chiuse; TP in R, no ordini automatici."""
+    """SL basato su 2 candele 4H chiuse; TP in R, no ordini automatici."""
     s = signal
     d = 1 if s['direction'] == 'LONG' else -1
     sl = s['sl']
@@ -536,7 +507,8 @@ def message_for(signal):
         f"Orario Italia: {now_italy}\n"
         f"Candela LIVE iniziata alle: {candle_italy}\n"
         f"ENTRY indicativa: {price_format(s['entry'])}\n"
-        f"SL largo 1H (5 candele chiuse + 0.20 ATR1H): {price_format(sl)}\n"
+        f"SL strutturale 4H (2 chiuse + 0.10 ATR4H): {price_format(sl)}\n"
+        f"Distanza SL: {s['stop_distance_pct']*100:.2f}% (strutturale, senza limite percentuale)\n"
         f"TP1 (0.30R): {price_format(tp1)}\n"
         f"TP2 (0.80R): {price_format(tp2)}\n"
         f"TP3 (1.50R): {price_format(tp3)}\n\n"
@@ -545,12 +517,10 @@ def message_for(signal):
         f"Wick direzionale: {s['leading_wick']*100:.1f}% (max 8%)\n"
         f"Wick opposto: {s['trailing_wick']*100:.1f}% (max 10%)\n"
         f"Volume progressivo: {s['volume_pace']:.2f}x (min 1.80x)\n"
-        f"Breakout 15m (3 chiuse): {price_format(s['breakout_level'])} "
+        f"Breakout ultime 4h (16x15m chiuse): {price_format(s['breakout_level'])} "
         f"+/- {price_format(s['breakout_buffer'])} (0.05 ATR15)\n"
-        f"Livello 1H (3 chiuse): {price_format(s['hourly_obstacle_level'])} "
-        f"- {s['hourly_obstacle_status']}\n"
         f"BTC 15m LIVE: {s['btc_direction']} (neutro <0.20 ATR15)\n"
-        f"Tempo candela: {s['elapsed']:.0f}s, conferma >=10s\n"
+        f"Tempo candela: {s['elapsed']:.0f}s, conferma >=20s\n"
         f"Strategia sperimentale. Volume proiettato e candela non ancora chiusi.\n"
         f"Nessun ordine automatico. Rischio indicativo per operazione: massimo 0.5% capitale, "
         f"da dimensionare manualmente; SL/TP non garantiscono esecuzione."
@@ -608,7 +578,7 @@ def current_snapshot():
 
 
 def scan_market():
-    """Scansione rapida in RAM, con conferma 10s continua e deduplica.
+    """Scansione rapida in RAM, con conferma 20s continua e deduplica.
 
     Le candele arrivano dai WebSocket; lo scan a 1s NON significa che
     Binance invii nuovi prezzi ogni secondo esatto.
@@ -654,13 +624,13 @@ def scan_market():
                 '| corpo', f"{signal['body_fraction']*100:.1f}%",
                 '| BTC15', btc_direction)
 
-    # Ogni condizione deve restare vera a OGNI scansione per 10 secondi.
+    # Ogni condizione deve restare vera a OGNI scansione per 20 secondi.
     # Un prezzo che rientra, un BTC contrario o un feed stale azzera il timer.
     for key in list(confirmation_started):
         if key not in valid_this_scan:
             del confirmation_started[key]
 
-    oldest_allowed = btc_live['t'] - 4 * HOUR_MS
+    oldest_allowed = btc_live['t'] - FOUR_HOURS_MS
     with alert_lock:
         sent_alerts.intersection_update({k for k in sent_alerts if k[1] >= oldest_allowed})
         for key in list(failed_alert_times):
@@ -672,9 +642,9 @@ def scan_market():
 def main():
     log('CryptoSignalAI MOMENTUM ONE | solo LONG/SHORT | 25 crypto WS, scansione ~1s')
     log('PARAMETRI: corpo >=82%, wick 8%/10%, corpo >=0.65 ATR15, volume >=1.80x;',
-        'candela >=60s, conferma >=10s, breakout 3x15m +0.05ATR; BTC15 concorde/neutro;',
-        'livello 3x1H blocca solo se prima TP1 e non superato +0.05ATR15;',
-        'SL 5 candele 1H chiuse +0.20 ATR1H; TP 0.30R/0.80R/1.50R')
+        'candela >=60s, conferma >=20s, breakout 16x15m (4 ore) +0.05 ATR15;',
+        'BTC15 concorde/neutro; stop 2x4H chiuse +0.10 ATR4H;',
+        'SL senza limite massimo percentuale; TP 0.30R/0.80R/1.50R')
     if not BOT_TOKEN or not CHAT_ID:
         log('ATTENZIONE: mancano variabili ambiente Telegram; nessuna notifica.')
     while True:
@@ -690,12 +660,12 @@ def main():
     threading.Thread(target=websocket_worker, daemon=True).start()
     send_telegram('MOMENTUM ONE AVVIATO [SIMULAZIONE]. 25 crypto; scansione ~1s; '
                   'candela 15m corpo >=82%, wick 8%/10%, corpo >=0.65ATR, '
-                  'volume progressivo >=1.80x, prima candela live dopo 60s e conferma >=10s. '
-                  'Breakout ultime 3 candele 15m +0.05 ATR15. '
-                  'Resistenza/supporto ultime 3 candele 1H: blocca solo se prima di TP1, '
-                  'finche non superato di 0.05 ATR15. '
+                  'volume progressivo >=1.80x, prima candela live dopo 60s e conferma >=20s. '
+                  'Breakout massimi/minimi ultime 4 ore (16x15m chiuse) +0.05 ATR15, '
+                  'tenuta sopra/sotto per 20s. '
                   'BTC 15m concorde o neutro (<0.20ATR). '
-                  'SL 5 candele 1H chiuse +0.20 ATR1H. TP 0.30R / 0.80R / 1.50R. '
+                  'SL 2 candele 4H chiuse +0.10 ATR4H; nessun limite massimo percentuale. '
+                  'TP 0.30R / 0.80R / 1.50R sullo stop 4H. '
                   'Solo segnali, nessun ordine automatico.')
     next_scan = time.monotonic()
     last_log = next_scan
