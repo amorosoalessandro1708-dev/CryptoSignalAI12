@@ -9,7 +9,10 @@ Ingresso su candela 15m LIVE (entrambi i versi):
 - volume PROGRESSIVO >= 1.80 volte media delle 10 precedenti 15m chiuse;
 - almeno 60 secondi trascorsi dall'apertura della candela;
 - conferma ininterrotta delle condizioni per almeno 10 secondi;
-- prezzo live oltre massimo/minimo della precedente candela 15m CHIUSA;
+- prezzo live oltre massimo/minimo delle 3 precedenti candele 15m CHIUSE
+  di almeno 0.05 ATR15;
+- resistenza/supporto delle ultime 3 candele 1H CHIUSE: se e' prima
+  di TP1, la rottura oltre quel livello richiede 0.05 ATR15;
 - BTC15 concorde O neutro (neutro = corpo live < 0.20 ATR15).
 
 SL strutturale: ultime 5 candele 1H CHIUSE +/- 0.20 ATR1H.
@@ -56,8 +59,11 @@ CONFIRM_SECONDS = 10.0
 BTC_NEUTRAL_BODY_ATR_MAX = 0.20  # neutralita' di BTC 15m live
 ATR_PERIOD = 14
 VOLUME_AVG_BARS = 10
+BREAKOUT_15M_LOOKBACK = 3      # massimo/minimo ultime 3 candele 15m CHIUSE
+BREAKOUT_BUFFER_ATR15 = 0.05  # distanza minima oltre il livello
+HOURLY_OBSTACLE_LOOKBACK = 3   # resistenza/supporto su 3 candele 1H CHIUSE
 
-# SOLO livelli di uscita: NON filtri tecnici aggiuntivi per l'ingresso
+# SL/TP e livello orario di contesto (nessun filtro trend 1H)
 SL_HOURLY_LOOKBACK = 5       # 5 candele orarie complete, NON quella live
 SL_BUFFER_ATR1H = 0.20       # oltre i minimi/massimi di struttura 1H
 TP1_R = 0.30
@@ -390,9 +396,40 @@ def btc15_direction(btc_candles):
     return 'LONG' if displacement > 0 else 'SHORT'
 
 
+def hourly_obstacle_allows_entry(candles_15m, direction, entry, tp1, atr_buffer):
+    """Controlla la barriera 1H solo quando puo' ostacolare TP1.
+
+    LONG: resistenza = max(high) delle 3 ultime 1H chiuse.
+    SHORT: supporto = min(low) delle 3 ultime 1H chiuse.
+    Se la barriera e' oltre TP1, non blocca; se e' prima del TP1,
+    il prezzo deve averla superata di almeno 0.05 ATR15.
+    Si usa sempre la stessa barriera su 3 candele orarie chiuse,
+    senza imporre il trend orario.
+    """
+    hourly = hourly_closed_candles(candles_15m)
+    if len(hourly) < HOURLY_OBSTACLE_LOOKBACK:
+        return {'allowed': False, 'level': None, 'status': 'STORICO_1H_INSUFFICIENTE'}
+    bars = hourly[-HOURLY_OBSTACLE_LOOKBACK:]
+    if direction == 'LONG':
+        resistance = max(c['h'] for c in bars)
+        if entry >= resistance + atr_buffer:
+            return {'allowed': True, 'level': resistance, 'status': 'ROTTA'}
+        if resistance < tp1:
+            return {'allowed': False, 'level': resistance, 'status': 'RESISTENZA_PRIMA_TP1'}
+        return {'allowed': True, 'level': resistance, 'status': 'OLTRE_TP1'}
+
+    support = min(c['l'] for c in bars)
+    if entry <= support - atr_buffer:
+        return {'allowed': True, 'level': support, 'status': 'ROTTO'}
+    if support > tp1:
+        return {'allowed': False, 'level': support, 'status': 'SUPPORTO_PRIMA_TP1'}
+    return {'allowed': True, 'level': support, 'status': 'OLTRE_TP1'}
+
+
 def analyze_candle(symbol, candles, btc_direction, now_ms):
-    """Restituisce una segnalazione soltanto quando TUTTI i criteri concordano."""
-    if len(candles) < max(ATR_PERIOD + 2, VOLUME_AVG_BARS + 1):
+    """Segnale quando condizioni live, breakout e ostacoli 1H concordano."""
+    required = max(ATR_PERIOD + 2, VOLUME_AVG_BARS + 1, BREAKOUT_15M_LOOKBACK + 1)
+    if len(candles) < required:
         return None
     current = candles[-1]
     if not (current['t'] <= now_ms < current['t'] + TIMEFRAME_SECONDS * 1000):
@@ -406,14 +443,15 @@ def analyze_candle(symbol, candles, btc_direction, now_ms):
     elapsed = (now_ms - current['t']) / 1000.0
     if elapsed < MIN_CANDLE_AGE_SECONDS:
         return None
-    previous = candles[-2]
-    if previous['t'] + FIFTEEN_MIN_MS != current['t']:
+
+    # Tre candele PRECEDENTI gia' chiuse e consecutive, mai quella LIVE.
+    previous = candles[-(BREAKOUT_15M_LOOKBACK + 1):-1]
+    if any(previous[i]['t'] + FIFTEEN_MIN_MS != previous[i + 1]['t']
+           for i in range(len(previous) - 1)):
         return None
-    # Breakout REALE sulla candela LIVE: oltre il massimo/minimo della precedente.
-    if direction == 'LONG' and closing <= previous['h']:
+    if previous[-1]['t'] + FIFTEEN_MIN_MS != current['t']:
         return None
-    if direction == 'SHORT' and closing >= previous['l']:
-        return None
+
     span = current['h'] - current['l']
     if span <= 0:
         return None
@@ -427,14 +465,31 @@ def analyze_candle(symbol, candles, btc_direction, now_ms):
     trailing_wick = lower_wick if direction == 'LONG' else upper_wick
     if leading_wick > LEADING_WICK_MAX or trailing_wick > TRAILING_WICK_MAX:
         return None
+
     atr15 = true_range_atr(candles[:-1])
     if not atr15 or body / atr15 < BODY_ATR_MIN:
         return None
+    buffer15 = BREAKOUT_BUFFER_ATR15 * atr15
+    breakout_level = (max(c['h'] for c in previous) if direction == 'LONG'
+                      else min(c['l'] for c in previous))
+    # Basta il corpo/prezzo LIVE sopra/sotto il livello piu' il buffer.
+    if direction == 'LONG' and closing < breakout_level + buffer15:
+        return None
+    if direction == 'SHORT' and closing > breakout_level - buffer15:
+        return None
+
     volume_pace = live_volume_pace(candles, now_ms)
     if volume_pace < VOLUME_RATIO_MIN:
         return None
     hourly_stop = hourly_structural_stop(candles, direction)
-    if not hourly_stop:  # impossibile inviare un SL 1H affidabile senza storico
+    if not hourly_stop:
+        return None
+    risk = abs(closing - hourly_stop['sl'])
+    if risk <= 0:
+        return None
+    tp1 = closing + (1 if direction == 'LONG' else -1) * TP1_R * risk
+    obstacle = hourly_obstacle_allows_entry(candles, direction, closing, tp1, buffer15)
+    if not obstacle['allowed']:
         return None
 
     return {
@@ -445,9 +500,12 @@ def analyze_candle(symbol, candles, btc_direction, now_ms):
         'trailing_wick': trailing_wick,
         'volume_pace': volume_pace, 'btc_direction': btc_direction,
         'elapsed': elapsed,
-        'atr15': atr15, 'sl': hourly_stop['sl'],
+        'atr15': atr15, 'sl': hourly_stop['sl'], 'tp1': tp1,
         'atr1h': hourly_stop['atr1h'],
         'structure_extreme': hourly_stop['structure_extreme'],
+        'breakout_level': breakout_level, 'breakout_buffer': buffer15,
+        'hourly_obstacle_level': obstacle['level'],
+        'hourly_obstacle_status': obstacle['status'],
     }
 
 
@@ -487,7 +545,10 @@ def message_for(signal):
         f"Wick direzionale: {s['leading_wick']*100:.1f}% (max 8%)\n"
         f"Wick opposto: {s['trailing_wick']*100:.1f}% (max 10%)\n"
         f"Volume progressivo: {s['volume_pace']:.2f}x (min 1.80x)\n"
-        f"Breakout: oltre max/min candela precedente\n"
+        f"Breakout 15m (3 chiuse): {price_format(s['breakout_level'])} "
+        f"+/- {price_format(s['breakout_buffer'])} (0.05 ATR15)\n"
+        f"Livello 1H (3 chiuse): {price_format(s['hourly_obstacle_level'])} "
+        f"- {s['hourly_obstacle_status']}\n"
         f"BTC 15m LIVE: {s['btc_direction']} (neutro <0.20 ATR15)\n"
         f"Tempo candela: {s['elapsed']:.0f}s, conferma >=10s\n"
         f"Strategia sperimentale. Volume proiettato e candela non ancora chiusi.\n"
@@ -611,7 +672,8 @@ def scan_market():
 def main():
     log('CryptoSignalAI MOMENTUM ONE | solo LONG/SHORT | 25 crypto WS, scansione ~1s')
     log('PARAMETRI: corpo >=82%, wick 8%/10%, corpo >=0.65 ATR15, volume >=1.80x;',
-        'candela >=60s, conferma >=10s, breakout precedente, BTC15 concorde/neutro;',
+        'candela >=60s, conferma >=10s, breakout 3x15m +0.05ATR; BTC15 concorde/neutro;',
+        'livello 3x1H blocca solo se prima TP1 e non superato +0.05ATR15;',
         'SL 5 candele 1H chiuse +0.20 ATR1H; TP 0.30R/0.80R/1.50R')
     if not BOT_TOKEN or not CHAT_ID:
         log('ATTENZIONE: mancano variabili ambiente Telegram; nessuna notifica.')
@@ -629,7 +691,10 @@ def main():
     send_telegram('MOMENTUM ONE AVVIATO [SIMULAZIONE]. 25 crypto; scansione ~1s; '
                   'candela 15m corpo >=82%, wick 8%/10%, corpo >=0.65ATR, '
                   'volume progressivo >=1.80x, prima candela live dopo 60s e conferma >=10s. '
-                  'Breakout precedente; BTC 15m concorde o neutro (<0.20ATR). '
+                  'Breakout ultime 3 candele 15m +0.05 ATR15. '
+                  'Resistenza/supporto ultime 3 candele 1H: blocca solo se prima di TP1, '
+                  'finche non superato di 0.05 ATR15. '
+                  'BTC 15m concorde o neutro (<0.20ATR). '
                   'SL 5 candele 1H chiuse +0.20 ATR1H. TP 0.30R / 0.80R / 1.50R. '
                   'Solo segnali, nessun ordine automatico.')
     next_scan = time.monotonic()
