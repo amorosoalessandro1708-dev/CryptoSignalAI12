@@ -6,16 +6,17 @@ STRATEGIA (stessa logica LONG/SHORT, nessun ordine automatico):
 2. NESSUN requisito di volume sulla candela di breakout 4H gia' chiusa.
 3. Solo DOPO quella chiusura 4H il bot osserva il grafico 15m e attende
    il pullback sulla vecchia resistenza/supporto (+/-0.10 ATR15).
-4. La candela 15m di conferma dopo il retest deve CHIUDERE nella direzione
-   del breakout (+/-0.05 ATR15), con pressione direzionale o rigetto, e
-   volume CHIUSO >=1.80x la media delle 10 precedenti candele 15m chiuse.
+4. Una candela 15m SUCCESSIVA a quella del retest deve CHIUDERE nella
+   direzione del breakout (+/-0.05 ATR15): corpo >=82% del range, lungo
+   >=0.65 ATR15, wick direzionale <=8%, opposto <=10%, e volume CHIUSO
+   >=1.80x la media delle 10 precedenti candele 15m chiuse.
 5. BTC15 della stessa candela 15m chiusa concorde o neutro (<0.20 ATR15).
 6. Entra solo in simulazione al primo prezzo disponibile dopo la chiusura 15m.
 
 NON esiste piu' la vecchia alternativa TENUTA 10 MIN: retest e chiusure
-4H e 15m sono obbligatori. La candela del retest puo' essere piccola o
-con wick di rifiuto: NON le si impone il corpo >=82%. Il volume >=1.80x
-va verificato sulla candela 15m di CONFERMA (anche se coincide col retest).
+4H e 15m sono obbligatori. La candela del retest puo' essere piccola,
+rossa o verde, senza requisiti di corpo e volume. La candela di CONFERMA
+si forma DOPO quella del retest e deve essere lunga, piena e voluminosa.
 
 Stop strutturale: estremo delle ultime 2 candele 4H chiuse +/-0.10 ATR4H,
 senza limite percentuale, includendo eventuale estremo 15m live piu' largo.
@@ -66,10 +67,10 @@ MACRO_CLOSE_GRACE_SECONDS = 600     # 10m di tolleranza per reconnect post-chius
 # Il retest e la candela 15m di conferma vengono DOPO il breakout 4H.
 RETEST_ZONE_ATR15 = 0.10           # tolleranza sopra/sotto il livello
 MICRO_CLOSE_BUFFER_ATR15 = 0.05    # chiusura 15m oltre il livello
-MICRO_CLOSE_POSITION_MIN = 0.75   # chiusura 15m nel 25% direzionale
-MICRO_BODY_ATR_MIN = 0.20         # corpo minimo per conferma direzionale
-MICRO_REJECTION_WICK_MIN = 0.35   # alternativa: hammer/pinbar di rigetto
-MICRO_REJECTION_BODY_ATR_MIN = 0.08
+CONFIRM_BODY_FRACTION_MIN = 0.82  # corpo pieno >=82% del range sulla 15m chiusa
+CONFIRM_BODY_ATR_MIN = 0.65       # corpo >=0.65 ATR15 sulla 15m chiusa
+CONFIRM_LEADING_WICK_MAX = 0.08  # LONG wick alto; SHORT wick basso
+CONFIRM_TRAILING_WICK_MAX = 0.10 # LONG wick basso; SHORT wick alto
 SETUP_LIFETIME_SECONDS = 4 * 60 * 60  # massimo 4 ore dopo la chiusura 4H
 CLOSE_EVENT_MAX_DELAY_SECONDS = 12    # non inviare segnali vecchi dopo disconnessioni
 
@@ -499,10 +500,10 @@ def confirmation_15m_volume_ratio(candles):
 
 
 def confirmation_15m_valid(candle, direction, level, atr15):
-    """Chiusura 15m nella direzione del breakout, dopo il pullback.
+    """Richiede candela 15m CHIUSA, lunga, piena e con ombre limitate.
 
-    Permette sia una candela direzionale, sia una candela di rigetto con wick
-    (hammer LONG / shooting star SHORT); quindi NON impone corpo 82% al retest.
+    La candela del retest NON usa queste soglie: valgono solo per la candela
+    successiva che conferma la ripartenza nella direzione della rottura 4H.
     """
     if atr15 is None or atr15 <= 0:
         return False
@@ -514,20 +515,22 @@ def confirmation_15m_valid(candle, direction, level, atr15):
         return False
     if direction == 'SHORT' and closing >= opening:
         return False
+    if direction not in ('LONG', 'SHORT'):
+        return False
     if not beyond_breakout(closing, direction, level,
                            MICRO_CLOSE_BUFFER_ATR15 * atr15):
         return False
-    close_pos = ((closing - candle['l'])/span if direction == 'LONG'
-                 else (candle['h'] - closing)/span)
-    if close_pos < MICRO_CLOSE_POSITION_MIN:
+    body = abs(closing - opening)
+    if body / span < CONFIRM_BODY_FRACTION_MIN:
         return False
-    body = abs(closing-opening)
-    trailing_wick = ((opening-candle['l'])/span if direction == 'LONG'
-                     else (candle['h']-opening)/span)
-    return (body >= MICRO_BODY_ATR_MIN * atr15 or
-            (trailing_wick >= MICRO_REJECTION_WICK_MIN and
-             body >= MICRO_REJECTION_BODY_ATR_MIN * atr15))
-
+    if body / atr15 < CONFIRM_BODY_ATR_MIN:
+        return False
+    upper_wick = max(0.0, candle['h'] - max(opening, closing)) / span
+    lower_wick = max(0.0, min(opening, closing) - candle['l']) / span
+    leading_wick = upper_wick if direction == 'LONG' else lower_wick
+    trailing_wick = lower_wick if direction == 'LONG' else upper_wick
+    return (leading_wick <= CONFIRM_LEADING_WICK_MAX and
+            trailing_wick <= CONFIRM_TRAILING_WICK_MAX)
 
 def build_confirmed_signal(setup, candles, btc_direction, candle_15m, now_ms):
     """Entry indicativa dal nuovo tick disponibile DOPO chiusura 15m."""
@@ -602,6 +605,10 @@ def evaluate_closed_retest_candle(setup, candles, btc_candles, now_ms):
         log('RETEST 15M', setup['symbol'], d, 'livello', price_format(level))
 
     if not setup['touched']:
+        return 'WAIT', None
+    # Retest e conferma sono DUE candele 15m distinte: niente segnale
+    # sulla stessa candela che ha toccato per la prima volta il livello.
+    if closed['t'] <= setup['touch_t']:
         return 'WAIT', None
     if not confirmation_15m_valid(closed, d, level, atr15):
         return 'WAIT', None
@@ -771,7 +778,8 @@ def scan_market():
 
 def main():
     log('MOMENTUM ONE | 25 crypto | scan ~1s | CHIUSURA 4H + RETEST 15M CHIUSO')
-    log('4H breakout vs 3 precedenti 4H SENZA filtro volume; retest 15m +/-0.10ATR15; volume 15m conferma >=1.80x')
+    log('4H breakout senza filtro volume; retest 15m +/-0.10ATR15; conferma 15m CHIUSA SUCCESSIVA')
+    log('Corpo >=82%, >=0.65ATR15, wick 8%/10%, volume 15m conferma >=1.80x su 10 chiuse')
     log('BTC15 concorde/neutro; SL 2x4H +0.10ATR4H senza tetto; TP 0.30R/0.80R/1.50R')
     if not BOT_TOKEN or not CHAT_ID:
         log('ATTENZIONE: mancano le variabili ambiente Telegram; nessuna notifica.')
@@ -788,9 +796,10 @@ def main():
     send_telegram('MOMENTUM ONE 4H+15M AVVIATO [SIMULAZIONE]. 25 crypto, scan ~1s. '
                   'Candela 4H CHIUSA oltre massimo/minimo precedenti 3 4H +0.05 ATR4H; '
                   'NESSUN filtro volume sulla 4H. '
-                  'Obbligatorio retest +/-0.10 ATR15, poi candela 15m CHIUSA '
-                  'nella direzione della rottura oltre +/-0.05 ATR15, '
-                  'con volume >=1.80x media ultime 10 candele 15m CHIUSE; '
+                  'Obbligatorio retest +/-0.10 ATR15, poi candela 15m SUCCESSIVA CHIUSA '
+                  'nella direzione della rottura oltre +/-0.05 ATR15: '
+                  'corpo >=82% e >=0.65 ATR15, wick 8%/10%, '
+                  'volume >=1.80x media ultime 10 candele 15m CHIUSE; '
                   'BTC15 chiuso concorde/neutro. NO tenuta 10 minuti. '
                   'SL ultime 2 candele 4H chiuse +0.10 ATR4H senza tetto. '
                   'TP1 0.30R / TP2 0.80R / TP3 1.50R. Solo segnali, nessun ordine.')
