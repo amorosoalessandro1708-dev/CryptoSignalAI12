@@ -1,28 +1,26 @@
-"""CryptoSignalAI MOMENTUM ONE - BREAKOUT 4 ORE | DUE CONFERME ALTERNATIVE.
+"""MOMENTUM ONE 4H CONFIRMED + 15M RETEST - SOLO SIMULAZIONE.
 
-SOLO SIMULAZIONE: un tipo di alert LONG/SHORT, nessun ordine automatico.
-25 coppie Binance USD-M Futures, candele 15m live via WebSocket, scan ~1s.
+STRATEGIA (stessa logica LONG/SHORT, nessun ordine automatico):
+1. La candela 4H CHIUSA rompe il massimo/minimo delle 3 precedenti 4H
+   CHIUSE di almeno 0.05 ATR4H, e chiude vicino all'estremo direzionale.
+2. Volume della candela 4H di rottura >=1.80x la media delle precedenti
+   10 candele 4H chiuse: nessuna proiezione del volume LIVE 4H.
+3. Solo DOPO quella chiusura 4H il bot osserva il grafico 15m e attende
+   il pullback sulla vecchia resistenza/supporto (+/-0.10 ATR15).
+4. Una candela 15m SUCCESSIVA al breakout deve CHIUDERE rialzista/ribassista
+   e oltre il livello (+/-0.05 ATR15), con pressione direzionale o rigetto.
+5. BTC15 della stessa candela 15m chiusa concorde o neutro (<0.20 ATR15).
+6. Entra solo in simulazione al primo prezzo disponibile dopo la chiusura 15m.
 
-TRIGGER: candela LIVE >=60s, corpo >=82% e >=0.65 ATR15, wick 8%/10%,
-volume progressivo >=1.80x; prezzo oltre massimo/minimo delle 16 candele 15m
-precedenti chiuse (4 ore di mercato) di >=0.05 ATR15. BTC15 concorde/neutro.
+NON esiste piu' la vecchia alternativa TENUTA 10 MIN: retest e chiusure
+4H e 15m sono obbligatori. La candela del retest puo' essere piccola o
+con wick di rifiuto: non le si impone corpo >=82% / volume >=1.80x.
 
-DUE POSSIBILITA' (una sola basta):
-A) Il prezzo rimane oltre il livello congelato di rottura + buffer per 600s
-   CONTINUI: se rientra, si azzera il timer. Se il WebSocket manca, il setup
-   viene annullato per non dare false conferme.
-B) La candela di breakout CHIUDE oltre il livello con corpo/volume validi;
-   una candela SUCCESSIVA torna entro +/-0.10 ATR15 dal livello (retest),
-   senza oltrepassarlo dalla parte sbagliata di piu' di 0.10 ATR15. Dopo
-   il ritorno oltre il livello + buffer e un rimbalzo di 0.05 ATR15 dal
-   prezzo di tocco, conferma per 20s consecutivi. Retest non obbligato ad
-   avere corpo 82%/volume 1.80x, gia' richiesti sulla rottura.
-
-Una sola notifica per setup; livello fisso anche se cambia la candela 15m.
-Setup scade dopo 60 minuti per non inseguire vecchie rotture.
-SL oltre estremo di 2 candele 4H CHIUSE +0.10 ATR4H, senza limite percentuale;
-TP1=0.30R, TP2=0.80R, TP3=1.50R calcolati sull'entry effettiva.
-SL e TP SOLO INFORMATIVI, non sono ordini inseriti sull'exchange.
+Stop strutturale: estremo delle ultime 2 candele 4H chiuse +/-0.10 ATR4H,
+senza limite percentuale, includendo eventuale estremo 15m live piu' largo.
+TP1=0.30R, TP2=0.80R, TP3=1.50R: R = distanza entry - stop.
+25 coppie Binance Futures USD-M; WebSocket 15m, controllo in RAM ~1s.
+SL/TP solo informativi, nessun ordine o gestione posizione automatica.
 """
 
 import json
@@ -50,28 +48,33 @@ SYMBOLS = [
     'FILUSDT', 'ETCUSDT', 'AAVEUSDT', 'TIAUSDT', 'SEIUSDT',
 ]
 
-# Soli filtri di INGRESSO (uguali per LONG e SHORT)
+# STRATEGIA 4H CHIUSO -> RETEST 15M -> CHIUSURA 15M (LONG/SHORT)
 SCAN_SECONDS = 1.0
 TIMEFRAME_SECONDS = 15 * 60
-BODY_FRACTION_MIN = 0.82
-LEADING_WICK_MAX = 0.08     # LONG wick alto; SHORT wick basso
-TRAILING_WICK_MAX = 0.10    # LONG wick basso; SHORT wick alto
-BODY_ATR_MIN = 0.65
-VOLUME_RATIO_MIN = 1.80
-MIN_CANDLE_AGE_SECONDS = 60.0
-HOLD_SECONDS = 600.0           # permanenza oltre il livello per 10 minuti
-RETEST_CONFIRM_SECONDS = 20.0  # conferma rimbalzo
-RETEST_ZONE_ATR15 = 0.10       # distanza consentita dal livello nel retest
-RETEST_REBOUND_ATR15 = 0.05    # spinta positiva dal prezzo di tocco
-SETUP_LIFETIME_SECONDS = 3600 # setup valido massimo 1 ora
-BTC_NEUTRAL_BODY_ATR_MAX = 0.20  # neutralita' di BTC 15m live
 ATR_PERIOD = 14
-VOLUME_AVG_BARS = 10
-BREAKOUT_15M_LOOKBACK = 16     # 4 ore = 16 candele 15m CHIUSE
-BREAKOUT_BUFFER_ATR15 = 0.05  # distanza minima oltre il livello
-# SL/TP calcolati sul timeframe 4H, senza filtri direzionali su 4H.
-SL_4H_LOOKBACK = 2          # ultime 2 candele 4H COMPLETE
-SL_BUFFER_ATR4H = 0.10      # buffer oltre struttura 4H
+BTC_NEUTRAL_BODY_ATR_MAX = 0.20
+
+# Il breakout 4H avviene rispetto ai massimi/minimi delle precedenti 3 4H.
+FOUR_HOUR_RESISTANCE_LOOKBACK = 3
+FOUR_HOUR_VOLUME_AVG_BARS = 10
+VOLUME_RATIO_MIN = 1.80             # 4H CHIUSA vs media delle 10 4H precedenti
+BREAKOUT_BUFFER_ATR4H = 0.05       # distanza oltre il livello in ATR4H
+FOUR_HOUR_CLOSE_POSITION_MIN = 0.70 # chiusura nel 30% estremo della 4H
+MACRO_CLOSE_GRACE_SECONDS = 600     # 10m di tolleranza per reconnect post-chiusura 4H
+
+# Il retest e la candela 15m di conferma vengono DOPO il breakout 4H.
+RETEST_ZONE_ATR15 = 0.10           # tolleranza sopra/sotto il livello
+MICRO_CLOSE_BUFFER_ATR15 = 0.05    # chiusura 15m oltre il livello
+MICRO_CLOSE_POSITION_MIN = 0.75   # chiusura 15m nel 25% direzionale
+MICRO_BODY_ATR_MIN = 0.20         # corpo minimo per conferma direzionale
+MICRO_REJECTION_WICK_MIN = 0.35   # alternativa: hammer/pinbar di rigetto
+MICRO_REJECTION_BODY_ATR_MIN = 0.08
+SETUP_LIFETIME_SECONDS = 4 * 60 * 60  # massimo 4 ore dopo la chiusura 4H
+CLOSE_EVENT_MAX_DELAY_SECONDS = 12    # non inviare segnali vecchi dopo disconnessioni
+
+# SL 4H e TP calcolati in R; nessun tetto alla distanza dello stop
+SL_4H_LOOKBACK = 2
+SL_BUFFER_ATR4H = 0.10
 TP1_R = 0.30
 TP2_R = 0.80
 TP3_R = 1.50
@@ -104,8 +107,8 @@ sent_alerts = set()           # (symbol, apertura della candela)
 pending_alerts = set()
 failed_alert_times = {}
 telegram_queue = queue.Queue(maxsize=100)
-active_setups = {}              # {symbol: stato di breakout/retest, con livello congelato}
-used_breakout_bars = set()       # impedisce di ricreare setup sulla stessa candela
+active_setups = {}             # {symbol: setup 4H confermato in attesa di retest 15m}
+seen_macro_bars = {}            # {symbol: t della 4H gia' analizzata}
 
 
 def log(*parts):
@@ -407,203 +410,201 @@ def btc15_direction(btc_candles):
     return 'LONG' if displacement > 0 else 'SHORT'
 
 
-def breakout_candidate(symbol, candles, btc_direction, now_ms):
-    """Crea un candidato esclusivamente sulla candela di rottura 15m live."""
-    required = max(ATR_PERIOD + 2, VOLUME_AVG_BARS + 1, BREAKOUT_15M_LOOKBACK + 1)
-    if len(candles) < required:
-        return None
-    current = candles[-1]
-    if not (current['t'] <= now_ms < current['t'] + FIFTEEN_MIN_MS):
-        return None
-    opening, closing = current['o'], current['c']
-    if opening == closing:
-        return None
-    direction = 'LONG' if closing > opening else 'SHORT'
-    if btc_direction not in (direction, 'NEUTRAL'):
-        return None
-    elapsed = (now_ms - current['t']) / 1000.0
-    if elapsed < MIN_CANDLE_AGE_SECONDS:
-        return None
-    previous = candles[-(BREAKOUT_15M_LOOKBACK + 1):-1]
-    if any(previous[i]['t'] + FIFTEEN_MIN_MS != previous[i+1]['t'] for i in range(len(previous)-1)):
-        return None
-    if previous[-1]['t'] + FIFTEEN_MIN_MS != current['t']:
-        return None
-    span = current['h'] - current['l']
-    if span <= 0:
-        return None
-    body = abs(closing - opening)
-    fraction = body / span
-    leading = ((current['h'] - closing) if direction == 'LONG' else (closing - current['l'])) / span
-    trailing = ((opening - current['l']) if direction == 'LONG' else (current['h'] - opening)) / span
-    if fraction < BODY_FRACTION_MIN or leading > LEADING_WICK_MAX or trailing > TRAILING_WICK_MAX:
-        return None
-    atr = true_range_atr(candles[:-1])
-    if not atr or body / atr < BODY_ATR_MIN:
-        return None
-    buffer = BREAKOUT_BUFFER_ATR15 * atr
-    level = max(c['h'] for c in previous) if direction == 'LONG' else min(c['l'] for c in previous)
-    if not beyond_breakout(closing, direction, level, buffer):
-        return None
-    pace = live_volume_pace(candles, now_ms)
-    if pace < VOLUME_RATIO_MIN:
-        return None
-    # Manteniamo lo stop 4H anche per i trigger, cosi' non si avvia un setup senza storico.
-    if not four_hour_structural_stop(candles, direction):
-        return None
-    return {
-        'symbol': symbol, 'direction': direction, 'breakout_candle_start': current['t'],
-        'level': level, 'buffer': buffer, 'atr15': atr,
-        'breakout_volume_pace': pace, 'breakout_body_fraction': fraction,
-        'breakout_body_atr': body / atr, 'breakout_leading_wick': leading,
-        'breakout_trailing_wick': trailing,
-    }
-
-
 def beyond_breakout(price, direction, level, buffer):
     return price >= level + buffer if direction == 'LONG' else price <= level - buffer
 
 
-def breakout_candle_closed_valid(candles, setup):
-    """Retest attivabile SOLO se la candela di rottura chiude forte oltre il livello."""
-    ix = next((i for i, c in enumerate(candles[:-1]) if c['t'] == setup['breakout_candle_start']), None)
-    if ix is None or ix < max(ATR_PERIOD + 1, VOLUME_AVG_BARS):
-        return False
-    candle = candles[ix]
-    d = setup['direction']
-    span = candle['h'] - candle['l']
-    if span <= 0 or not beyond_breakout(candle['c'], d, setup['level'], setup['buffer']):
-        return False
-    body = abs(candle['c'] - candle['o'])
-    if (candle['c'] <= candle['o']) if d == 'LONG' else (candle['c'] >= candle['o']):
-        return False
-    lead = (candle['h'] - candle['c']) / span if d == 'LONG' else (candle['c'] - candle['l']) / span
-    trail = (candle['o'] - candle['l']) / span if d == 'LONG' else (candle['h'] - candle['o']) / span
-    if body/span < BODY_FRACTION_MIN or lead > LEADING_WICK_MAX or trail > TRAILING_WICK_MAX:
-        return False
-    if body / setup['atr15'] < BODY_ATR_MIN:
-        return False
-    avg = sum(c['v'] for c in candles[ix - VOLUME_AVG_BARS:ix]) / VOLUME_AVG_BARS
-    if avg <= 0 or candle['v'] / avg < VOLUME_RATIO_MIN:
-        return False
-    return True
+def macro_4h_breakout(symbol, candles, now_ms):
+    """Considera SOLO la 4H appena CHIUSA e le 3 4H CHIUSE precedenti.
 
-
-def build_signal(setup, candles, btc_direction, mode, now_ms):
-    """Ricalcola SL4H e target R sul PREZZO DEL SEGNALE, non sul breakout vecchio."""
-    live = candles[-1]
-    sl_info = four_hour_structural_stop(candles, setup['direction'])
-    if not sl_info:
+    La resistenza e' reale sul timeframe 4H, non max di 16 x 15m live.
+    Se un deploy riparte molto dopo la chiusura, non simula il passato.
+    """
+    four = four_hour_closed_candles(candles)
+    required = max(ATR_PERIOD + 2, FOUR_HOUR_VOLUME_AVG_BARS + 1,
+                   FOUR_HOUR_RESISTANCE_LOOKBACK + 1)
+    if len(four) < required:
         return None
-    price = live['c']
-    risk = (price - sl_info['sl']) if setup['direction'] == 'LONG' else (sl_info['sl'] - price)
-    if price <= 0 or risk <= 0:
+    macro = four[-1]
+    close_ms = macro['t'] + FOUR_HOURS_MS
+    if not (0 <= now_ms - close_ms <= MACRO_CLOSE_GRACE_SECONDS * 1000):
         return None
-    # Controllo coerenza con la direzione prima dell'invio.
-    if not beyond_breakout(price, setup['direction'], setup['level'], setup['buffer']):
+    prev = four[:-1]
+    if any(prev[i]['t'] + FOUR_HOURS_MS != prev[i + 1]['t']
+           for i in range(len(prev) - 1)):
         return None
-    s = {
-        'symbol': setup['symbol'], 'direction': setup['direction'], 'entry': price,
-        'candle_start': setup['breakout_candle_start'], 'entry_candle_start': live['t'],
-        'confirmation_mode': mode,
-        'body_fraction': setup['breakout_body_fraction'], 'body_atr': setup['breakout_body_atr'],
-        'leading_wick': setup['breakout_leading_wick'], 'trailing_wick': setup['breakout_trailing_wick'],
-        'volume_pace': setup['breakout_volume_pace'], 'btc_direction': btc_direction,
-        'atr15': setup['atr15'], 'sl': sl_info['sl'], 'atr4h': sl_info['atr4h'],
-        'stop_distance_pct': risk / price,
-        'breakout_level': setup['level'], 'breakout_buffer': setup['buffer'],
-        'elapsed': (now_ms - setup['breakout_candle_start'])/1000.0,
-    }
-    return s
-
-
-def create_setup(candidate, mono):
+    if prev[-1]['t'] + FOUR_HOURS_MS != macro['t']:
+        return None
+    direction = ('LONG' if macro['c'] > macro['o'] else
+                 'SHORT' if macro['c'] < macro['o'] else None)
+    if direction is None:
+        return None
+    atr4h = true_range_atr(prev)
+    if not atr4h or atr4h <= 0:
+        return None
+    level_bars = prev[-FOUR_HOUR_RESISTANCE_LOOKBACK:]
+    level = max(c['h'] for c in level_bars) if direction == 'LONG' else min(c['l'] for c in level_bars)
+    buffer = BREAKOUT_BUFFER_ATR4H * atr4h
+    if not beyond_breakout(macro['c'], direction, level, buffer):
+        return None
+    full_range = macro['h'] - macro['l']
+    if full_range <= 0:
+        return None
+    close_pos = ((macro['c']-macro['l']) / full_range if direction == 'LONG'
+                 else (macro['h']-macro['c']) / full_range)
+    if close_pos < FOUR_HOUR_CLOSE_POSITION_MIN:
+        return None
+    volume_avg = sum(c['v'] for c in prev[-FOUR_HOUR_VOLUME_AVG_BARS:]) / FOUR_HOUR_VOLUME_AVG_BARS
+    if volume_avg <= 0:
+        return None
+    volume_ratio = macro['v'] / volume_avg
+    if volume_ratio < VOLUME_RATIO_MIN:
+        return None
+    if not four_hour_structural_stop(candles, direction):
+        return None
     return {
-        **candidate,
-        'created': mono,
-        'hold_started': mono,
-        'breakout_closed_checked': False,
-        'retest_armed': False,
-        'retest_touched': False,
-        'touch_price': None,
-        'rebound_started': None,
+        'symbol': symbol, 'direction': direction,
+        'macro_t': macro['t'], 'macro_end_t': close_ms,
+        'level': level, 'macro_buffer': buffer,
+        'atr4h_at_breakout': atr4h,
+        'macro_volume_ratio': volume_ratio,
+        'macro_close_pos': close_pos,
+        'last_checked_15m_t': None,
+        'touched': False, 'touch_t': None,
+        'touched_price': None,
     }
 
 
-def update_setup(setup, candles, btc_direction, now_ms, mono):
-    """Processa A (10 min continui) o B (chiusura + retest + rimbalzo 20s)."""
+def btc15_closed_direction(btc_candles, confirmation_t):
+    """BTC15 sulla candela appena CHIUSA, non sulla nuova LIVE quasi neutra."""
+    if len(btc_candles) < ATR_PERIOD + 3 or btc_candles[-2]['t'] != confirmation_t:
+        return None
+    atr = true_range_atr(btc_candles[:-2])
+    if not atr or atr <= 0:
+        return None
+    candle = btc_candles[-2]
+    movement = candle['c'] - candle['o']
+    if abs(movement) / atr < BTC_NEUTRAL_BODY_ATR_MAX:
+        return 'NEUTRAL'
+    return 'LONG' if movement > 0 else 'SHORT'
+
+
+def confirmation_15m_valid(candle, direction, level, atr15):
+    """Chiusura 15m nella direzione del breakout, dopo il pullback.
+
+    Permette sia una candela direzionale, sia una candela di rigetto con wick
+    (hammer LONG / shooting star SHORT); quindi NON impone corpo 82% al retest.
+    """
+    if atr15 is None or atr15 <= 0:
+        return False
+    span = candle['h'] - candle['l']
+    if span <= 0:
+        return False
+    opening, closing = candle['o'], candle['c']
+    if direction == 'LONG' and closing <= opening:
+        return False
+    if direction == 'SHORT' and closing >= opening:
+        return False
+    if not beyond_breakout(closing, direction, level,
+                           MICRO_CLOSE_BUFFER_ATR15 * atr15):
+        return False
+    close_pos = ((closing - candle['l'])/span if direction == 'LONG'
+                 else (candle['h'] - closing)/span)
+    if close_pos < MICRO_CLOSE_POSITION_MIN:
+        return False
+    body = abs(closing-opening)
+    trailing_wick = ((opening-candle['l'])/span if direction == 'LONG'
+                     else (candle['h']-opening)/span)
+    return (body >= MICRO_BODY_ATR_MIN * atr15 or
+            (trailing_wick >= MICRO_REJECTION_WICK_MIN and
+             body >= MICRO_REJECTION_BODY_ATR_MIN * atr15))
+
+
+def build_confirmed_signal(setup, candles, btc_direction, candle_15m, now_ms):
+    """Entry indicativa dal nuovo tick disponibile DOPO chiusura 15m."""
+    if btc_direction not in (setup['direction'], 'NEUTRAL'):
+        return None
     live = candles[-1]
-    d = setup['direction']
     price = live['c']
-    level = setup['level']
-    buffer = setup['buffer']
-    atr = setup['atr15']
-    if mono - setup['created'] >= SETUP_LIFETIME_SECONDS:
-        return 'EXPIRED', None
-    if now_ms < live['t'] or now_ms >= live['t'] + FIFTEEN_MIN_MS:
-        return 'EXPIRED', None
+    if price <= 0 or not beyond_breakout(
+            price, setup['direction'], setup['level'],
+            MICRO_CLOSE_BUFFER_ATR15 * setup['atr15_retest']):
+        return None
+    info = four_hour_structural_stop(candles, setup['direction'])
+    if not info:
+        return None
+    risk = (price - info['sl'] if setup['direction'] == 'LONG'
+            else info['sl'] - price)
+    if risk <= 0:
+        return None
+    return {
+        'symbol': setup['symbol'], 'direction': setup['direction'],
+        'entry': price, 'sl': info['sl'], 'atr4h': info['atr4h'],
+        'stop_distance_pct': risk/price,
+        'macro_t': setup['macro_t'], 'macro_end_t': setup['macro_end_t'],
+        'confirm_15m_t': candle_15m['t'],
+        'retest_t': setup['touch_t'], 'breakout_level': setup['level'],
+        'breakout_buffer': setup['macro_buffer'],
+        'macro_volume_ratio': setup['macro_volume_ratio'],
+        'macro_close_pos': setup['macro_close_pos'],
+        'btc_direction': btc_direction,
+    }
 
-    above = beyond_breakout(price, d, level, buffer)
-    if above:
-        if setup['hold_started'] is None:
-            setup['hold_started'] = mono
-    else:
-        setup['hold_started'] = None
 
-    if not setup['breakout_closed_checked'] and live['t'] > setup['breakout_candle_start']:
-        setup['breakout_closed_checked'] = True
-        initial_closed = next((c for c in candles[:-1]
-                               if c['t'] == setup['breakout_candle_start']), None)
-        # Una chiusura dalla parte sbagliata invalida entrambe le alternative.
-        if initial_closed is None or not beyond_breakout(
-                initial_closed['c'], d, level, buffer):
-            return 'EXPIRED', None
-        # Il retest richiede un breakout CHIUSO forte; la tenuta 10m richiede
-        # invece la forza al trigger e 600s sopra/sotto il livello congelato.
-        setup['retest_armed'] = breakout_candle_closed_valid(candles, setup)
-
-    btc_ok = btc_direction in (d, 'NEUTRAL')
-    if above and setup['hold_started'] is not None and mono - setup['hold_started'] >= HOLD_SECONDS:
-        # Finche' siamo sulla candela di rottura, anche il volume live deve essere alto.
-        if live['t'] != setup['breakout_candle_start'] or live_volume_pace(candles, now_ms) >= VOLUME_RATIO_MIN:
-            if btc_ok:
-                s = build_signal(setup, candles, btc_direction, 'TENUTA_10_MIN', now_ms)
-                if s:
-                    return 'SIGNAL', s
-
-    if not setup['retest_armed'] or live['t'] <= setup['breakout_candle_start']:
+def evaluate_closed_retest_candle(setup, candles, btc_candles, now_ms):
+    """Elabora una sola candela 15m appena chiusa; mai una LIVE."""
+    if len(candles) < ATR_PERIOD + 3:
         return 'WAIT', None
-
-    tol = RETEST_ZONE_ATR15 * atr
-    # Uno sfondamento profondo invalida il retest; si evita di scambiarlo per un rimbalzo.
-    deep_break = live['l'] < level - tol if d == 'LONG' else live['h'] > level + tol
-    if deep_break:
+    live = candles[-1]
+    closed = candles[-2]
+    closed_end = closed['t'] + FIFTEEN_MIN_MS
+    if live['t'] != closed_end:
+        return 'EXPIRED', None  # perdita di continuita' / feed con buchi
+    if closed['t'] < setup['macro_end_t']:
+        return 'WAIT', None  # nessun retest prima della chiusura 4H
+    if now_ms - setup['macro_end_t'] > SETUP_LIFETIME_SECONDS * 1000:
         return 'EXPIRED', None
+    if setup['last_checked_15m_t'] == closed['t']:
+        return 'WAIT', None
+    if (setup['last_checked_15m_t'] is not None and
+            closed['t'] != setup['last_checked_15m_t'] + FIFTEEN_MIN_MS):
+        return 'EXPIRED', None
+    setup['last_checked_15m_t'] = closed['t']
+    if now_ms - closed_end > CLOSE_EVENT_MAX_DELAY_SECONDS * 1000:
+        return 'WAIT', None  # non fingere un'entrata retroattiva
 
-    if not setup['retest_touched']:
-        # Il PREZZO LIVE entra nella zona +/-0.10 ATR attorno al livello.
-        if abs(price - level) <= tol:
-            setup['retest_touched'] = True
-            setup['touch_price'] = price
-            setup['rebound_started'] = None
-            log('RETEST', setup['symbol'], d, 'livello', price_format(level))
-    if setup['retest_touched']:
-        if d == 'LONG':
-            bounce_target = max(level + buffer, setup['touch_price'] + RETEST_REBOUND_ATR15 * atr)
-            bounced = price >= bounce_target
-        else:
-            bounce_target = min(level - buffer, setup['touch_price'] - RETEST_REBOUND_ATR15 * atr)
-            bounced = price <= bounce_target
-        if bounced:
-            if setup['rebound_started'] is None:
-                setup['rebound_started'] = mono
-            if mono - setup['rebound_started'] >= RETEST_CONFIRM_SECONDS and btc_ok:
-                s = build_signal(setup, candles, btc_direction, 'RETEST_RIMBALZO', now_ms)
-                if s:
-                    return 'SIGNAL', s
-        else:
-            setup['rebound_started'] = None
+    atr15 = true_range_atr(candles[:-2])
+    if not atr15 or atr15 <= 0:
+        return 'WAIT', None
+    level = setup['level']
+    tol = RETEST_ZONE_ATR15 * atr15
+    d = setup['direction']
+    touched = (closed['l'] <= level + tol and closed['h'] >= level - tol)
+    if d == 'SHORT':
+        touched = (closed['h'] >= level - tol and closed['l'] <= level + tol)
+
+    # Un ribasso/rialzo troppo profondo cancella il setup (falsa rottura).
+    if (d == 'LONG' and closed['l'] < level - tol) or (d == 'SHORT' and closed['h'] > level + tol):
+        return 'EXPIRED', None
+    if touched and not setup['touched']:
+        setup['touched'] = True
+        setup['touch_t'] = closed['t']
+        setup['touched_price'] = closed['l'] if d == 'LONG' else closed['h']
+        log('RETEST 15M', setup['symbol'], d, 'livello', price_format(level))
+
+    if not setup['touched']:
+        return 'WAIT', None
+    if not confirmation_15m_valid(closed, d, level, atr15):
+        return 'WAIT', None
+    btc_direction = btc15_closed_direction(btc_candles, closed['t'])
+    if btc_direction not in (d, 'NEUTRAL'):
+        return 'WAIT', None
+    setup['atr15_retest'] = atr15
+    signal = build_confirmed_signal(setup, candles, btc_direction, closed, now_ms)
+    if signal:
+        return 'SIGNAL', signal
     return 'WAIT', None
+
 
 def price_format(price):
     if price >= 1000:
@@ -615,41 +616,42 @@ def price_format(price):
     return f'{price:.9f}'
 
 
-def message_for(signal):
-    """Invia SL 4H + TP in R, distinguendo il breakout dal retest."""
-    s = signal
+def message_for(s):
+    """Telegram: conferma 4H CHIUSA + retest e conferma 15m CHIUSA."""
     d = 1 if s['direction'] == 'LONG' else -1
     risk = abs(s['entry'] - s['sl'])
     tp1 = s['entry'] + d * TP1_R * risk
     tp2 = s['entry'] + d * TP2_R * risk
     tp3 = s['entry'] + d * TP3_R * risk
     now_italy = datetime.now(ITALY).strftime('%d/%m/%Y %H:%M:%S')
-    candle_italy = datetime.fromtimestamp(s['candle_start']/1000, ITALY).strftime('%d/%m %H:%M')
-    entry_italy = datetime.fromtimestamp(s['entry_candle_start']/1000, ITALY).strftime('%d/%m %H:%M')
-    confirmation = 'Permanenza di 10 minuti' if s['confirmation_mode'] == 'TENUTA_10_MIN' else 'Retest + rimbalzo 20 secondi'
+    macro_italy = datetime.fromtimestamp(s['macro_t']/1000, ITALY).strftime('%d/%m %H:%M')
+    retest_italy = datetime.fromtimestamp(s['retest_t']/1000, ITALY).strftime('%d/%m %H:%M')
+    confirm_italy = datetime.fromtimestamp(s['confirm_15m_t']/1000, ITALY).strftime('%d/%m %H:%M')
     return (
-        f"MOMENTUM ONE 4H - {s['direction']} [SIMULAZIONE]\n"
+        f"MOMENTUM ONE - 4H CHIUSA + RETEST 15M - {s['direction']} [SIMULAZIONE]\n"
         f"{s['symbol'].replace('USDT', '/USDT')}\n"
-        f"Conferma: {confirmation}\n"
         f"Orario Italia: {now_italy}\n"
-        f"Candela breakout: {candle_italy} | candela entry: {entry_italy}\n"
+        f"Candela breakout 4H iniziata: {macro_italy} (CHIUSA)\n"
+        f"Retest 15m iniziato: {retest_italy}\n"
+        f"Candela conferma 15m iniziata: {confirm_italy} (CHIUSA)\n"
+        f"Livello resistenza/supporto 4H: {price_format(s['breakout_level'])}\n"
+        f"Margine breakout 4H: {price_format(s['breakout_buffer'])}\n"
+        f"Volume 4H breakout: {s['macro_volume_ratio']:.2f}x (min {VOLUME_RATIO_MIN:.2f}x)\n"
+        f"BTC15 sulla conferma: {s['btc_direction']}\n"
         f"ENTRY indicativa: {price_format(s['entry'])}\n"
-        f"SL 4H (2 chiuse + 0.10 ATR4H): {price_format(s['sl'])}\n"
+        f"SL 4H (2 chiuse +0.10 ATR4H): {price_format(s['sl'])}\n"
         f"Distanza SL: {s['stop_distance_pct']*100:.2f}% (nessun tetto)\n"
         f"TP1 (0.30R): {price_format(tp1)}\n"
         f"TP2 (0.80R): {price_format(tp2)}\n"
         f"TP3 (1.50R): {price_format(tp3)}\n\n"
-        f"Corpo BREAKOUT: {s['body_fraction']*100:.1f}% | {s['body_atr']:.2f} ATR15\n"
-        f"Wick breakout direzionale/opposto: {s['leading_wick']*100:.1f}% / {s['trailing_wick']*100:.1f}%\n"
-        f"Volume progressivo al breakout: {s['volume_pace']:.2f}x\n"
-        f"Livello ultime 4h: {price_format(s['breakout_level'])}, buffer {price_format(s['breakout_buffer'])}\n"
-        f"BTC15: {s['btc_direction']} (neutro <0.20 ATR15)\n"
-        f"SOLO AVVISO INFORMATIVO. SL/TP non sono ordini.\n"
-        f"Trading sperimentale; gestione rischio e liquidazione restano a carico dell'utente."
+        f"SOLO AVVISO INFORMATIVO: SL/TP NON sono ordini. "
+        f"La conferma non garantisce una continuazione. Rischio e liquidazione "
+        f"a carico dell'utente."
     )
 
+
 def enqueue_alert(signal):
-    key = (signal['symbol'], signal['candle_start'])
+    key = (signal['symbol'], signal['macro_t'])
     now = time.monotonic()
     with alert_lock:
         if key in sent_alerts or key in pending_alerts:
@@ -699,58 +701,50 @@ def current_snapshot():
 
 
 def scan_market():
-    """Due strade indipendenti: tenuta 600s oppure breakout chiuso + retest."""
+    """Avvia un setup solo dopo chiusura 4H; valuta SOLO 15m chiuse."""
     snapshot = current_snapshot()
     if 'BTCUSDT' not in snapshot:
-        active_setups.clear()  # feed assente: non si puo' certificare permanenza continua
         return 0
-    now_ms = int(time.time() * 1000)
     btc_candles = snapshot['BTCUSDT']
-    btc_live = btc_candles[-1]
-    if not (btc_live['t'] <= now_ms < btc_live['t'] + FIFTEEN_MIN_MS):
-        active_setups.clear()
+    now_ms = int(time.time() * 1000)
+    if not (btc_candles[-1]['t'] <= now_ms < btc_candles[-1]['t'] + FIFTEEN_MIN_MS):
         return 0
-    btc_direction = btc15_direction(btc_candles)
-    if btc_direction is None:
-        active_setups.clear()
-        return 0
-    mono = time.monotonic()
     queued = 0
-    for symbol in list(active_setups):
-        if symbol not in snapshot or snapshot[symbol][-1]['t'] != btc_live['t']:
-            del active_setups[symbol]  # un buco nel feed annulla conferma e setup
     for symbol, candles in snapshot.items():
-        if candles[-1]['t'] != btc_live['t']:
+        if candles[-1]['t'] != btc_candles[-1]['t']:
             continue
+        four = four_hour_closed_candles(candles)
+        if not four:
+            continue
+        macro_t = four[-1]['t']
+        if seen_macro_bars.get(symbol) != macro_t:
+            seen_macro_bars[symbol] = macro_t
+            candidate = macro_4h_breakout(symbol, candles, now_ms)
+            if candidate:
+                active_setups[symbol] = candidate
+                log('BREAKOUT 4H CHIUSO', symbol, candidate['direction'],
+                    '| livello', price_format(candidate['level']),
+                    '| volume 4H', f"{candidate['macro_volume_ratio']:.2f}x")
+            else:
+                active_setups.pop(symbol, None)  # nuovo blocco 4H invalida il vecchio
+
         setup = active_setups.get(symbol)
-        if setup is None:
-            key = (symbol, candles[-1]['t'])
-            if key in used_breakout_bars:
-                continue
-            with alert_lock:
-                if key in sent_alerts or key in pending_alerts:
-                    continue
-            candidate = breakout_candidate(symbol, candles, btc_direction, now_ms)
-            if candidate is None:
-                continue
-            used_breakout_bars.add(key)
-            setup = create_setup(candidate, mono)
-            active_setups[symbol] = setup
-            log('BREAKOUT CANDIDATO', symbol, setup['direction'],
-                '| livello', price_format(setup['level']), '| volume', f"{setup['breakout_volume_pace']:.2f}x")
-        status, signal = update_setup(setup, candles, btc_direction, now_ms, mono)
-        if status == 'EXPIRED':
+        if not setup:
+            continue
+        if now_ms - setup['macro_end_t'] > SETUP_LIFETIME_SECONDS * 1000:
             del active_setups[symbol]
             continue
-        if status == 'SIGNAL' and signal:
+        status, signal = evaluate_closed_retest_candle(setup, candles, btc_candles, now_ms)
+        if status == 'EXPIRED':
+            del active_setups[symbol]
+        elif status == 'SIGNAL' and signal:
             if enqueue_alert(signal):
                 queued += 1
-                log('SEGNALE', signal['direction'], symbol, '|', signal['confirmation_mode'],
-                    '| BTC15', btc_direction)
+                log('SEGNALE 4H + RETEST 15M', symbol, signal['direction'],
+                    '| BTC15', signal['btc_direction'])
                 del active_setups[symbol]
-    # Storico deduplica limitato a 4 ore; nessun doppio avviso per medesimo setup.
-    oldest_allowed = btc_live['t'] - FOUR_HOURS_MS
-    used_breakout_bars.intersection_update({k for k in used_breakout_bars if k[1] >= oldest_allowed})
+    # Segnali gia' inviati conservati finche' macro non e' vecchia di oltre 8h.
+    oldest_allowed = now_ms - 2 * FOUR_HOURS_MS
     with alert_lock:
         sent_alerts.intersection_update({k for k in sent_alerts if k[1] >= oldest_allowed})
         for key in list(failed_alert_times):
@@ -758,31 +752,31 @@ def scan_market():
                 del failed_alert_times[key]
     return queued
 
+
 def main():
-    log('MOMENTUM ONE | 25 crypto | scan ~1s | 4H breakout + TENUTA 10 MIN / RETEST')
-    log('Corpo 82% / 0.65 ATR15, wick 8%/10%, volume 1.80x, buffer 0.05 ATR15, BTC15 favorevole/neutro')
-    log('SL 2 candele 4H chiuse +0.10 ATR4H senza limite; TP 0.30R / 0.80R / 1.50R')
+    log('MOMENTUM ONE | 25 crypto | scan ~1s | CHIUSURA 4H + RETEST 15M CHIUSO')
+    log('4H breakout vs 3 precedenti 4H, volume 4H >=1.80x 10 4H, retest 15m +/-0.10ATR15')
+    log('BTC15 concorde/neutro; SL 2x4H +0.10ATR4H senza tetto; TP 0.30R/0.80R/1.50R')
     if not BOT_TOKEN or not CHAT_ID:
-        log('ATTENZIONE: mancano le variabili ambiente Telegram; niente notifiche.')
+        log('ATTENZIONE: mancano le variabili ambiente Telegram; nessuna notifica.')
     while True:
         try:
             initialize_history()
             break
         except Exception as exc:
-            log('Storico Binance non disponibile:', exc, 'riprovo fra 20s')
+            log('Storico Binance non disponibile:', exc, 'riprovo fra 20 secondi')
             time.sleep(20)
     threading.Thread(target=telegram_worker, daemon=True).start()
     threading.Thread(target=history_worker, daemon=True).start()
     threading.Thread(target=websocket_worker, daemon=True).start()
-    send_telegram('MOMENTUM ONE 4H AVVIATO [SIMULAZIONE]. 25 crypto, scan ~1s. '
-                  'Breakout 4 ore (16x15m chiuse) +0.05 ATR15 con candela forte: '
-                  'corpo 82%, >=0.65 ATR15, wick 8%/10%, volume progressivo >=1.80x. '
-                  'Conferma ALTERNATIVA A: 10 minuti CONTINUI sopra/sotto il livello; '
-                  'OPPURE B: candela di breakout chiusa forte, retest +/-0.10 ATR15 '
-                  'e rimbalzo di 0.05 ATR15 per 20 secondi. BTC15 concorde/neutro. '
-                  'SL ultime 2 candele 4H chiuse +0.10 ATR4H, senza limite percentuale. '
-                  'TP1 0.30R / TP2 0.80R / TP3 1.50R sullo stop 4H. '
-                  'Solo segnali, nessun ordine automatico.')
+    send_telegram('MOMENTUM ONE 4H+15M AVVIATO [SIMULAZIONE]. 25 crypto, scan ~1s. '
+                  'Candela 4H CHIUSA oltre massimo/minimo precedenti 3 4H +0.05 ATR4H; '
+                  'volume 4H >=1.80x sulle precedenti 10 4H. '
+                  'Obbligatorio retest +/-0.10 ATR15, poi candela 15m CHIUSA '
+                  'nella direzione della rottura oltre +/-0.05 ATR15; '
+                  'BTC15 chiuso concorde/neutro. NO tenuta 10 minuti. '
+                  'SL ultime 2 candele 4H chiuse +0.10 ATR4H senza tetto. '
+                  'TP1 0.30R / TP2 0.80R / TP3 1.50R. Solo segnali, nessun ordine.')
     next_scan = time.monotonic()
     last_log = next_scan
     while True:
@@ -796,7 +790,7 @@ def main():
             snap = current_snapshot()
             b = btc15_direction(snap['BTCUSDT']) if 'BTCUSDT' in snap else 'DATI NON FRESCHI'
             log('Scansione ~1s | feed attivi:', len(snap), '/25 | BTC15:', b,
-                '| setup in attesa:', len(active_setups))
+                '| setup 4H in attesa:', len(active_setups))
             last_log = now
         time.sleep(max(0.0, next_scan - time.monotonic()))
         if next_scan < time.monotonic() - SCAN_SECONDS:
