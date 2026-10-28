@@ -3,18 +3,19 @@
 STRATEGIA (stessa logica LONG/SHORT, nessun ordine automatico):
 1. La candela 4H CHIUSA rompe il massimo/minimo delle 3 precedenti 4H
    CHIUSE di almeno 0.05 ATR4H, e chiude vicino all'estremo direzionale.
-2. Volume della candela 4H di rottura >=1.80x la media delle precedenti
-   10 candele 4H chiuse: nessuna proiezione del volume LIVE 4H.
+2. NESSUN requisito di volume sulla candela di breakout 4H gia' chiusa.
 3. Solo DOPO quella chiusura 4H il bot osserva il grafico 15m e attende
    il pullback sulla vecchia resistenza/supporto (+/-0.10 ATR15).
-4. Una candela 15m SUCCESSIVA al breakout deve CHIUDERE rialzista/ribassista
-   e oltre il livello (+/-0.05 ATR15), con pressione direzionale o rigetto.
+4. La candela 15m di conferma dopo il retest deve CHIUDERE nella direzione
+   del breakout (+/-0.05 ATR15), con pressione direzionale o rigetto, e
+   volume CHIUSO >=1.80x la media delle 10 precedenti candele 15m chiuse.
 5. BTC15 della stessa candela 15m chiusa concorde o neutro (<0.20 ATR15).
 6. Entra solo in simulazione al primo prezzo disponibile dopo la chiusura 15m.
 
 NON esiste piu' la vecchia alternativa TENUTA 10 MIN: retest e chiusure
 4H e 15m sono obbligatori. La candela del retest puo' essere piccola o
-con wick di rifiuto: non le si impone corpo >=82% / volume >=1.80x.
+con wick di rifiuto: NON le si impone il corpo >=82%. Il volume >=1.80x
+va verificato sulla candela 15m di CONFERMA (anche se coincide col retest).
 
 Stop strutturale: estremo delle ultime 2 candele 4H chiuse +/-0.10 ATR4H,
 senza limite percentuale, includendo eventuale estremo 15m live piu' largo.
@@ -56,8 +57,8 @@ BTC_NEUTRAL_BODY_ATR_MAX = 0.20
 
 # Il breakout 4H avviene rispetto ai massimi/minimi delle precedenti 3 4H.
 FOUR_HOUR_RESISTANCE_LOOKBACK = 3
-FOUR_HOUR_VOLUME_AVG_BARS = 10
-VOLUME_RATIO_MIN = 1.80             # 4H CHIUSA vs media delle 10 4H precedenti
+VOLUME_RATIO_MIN = 1.80             # 15m CONFERMA CHIUSA vs media 10 chiuse
+VOLUME_AVG_BARS_15M = 10           # nessun volume obbligatorio sulla 4H
 BREAKOUT_BUFFER_ATR4H = 0.05       # distanza oltre il livello in ATR4H
 FOUR_HOUR_CLOSE_POSITION_MIN = 0.70 # chiusura nel 30% estremo della 4H
 MACRO_CLOSE_GRACE_SECONDS = 600     # 10m di tolleranza per reconnect post-chiusura 4H
@@ -421,8 +422,7 @@ def macro_4h_breakout(symbol, candles, now_ms):
     Se un deploy riparte molto dopo la chiusura, non simula il passato.
     """
     four = four_hour_closed_candles(candles)
-    required = max(ATR_PERIOD + 2, FOUR_HOUR_VOLUME_AVG_BARS + 1,
-                   FOUR_HOUR_RESISTANCE_LOOKBACK + 1)
+    required = max(ATR_PERIOD + 2, FOUR_HOUR_RESISTANCE_LOOKBACK + 1)
     if len(four) < required:
         return None
     macro = four[-1]
@@ -454,12 +454,6 @@ def macro_4h_breakout(symbol, candles, now_ms):
                  else (macro['h']-macro['c']) / full_range)
     if close_pos < FOUR_HOUR_CLOSE_POSITION_MIN:
         return None
-    volume_avg = sum(c['v'] for c in prev[-FOUR_HOUR_VOLUME_AVG_BARS:]) / FOUR_HOUR_VOLUME_AVG_BARS
-    if volume_avg <= 0:
-        return None
-    volume_ratio = macro['v'] / volume_avg
-    if volume_ratio < VOLUME_RATIO_MIN:
-        return None
     if not four_hour_structural_stop(candles, direction):
         return None
     return {
@@ -467,7 +461,6 @@ def macro_4h_breakout(symbol, candles, now_ms):
         'macro_t': macro['t'], 'macro_end_t': close_ms,
         'level': level, 'macro_buffer': buffer,
         'atr4h_at_breakout': atr4h,
-        'macro_volume_ratio': volume_ratio,
         'macro_close_pos': close_pos,
         'last_checked_15m_t': None,
         'touched': False, 'touch_t': None,
@@ -487,6 +480,22 @@ def btc15_closed_direction(btc_candles, confirmation_t):
     if abs(movement) / atr < BTC_NEUTRAL_BODY_ATR_MAX:
         return 'NEUTRAL'
     return 'LONG' if movement > 0 else 'SHORT'
+
+
+def confirmation_15m_volume_ratio(candles):
+    """Volume della 15m appena CHIUSA vs media delle 10 CHIUSE precedenti.
+
+    candles[-1] e' la 15m LIVE appena iniziata, candles[-2] la conferma chiusa.
+    Nessuna proiezione: si richiede volume 1.80x reale sulla conferma.
+    """
+    if len(candles) < VOLUME_AVG_BARS_15M + 2:
+        return 0.0
+    confirmation = candles[-2]
+    previous = candles[-(VOLUME_AVG_BARS_15M + 2):-2]
+    avg = sum(max(0.0, c['v']) for c in previous) / VOLUME_AVG_BARS_15M
+    if avg <= 0:
+        return 0.0
+    return max(0.0, confirmation['v']) / avg
 
 
 def confirmation_15m_valid(candle, direction, level, atr15):
@@ -545,7 +554,7 @@ def build_confirmed_signal(setup, candles, btc_direction, candle_15m, now_ms):
         'confirm_15m_t': candle_15m['t'],
         'retest_t': setup['touch_t'], 'breakout_level': setup['level'],
         'breakout_buffer': setup['macro_buffer'],
-        'macro_volume_ratio': setup['macro_volume_ratio'],
+        'confirm_volume_ratio': setup['confirm_volume_ratio'],
         'macro_close_pos': setup['macro_close_pos'],
         'btc_direction': btc_direction,
     }
@@ -596,10 +605,15 @@ def evaluate_closed_retest_candle(setup, candles, btc_candles, now_ms):
         return 'WAIT', None
     if not confirmation_15m_valid(closed, d, level, atr15):
         return 'WAIT', None
+    # Il solo filtro volume e' sulla candela 15m CHIUSA di conferma.
+    ratio15 = confirmation_15m_volume_ratio(candles)
+    if ratio15 < VOLUME_RATIO_MIN:
+        return 'WAIT', None
     btc_direction = btc15_closed_direction(btc_candles, closed['t'])
     if btc_direction not in (d, 'NEUTRAL'):
         return 'WAIT', None
     setup['atr15_retest'] = atr15
+    setup['confirm_volume_ratio'] = ratio15
     signal = build_confirmed_signal(setup, candles, btc_direction, closed, now_ms)
     if signal:
         return 'SIGNAL', signal
@@ -636,7 +650,8 @@ def message_for(s):
         f"Candela conferma 15m iniziata: {confirm_italy} (CHIUSA)\n"
         f"Livello resistenza/supporto 4H: {price_format(s['breakout_level'])}\n"
         f"Margine breakout 4H: {price_format(s['breakout_buffer'])}\n"
-        f"Volume 4H breakout: {s['macro_volume_ratio']:.2f}x (min {VOLUME_RATIO_MIN:.2f}x)\n"
+        f"Volume 4H breakout: nessuna soglia richiesta\n"
+        f"Volume 15m conferma: {s['confirm_volume_ratio']:.2f}x (min {VOLUME_RATIO_MIN:.2f}x)\n"
         f"BTC15 sulla conferma: {s['btc_direction']}\n"
         f"ENTRY indicativa: {price_format(s['entry'])}\n"
         f"SL 4H (2 chiuse +0.10 ATR4H): {price_format(s['sl'])}\n"
@@ -724,7 +739,7 @@ def scan_market():
                 active_setups[symbol] = candidate
                 log('BREAKOUT 4H CHIUSO', symbol, candidate['direction'],
                     '| livello', price_format(candidate['level']),
-                    '| volume 4H', f"{candidate['macro_volume_ratio']:.2f}x")
+                    '| volume 4H non richiesto')
             else:
                 active_setups.pop(symbol, None)  # nuovo blocco 4H invalida il vecchio
 
@@ -741,6 +756,7 @@ def scan_market():
             if enqueue_alert(signal):
                 queued += 1
                 log('SEGNALE 4H + RETEST 15M', symbol, signal['direction'],
+                    '| volume 15m', f"{signal['confirm_volume_ratio']:.2f}x",
                     '| BTC15', signal['btc_direction'])
                 del active_setups[symbol]
     # Segnali gia' inviati conservati finche' macro non e' vecchia di oltre 8h.
@@ -755,7 +771,7 @@ def scan_market():
 
 def main():
     log('MOMENTUM ONE | 25 crypto | scan ~1s | CHIUSURA 4H + RETEST 15M CHIUSO')
-    log('4H breakout vs 3 precedenti 4H, volume 4H >=1.80x 10 4H, retest 15m +/-0.10ATR15')
+    log('4H breakout vs 3 precedenti 4H SENZA filtro volume; retest 15m +/-0.10ATR15; volume 15m conferma >=1.80x')
     log('BTC15 concorde/neutro; SL 2x4H +0.10ATR4H senza tetto; TP 0.30R/0.80R/1.50R')
     if not BOT_TOKEN or not CHAT_ID:
         log('ATTENZIONE: mancano le variabili ambiente Telegram; nessuna notifica.')
@@ -771,9 +787,10 @@ def main():
     threading.Thread(target=websocket_worker, daemon=True).start()
     send_telegram('MOMENTUM ONE 4H+15M AVVIATO [SIMULAZIONE]. 25 crypto, scan ~1s. '
                   'Candela 4H CHIUSA oltre massimo/minimo precedenti 3 4H +0.05 ATR4H; '
-                  'volume 4H >=1.80x sulle precedenti 10 4H. '
+                  'NESSUN filtro volume sulla 4H. '
                   'Obbligatorio retest +/-0.10 ATR15, poi candela 15m CHIUSA '
-                  'nella direzione della rottura oltre +/-0.05 ATR15; '
+                  'nella direzione della rottura oltre +/-0.05 ATR15, '
+                  'con volume >=1.80x media ultime 10 candele 15m CHIUSE; '
                   'BTC15 chiuso concorde/neutro. NO tenuta 10 minuti. '
                   'SL ultime 2 candele 4H chiuse +0.10 ATR4H senza tetto. '
                   'TP1 0.30R / TP2 0.80R / TP3 1.50R. Solo segnali, nessun ordine.')
