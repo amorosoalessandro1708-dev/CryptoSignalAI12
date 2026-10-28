@@ -6,17 +6,24 @@ STRATEGIA (stessa logica LONG/SHORT, nessun ordine automatico):
 2. NESSUN requisito di volume sulla candela di breakout 4H gia' chiusa.
 3. Solo DOPO quella chiusura 4H il bot osserva il grafico 15m e attende
    il pullback sulla vecchia resistenza/supporto (+/-0.10 ATR15).
-4. Una candela 15m SUCCESSIVA a quella del retest deve CHIUDERE nella
-   direzione del breakout (+/-0.05 ATR15): corpo >=82% del range, lungo
-   >=0.65 ATR15, wick direzionale <=8%, opposto <=10%, e volume CHIUSO
-   >=1.80x la media delle 10 precedenti candele 15m chiuse.
-5. BTC15 della stessa candela 15m chiusa concorde o neutro (<0.20 ATR15).
-6. Entra solo in simulazione al primo prezzo disponibile dopo la chiusura 15m.
+4. Dopo il retest il bot MONITORA OGNI SECONDO il volume cumulativo LIVE
+   di ogni successiva candela 15m: rapporto reale e proiezione del ritmo
+   rispetto alla media delle 10 precedenti 15m chiuse. NESSUN segnale live.
+5. Il segnale richiede una candela 15m SUCCESSIVA al retest GIA' CHIUSA:
+   nella direzione del breakout (+/-0.05 ATR15), corpo >=82% del range,
+   lungo >=0.65 ATR15, wick direzionale <=8%, opposto <=10%, e volume
+   FINALE >=1.60x la media delle 10 precedenti candele 15m chiuse.
+6. BTC15 della stessa candela 15m chiusa concorde o neutro (<0.20 ATR15).
+7. Entra solo in simulazione al primo prezzo disponibile dopo la chiusura 15m.
 
 NON esiste piu' la vecchia alternativa TENUTA 10 MIN: retest e chiusure
 4H e 15m sono obbligatori. La candela del retest puo' essere piccola,
 rossa o verde, senza requisiti di corpo e volume. La candela di CONFERMA
 si forma DOPO quella del retest e deve essere lunga, piena e voluminosa.
+Le eventuali candele intermedie possono avere volume crescente o irregolare:
+non sono obbligate a una progressione rigida; l'ultima conferma deve
+rispettare il volume minimo effettivo di 1.60x. Le proiezioni LIVE sono
+solo informative: non sostituiscono il controllo finale sulla candela CHIUSA.
 
 Stop strutturale: estremo delle ultime 2 candele 4H chiuse +/-0.10 ATR4H,
 senza limite percentuale, includendo eventuale estremo 15m live piu' largo.
@@ -58,8 +65,10 @@ BTC_NEUTRAL_BODY_ATR_MAX = 0.20
 
 # Il breakout 4H avviene rispetto ai massimi/minimi delle precedenti 3 4H.
 FOUR_HOUR_RESISTANCE_LOOKBACK = 3
-VOLUME_RATIO_MIN = 1.80             # 15m CONFERMA CHIUSA vs media 10 chiuse
+VOLUME_RATIO_MIN = 1.60             # 15m CONFERMA CHIUSA vs media 10 chiuse
 VOLUME_AVG_BARS_15M = 10           # nessun volume obbligatorio sulla 4H
+LIVE_VOLUME_PACE_MIN_SECONDS = 60     # evitare proiezioni fuorvianti a inizio candela
+LIVE_VOLUME_PROGRESS_LOG_SECONDS = 180  # un log ogni 3 minuti, non ogni secondo
 BREAKOUT_BUFFER_ATR4H = 0.05       # distanza oltre il livello in ATR4H
 FOUR_HOUR_CLOSE_POSITION_MIN = 0.70 # chiusura nel 30% estremo della 4H
 MACRO_CLOSE_GRACE_SECONDS = 600     # 10m di tolleranza per reconnect post-chiusura 4H
@@ -327,18 +336,79 @@ def true_range_atr(closed_candles):
     return sum(tr) / ATR_PERIOD
 
 
-def live_volume_pace(candles, now_ms):
-    """Volume proiettato a 15m / volume medio delle 10 precedenti chiuse."""
-    if len(candles) < VOLUME_AVG_BARS + 1:
-        return 0.0
-    live = candles[-1]
-    previous = candles[-(VOLUME_AVG_BARS + 1):-1]
-    avg = sum(c['v'] for c in previous) / len(previous)
-    if avg <= 0:
-        return 0.0
-    elapsed = min(float(TIMEFRAME_SECONDS), max(1.0, (now_ms - live['t']) / 1000.0))
-    return max(0.0, live['v']) / (avg * elapsed / TIMEFRAME_SECONDS)
+def live_volume_progress(candles, now_ms):
+    """Misura il volume cumulativo della candela LIVE senza anticipare il segnale.
 
+    actual_ratio = volume gia' scambiato / media delle 10 precedenti CHIUSE.
+    pace_ratio = proiezione lineare a fine 15m, solo INDICATIVA; non e' il
+    volume definitivo, ne' un filtro di ingresso. La media e' fissata per
+    tutta la durata della candela live e non include mai la live stessa.
+    """
+    if len(candles) < VOLUME_AVG_BARS_15M + 1:
+        return None
+    live = candles[-1]
+    elapsed_ms = now_ms - live['t']
+    if not 0 <= elapsed_ms < FIFTEEN_MIN_MS:
+        return None
+    previous = candles[-(VOLUME_AVG_BARS_15M + 1):-1]
+    avg = sum(max(0.0, c['v']) for c in previous) / VOLUME_AVG_BARS_15M
+    if avg <= 0:
+        return None
+    elapsed = elapsed_ms / 1000.0
+    actual_ratio = max(0.0, live['v']) / avg
+    pace_ratio = (actual_ratio * TIMEFRAME_SECONDS / elapsed
+                  if elapsed >= LIVE_VOLUME_PACE_MIN_SECONDS else None)
+    return {
+        'candle_t': live['t'],
+        'elapsed_seconds': elapsed,
+        'actual_ratio': actual_ratio,
+        'pace_ratio': pace_ratio,
+        'progress_percent': 100.0 * actual_ratio / VOLUME_RATIO_MIN,
+    }
+
+
+def monitor_live_confirmation_volume(setup, candles, now_ms):
+    """Aggiorna ogni scan (~1s) il volume LIVE DOPO un retest CHIUSO.
+
+    I log di avanzamento vengono limitati a uno ogni 3 minuti. Il volume
+    1.60x raggiunto prima della chiusura e' solo una condizione PRELIMINARE:
+    il segnale resta in evaluate_closed_retest_candle sulle 15m CHIUSE.
+    """
+    if not setup['touched'] or not candles:
+        return
+    if candles[-1]['t'] <= setup['touch_t']:
+        return  # il retest stesso non puo' essere la candela di conferma
+    progress = live_volume_progress(candles, now_ms)
+    if not progress:
+        return
+    t = progress['candle_t']
+    state = setup.get('live_volume_state')
+    if state is None or state['candle_t'] != t:
+        state = {
+            'candle_t': t,
+            'reached_final_volume_live': False,
+            'next_log_elapsed': LIVE_VOLUME_PROGRESS_LOG_SECONDS,
+        }
+        setup['live_volume_state'] = state
+    # Il dato viene aggiornato ogni secondo; i log sono meno frequenti.
+    state['actual_ratio'] = progress['actual_ratio']
+    state['pace_ratio'] = progress['pace_ratio']
+    state['progress_percent'] = progress['progress_percent']
+    if (progress['actual_ratio'] >= VOLUME_RATIO_MIN and
+            not state['reached_final_volume_live']):
+        state['reached_final_volume_live'] = True
+        log('VOLUME LIVE', setup['symbol'], setup['direction'],
+            f"{progress['actual_ratio']:.2f}x su {VOLUME_RATIO_MIN:.2f}x",
+            '| SOGLIA RAGGIUNTA: si attende CHIUSURA 15m + altri filtri')
+    if (progress['pace_ratio'] is not None and
+            progress['elapsed_seconds'] >= state['next_log_elapsed']):
+        state['next_log_elapsed'] = ((int(progress['elapsed_seconds']) //
+                                      LIVE_VOLUME_PROGRESS_LOG_SECONDS) + 1) * LIVE_VOLUME_PROGRESS_LOG_SECONDS
+        log('PROGRESSO VOLUME LIVE', setup['symbol'], setup['direction'],
+            f"reale {progress['actual_ratio']:.2f}x",
+            f"({progress['progress_percent']:.0f}% della soglia)",
+            f"ritmo stimato {progress['pace_ratio']:.2f}x",
+            '| conferma SOLO dopo chiusura 15m')
 
 
 def four_hour_closed_candles(candles_15m):
@@ -487,7 +557,7 @@ def confirmation_15m_volume_ratio(candles):
     """Volume della 15m appena CHIUSA vs media delle 10 CHIUSE precedenti.
 
     candles[-1] e' la 15m LIVE appena iniziata, candles[-2] la conferma chiusa.
-    Nessuna proiezione: si richiede volume 1.80x reale sulla conferma.
+    Nessuna proiezione: si richiede volume 1.60x reale sulla conferma.
     """
     if len(candles) < VOLUME_AVG_BARS_15M + 2:
         return 0.0
@@ -763,9 +833,13 @@ def scan_market():
             if enqueue_alert(signal):
                 queued += 1
                 log('SEGNALE 4H + RETEST 15M', symbol, signal['direction'],
-                    '| volume 15m', f"{signal['confirm_volume_ratio']:.2f}x",
+                    '| volume 15m CHIUSO', f"{signal['confirm_volume_ratio']:.2f}x",
                     '| BTC15', signal['btc_direction'])
                 del active_setups[symbol]
+        # La scansione continua a monitorare il volume della 15m ancora LIVE,
+        # ma NON puo' produrre segnali prima della chiusura di quella candela.
+        if symbol in active_setups:
+            monitor_live_confirmation_volume(setup, candles, now_ms)
     # Segnali gia' inviati conservati finche' macro non e' vecchia di oltre 8h.
     oldest_allowed = now_ms - 2 * FOUR_HOURS_MS
     with alert_lock:
@@ -779,7 +853,8 @@ def scan_market():
 def main():
     log('MOMENTUM ONE | 25 crypto | scan ~1s | CHIUSURA 4H + RETEST 15M CHIUSO')
     log('4H breakout senza filtro volume; retest 15m +/-0.10ATR15; conferma 15m CHIUSA SUCCESSIVA')
-    log('Corpo >=82%, >=0.65ATR15, wick 8%/10%, volume 15m conferma >=1.80x su 10 chiuse')
+    log('Volume 15m LIVE monitorato ogni ~1s; soglia finale CHIUSA >=1.60x su 10 chiuse')
+    log('Conferma 15m CHIUSA: corpo >=82%, >=0.65ATR15, wick 8%/10%')
     log('BTC15 concorde/neutro; SL 2x4H +0.10ATR4H senza tetto; TP 0.30R/0.80R/1.50R')
     if not BOT_TOKEN or not CHAT_ID:
         log('ATTENZIONE: mancano le variabili ambiente Telegram; nessuna notifica.')
@@ -799,7 +874,8 @@ def main():
                   'Obbligatorio retest +/-0.10 ATR15, poi candela 15m SUCCESSIVA CHIUSA '
                   'nella direzione della rottura oltre +/-0.05 ATR15: '
                   'corpo >=82% e >=0.65 ATR15, wick 8%/10%, '
-                  'volume >=1.80x media ultime 10 candele 15m CHIUSE; '
+                  'volume LIVE monitorato ~1s (ritmo stimato, senza segnali anticipati); '
+                  'volume FINALE >=1.60x media ultime 10 candele 15m CHIUSE; '
                   'BTC15 chiuso concorde/neutro. NO tenuta 10 minuti. '
                   'SL ultime 2 candele 4H chiuse +0.10 ATR4H senza tetto. '
                   'TP1 0.30R / TP2 0.80R / TP3 1.50R. Solo segnali, nessun ordine.')
