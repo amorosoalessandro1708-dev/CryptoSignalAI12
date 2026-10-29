@@ -6,7 +6,7 @@ STESSI FILTRI STRATEGICI DELLA VERSIONE ORIGINALE:
 - Retest su 15m chiusa entro +/-0.15 ATR15 e senza invalidazione profonda.
 - Conferma su candela 15m SUCCESSIVA CHIUSA: corpo >=75% del range e
   >=0.50 ATR15; wick per lato <=15%; buffer oltre livello 0.02 ATR15.
-- Volume definitivo della candela conferma >=1.35x della media delle
+- Volume definitivo della candela conferma >=0.80x della media delle
   10 precedenti 15m chiuse; volume live controllato senza segnali anticipati.
 - BTC15 sulla conferma concorde o neutro; SL 3x4H +0.10 ATR4H;
   TP1=0.30R, TP2=0.80R, TP3=1.50R; nessun cooldown temporale per crypto.
@@ -53,7 +53,7 @@ BTC_NEUTRAL_BODY_ATR_MAX = 0.20
 
 # Breakout 4H vs massimo/minimo ultime 10 candele 4H chiuse.
 FOUR_HOUR_RESISTANCE_LOOKBACK = 10
-VOLUME_RATIO_MIN = 1.35             # 15m CONFERMA CHIUSA vs media 10 chiuse
+VOLUME_RATIO_MIN = 0.80             # 15m CONFERMA CHIUSA vs media 10 chiuse
 VOLUME_AVG_BARS_15M = 10           # nessun volume obbligatorio sulla 4H
 LIVE_VOLUME_PACE_MIN_SECONDS = 60     # evitare proiezioni fuorvianti a inizio candela
 LIVE_VOLUME_PROGRESS_LOG_SECONDS = 180  # un log ogni 3 minuti, non ogni secondo
@@ -392,7 +392,7 @@ def monitor_live_confirmation_volume(setup, candles, now_ms):
     """Aggiorna ogni scan (~1s) il volume LIVE DOPO un retest CHIUSO.
 
     I log di avanzamento vengono limitati a uno ogni 3 minuti. Il volume
-    1.35x raggiunto prima della chiusura e' solo una condizione PRELIMINARE:
+    0.80x raggiunto prima della chiusura e' solo una condizione PRELIMINARE:
     il segnale resta in evaluate_closed_retest_candle sulle 15m CHIUSE.
     """
     if not setup['touched'] or not candles:
@@ -578,7 +578,7 @@ def confirmation_15m_volume_ratio(candles):
     """Volume della 15m appena CHIUSA vs media delle 10 CHIUSE precedenti.
 
     candles[-1] e' la 15m LIVE appena iniziata, candles[-2] la conferma chiusa.
-    Nessuna proiezione: si richiede volume 1.35x reale sulla conferma.
+    Nessuna proiezione: si richiede volume 0.80x reale sulla conferma.
     """
     if len(candles) < VOLUME_AVG_BARS_15M + 2:
         return 0.0
@@ -938,7 +938,7 @@ def main():
     threading.Thread(target=websocket_worker, daemon=True).start()
     send_telegram('MOMENTUM ONE ALLEGGERITO 25 COIN AVVIATO - TELEGRAM RETRY ATTIVO - '
                   'Scan 1s - 4H 10 barre +0.03 ATR - Retest 0.15 ATR - '
-                  'Vol 1.35x - Corpo 75%/0.50 ATR Wick 15% - SL 3x4H - '
+                  'Vol 0.80x - Corpo 75%/0.50 ATR Wick 15% - SL 3x4H - '
                   'TP 0.30R/0.80R/1.50R - NO COOLDOWN 8H; duplicati stesso breakout bloccati. SOLO SIMULAZIONE.')
     next_scan = time.monotonic()
     last_log = next_scan
