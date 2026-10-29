@@ -1,4 +1,4 @@
-"""MOMENTUM ONE UNIFICATO - 25 COIN | UN SOLO SERVIZIO RAILWAY.
+"""MOMENTUM ONE UNIFICATO - 40 COIN | UN SOLO SERVIZIO RAILWAY.
 
 Gruppo 1H: BTCUSDT, ETHUSDT, SOLUSDT.
 - Breakout 1H CHIUSO sopra/sotto le 20 precedenti 1H, buffer 0.04 ATR1H,
@@ -8,14 +8,14 @@ Gruppo 1H: BTCUSDT, ETHUSDT, SOLUSDT.
   media delle 20 precedenti 15m. SL ultime 5 1H +0.15 ATR1H. Setup 2h.
 - BTC15 sul segnale BTC e' NEUTRAL (non filtra); su ETH/SOL e' concorde o neutro.
 
-Gruppo 4H: le altre 22 criptovalute (PARAMETRI PRECEDENTI INVARIATI).
+Gruppo 4H: le altre 37 criptovalute (PARAMETRI PRECEDENTI INVARIATI).
 - Breakout 4H CHIUSO su 10 precedenti 4H, buffer 0.03 ATR4H,
   chiusura nel 30% direzionale; volume >=1.35x delle 20 precedenti 4H.
 - Retest 15m CHIUSA +/-0.15 ATR15; conferma successiva 15m CHIUSA con
   corpo >=75%, >=0.50 ATR15, wick <=15%, volume >=0.80x media 20 15m.
 - SL ultime 3 4H +0.10 ATR4H. Setup 4h. BTC15 concorde o neutro.
 
-Comune: 25 stream 15m WS, scan ~1s, storico 480 candele 15m,
+Comune: 40 stream 15m WS, scan ~1s, storico 480 candele 15m,
 ATR14 solo su chiuse, TP1/TP2/TP3=0.30R/0.80R/1.50R,
 Telegram retry con anti-duplicato (coin, macro_t), nessun cooldown;
 nessuna esecuzione ordini (solo avvisi in simulazione).
@@ -45,9 +45,13 @@ SYMBOLS = [
     'NEARUSDT', 'UNIUSDT', 'LTCUSDT', 'DOTUSDT', 'APTUSDT',
     'ARBUSDT', 'OPUSDT', 'INJUSDT', 'RENDERUSDT', '1000PEPEUSDT',
     'FILUSDT', 'ETCUSDT', 'AAVEUSDT', 'TIAUSDT', 'SEIUSDT',
+    # 15 nuove altcoin: SOLO strategia 4H; nessun filtro modificato.
+    'HBARUSDT', 'XLMUSDT', 'TRXUSDT', 'ONDOUSDT', 'ENAUSDT',
+    'WIFUSDT', 'TAOUSDT', '1000SHIBUSDT', '1000BONKUSDT', 'WLDUSDT',
+    'FETUSDT', 'ATOMUSDT', 'BCHUSDT', 'JUPUSDT', 'PENDLEUSDT',
 ]
 
-# Le 25 coppie restano monitorate in un solo processo.
+# Le 40 coppie restano monitorate in un solo processo.
 ONE_HOUR_SYMBOLS = frozenset(('BTCUSDT', 'ETHUSDT', 'SOLUSDT'))
 FOUR_HOUR_SYMBOLS = frozenset(s for s in SYMBOLS if s not in ONE_HOUR_SYMBOLS)
 SCAN_SECONDS = 1.0
@@ -512,7 +516,7 @@ def beyond_breakout(price, direction, level, buffer):
 
 
 def macro_breakout(symbol, candles, now_ms, cfg):
-    """Breakout 1H sulle 3 maggiori crypto, 4H sulle altre 22, su candele CHIUSE."""
+    """Breakout 1H sulle 3 maggiori crypto, 4H sulle altre 37, su candele CHIUSE."""
     macro_bars = macro_closed_candles(candles, cfg['macro_ms'])
     required = max(ATR_PERIOD + 2, cfg['lookback'] + 1, cfg['volume_bars_macro'] + 1)
     if len(macro_bars) < required:
@@ -761,7 +765,7 @@ def message_for(s):
     retest_italy = datetime.fromtimestamp(s['retest_t']/1000, ITALY).strftime('%d/%m %H:%M')
     confirm_italy = datetime.fromtimestamp(s['confirm_15m_t']/1000, ITALY).strftime('%d/%m %H:%M')
     title = ('MOMENTUM ONE 1H - BTC ETH SOL' if cfg['name'] == '1H'
-             else 'MOMENTUM ONE 4H - 22 ALTCOIN')
+             else 'MOMENTUM ONE 4H - 37 ALTCOIN')
     signal_id = f"{s['symbol']}-{s['macro_t']}-{s['confirm_15m_t']}"
     return (
         f"{title} - {s['direction']} [SIMULAZIONE]\n"
@@ -867,7 +871,7 @@ def current_snapshot():
 
 
 def scan_market():
-    """Un'unica scansione: 1H per BTC/ETH/SOL, 4H per le altre 22."""
+    """Un'unica scansione: 1H per BTC/ETH/SOL, 4H per le altre 37."""
     snapshot = current_snapshot()
     if 'BTCUSDT' not in snapshot:
         return 0
@@ -893,7 +897,7 @@ def scan_market():
                     candidate['direction'], '| livello', price_format(candidate['level']),
                     '| volume', f"{candidate['macro_volume_ratio']:.2f}x", '| media 20 precedenti')
             elif cfg['name'] == '4H':
-                # Per le 22 altcoin mantiene il comportamento precedente.
+                # Per le 37 altcoin mantiene il comportamento precedente.
                 active_setups.pop(symbol, None)
             # Per BTC/ETH/SOL il setup 1H puo' durare 2 ore anche se
             # l'ora successiva non crea un nuovo breakout valido.
@@ -928,9 +932,9 @@ def scan_market():
 
 
 def main():
-    log('MOMENTUM ONE UNIFICATO | 25 crypto | 3 strategia 1H + 22 strategia 4H | scan ~1s')
+    log('MOMENTUM ONE UNIFICATO | 40 crypto | 3 strategia 1H + 37 strategia 4H | scan ~1s')
     log('1H BTC/ETH/SOL: volume breakout >=1.60x 20 1H; conferma 15m >=1.00x 20 15m')
-    log('4H altre 22: volume breakout >=1.35x 20 4H; conferma 15m >=0.80x 20 15m')
+    log('4H altre 37: volume breakout >=1.35x 20 4H; conferma 15m >=0.80x 20 15m')
     log('TELEGRAM RETRY ATTIVO | NO COOLDOWN | anti-duplicati per breakout')
     if not BOT_TOKEN or not CHAT_ID:
         log('ATTENZIONE: mancano variabili Telegram')
@@ -944,11 +948,11 @@ def main():
     threading.Thread(target=telegram_worker, daemon=True).start()
     threading.Thread(target=history_worker, daemon=True).start()
     threading.Thread(target=websocket_worker, daemon=True).start()
-    send_telegram('MOMENTUM ONE UNIFICATO AVVIATO [SIMULAZIONE] - 25 crypto, scan ~1s. '
+    send_telegram('MOMENTUM ONE UNIFICATO AVVIATO [SIMULAZIONE] - 40 crypto, scan ~1s. '
                   'BTC ETH SOL: BREAKOUT 1H volume >=1.60x su 20 1H; '
                   'RETEST 15m; CONFERMA 15m volume >=1.00x su 20 15m; '
                   'corpo >=80%, >=0.60 ATR15, wick <=12%; SL 5x1H +0.15 ATR1H; setup 2h. '
-                  'ALTRE 22: BREAKOUT 4H volume >=1.35x su 20 4H; '
+                  'ALTRE 37: BREAKOUT 4H volume >=1.35x su 20 4H; '
                   'RETEST 15m; CONFERMA 15m volume >=0.80x su 20 15m; '
                   'corpo >=75%, >=0.50 ATR15, wick <=15%; SL 3x4H +0.10 ATR4H; setup 4h. '
                   'BTC neutro solo su BTC. TP1 0.30R / TP2 0.80R / TP3 1.50R. '
@@ -969,7 +973,7 @@ def main():
                 in_delivery = len(pending_alerts)
             s1 = sum(1 for s in active_setups if s in ONE_HOUR_SYMBOLS)
             s4 = sum(1 for s in active_setups if s in FOUR_HOUR_SYMBOLS)
-            log('Scansione ~1s | feed attivi:', len(snap), '/25 | BTC15:', b,
+            log('Scansione ~1s | feed attivi:', len(snap), '/40 | BTC15:', b,
                 '| setup 1H:', s1, '| setup 4H:', s4, '| Telegram in coda:', in_delivery)
             last_log = now
         time.sleep(max(0.0, next_scan - time.monotonic()))
