@@ -9,13 +9,14 @@ STESSI FILTRI STRATEGICI DELLA VERSIONE ORIGINALE:
 - Volume definitivo della candela conferma >=1.35x della media delle
   10 precedenti 15m chiuse; volume live controllato senza segnali anticipati.
 - BTC15 sulla conferma concorde o neutro; SL 3x4H +0.10 ATR4H;
-  TP1=0.30R, TP2=0.80R, TP3=1.50R; cooldown per crypto 8 ore.
+  TP1=0.30R, TP2=0.80R, TP3=1.50R; nessun cooldown temporale per crypto.
 - Validita' setup effettiva 4 ore (come nel codice originale, non 3).
 
 AGGIORNAMENTI SOLO OPERATIVI: consegna Telegram con retry, log diagnostici
 per retest/conferme rifiutate, gestione della coda senza perdere messaggi
 alla prima difficolta' di rete. La garanzia di consegna esatta una volta
 non e' tecnicamente possibile in caso di timeout ambiguo dell'API Telegram.
+Segnali duplicati dello STESSO breakout 4H bloccati con chiave (coin, macro_t).
 Solo segnali simulati. Nessun ordine automatico, nessuna modifica dei filtri.
 """
 
@@ -90,7 +91,6 @@ REST_REFRESH_SECONDS = 300
 GAP_REFRESH_SECONDS = 15
 LOG_INTERVAL_SECONDS = 15
 TELEGRAM_RETRY_SECONDS = 30
-COOLDOWN_AFTER_SIGNAL_SECONDS = 8 * 60 * 60
 HISTORY_MAXLEN = 320  # necessario per ricostruire ATR14 sul timeframe 4H
 # Parametri trasporto Telegram (NON influiscono sui requisiti di trading)
 TELEGRAM_MAX_ATTEMPTS = 8
@@ -113,7 +113,6 @@ failed_alert_times = {}
 telegram_queue = queue.Queue(maxsize=100)
 active_setups = {}             # {symbol: setup 4H confermato in attesa di retest 15m}
 seen_macro_bars = {}            # {symbol: t della 4H gia' analizzata}
-last_signal_time = {}           # cooldown 8 ore, solo dopo invio Telegram confermato
 
 
 def log(*parts):
@@ -781,9 +780,6 @@ def enqueue_alert(signal):
     key = (signal['symbol'], signal['macro_t'])
     now = time.monotonic()
     with alert_lock:
-        if now - last_signal_time.get(signal['symbol'], -1e9) < COOLDOWN_AFTER_SIGNAL_SECONDS:
-            log('COOLDOWN 8H: segnale bloccato per', signal['symbol'])
-            return False
         if key in sent_alerts or key in pending_alerts:
             return False
         if now - failed_alert_times.get(key, -1e9) < TELEGRAM_RETRY_SECONDS:
@@ -805,7 +801,7 @@ def telegram_worker():
     """Ritenta invii falliti e conferma solo con risposta positiva API.
 
     Finche' il job e' in retry resta in pending_alerts, quindi non viene
-    accodato due volte. Mantiene il cooldown originale di 8h per crypto.
+    accodato due volte. Nessun blocco temporale tra breakout diversi.
     """
     while True:
         key, message = telegram_queue.get()
@@ -822,7 +818,6 @@ def telegram_worker():
                     delivered = True
                     with alert_lock:
                         sent_alerts.add(key)
-                        last_signal_time[key[0]] = time.monotonic()
                         failed_alert_times.pop(key, None)
                     log('TELEGRAM CONSEGNATO', key[0], '| macro', key[1], '| tentativo', attempt)
                     break
@@ -910,12 +905,13 @@ def scan_market():
                     '| BTC15', signal['btc_direction'])
                 del active_setups[symbol]
             else:
-                log('SEGNALE NON ACCODATO', symbol, '| cooldown, duplicato o coda piena')
+                log('SEGNALE NON ACCODATO', symbol, '| duplicato, errore precedente o coda piena')
         # La scansione continua a monitorare il volume della 15m ancora LIVE,
         # ma NON puo' produrre segnali prima della chiusura di quella candela.
         if symbol in active_setups:
             monitor_live_confirmation_volume(setup, candles, now_ms)
-    # Segnali gia' inviati conservati finche' macro non e' vecchia di oltre 8h.
+    # Protezione ANTI-DUPLICATO per (coin, macro_t), non cooldown per crypto.
+    # Le chiavi obsolete vengono rimosse dopo 8h: il setup scade gia' dopo 4h.
     oldest_allowed = now_ms - 2 * FOUR_HOURS_MS
     with alert_lock:
         sent_alerts.intersection_update({k for k in sent_alerts if k[1] >= oldest_allowed})
@@ -927,7 +923,7 @@ def scan_market():
 
 def main():
     log('MOMENTUM ONE ALLEGGERITO | 25 crypto | scan 1s | 4H 10 barre +0.03 ATR + RETEST 0.15 ATR')
-    log('TELEGRAM RETRY ATTIVO | soglie trading originali invariate | log diagnostici attivi')
+    log('TELEGRAM RETRY ATTIVO | NO COOLDOWN 8H | anti-duplicati per breakout 4H | log diagnostici attivi')
     if not BOT_TOKEN or not CHAT_ID:
         log('ATTENZIONE: mancano variabili Telegram')
     while True:
@@ -943,7 +939,7 @@ def main():
     send_telegram('MOMENTUM ONE ALLEGGERITO 25 COIN AVVIATO - TELEGRAM RETRY ATTIVO - '
                   'Scan 1s - 4H 10 barre +0.03 ATR - Retest 0.15 ATR - '
                   'Vol 1.35x - Corpo 75%/0.50 ATR Wick 15% - SL 3x4H - '
-                  'TP 0.30R/0.80R/1.50R - cooldown 8h. SOLO SIMULAZIONE.')
+                  'TP 0.30R/0.80R/1.50R - NO COOLDOWN 8H; duplicati stesso breakout bloccati. SOLO SIMULAZIONE.')
     next_scan = time.monotonic()
     last_log = next_scan
     while True:
