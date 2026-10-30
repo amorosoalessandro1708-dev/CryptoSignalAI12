@@ -3,7 +3,7 @@
 Gruppo 1H: BTCUSDT, ETHUSDT, SOLUSDT.
 - Breakout 1H CHIUSO sopra/sotto le 20 precedenti 1H, buffer 0.04 ATR1H,
   chiusura nel 35% direzionale; volume >=1.60x delle 20 precedenti 1H.
-- Retest su 15m CHIUSA entro +/-0.15 ATR15; conferma 15m successiva CHIUSA
+- Retest su 15m CHIUSA: tocco del livello (senza tolleranza ATR e senza limite wick); conferma 15m successiva CHIUSA
   con corpo >=80%, >=0.60 ATR15, wick <=12% per lato e volume >=1.00x
   media delle 20 precedenti 15m. SL ultime 5 1H +0.15 ATR1H. Setup 2h.
 - BTC15 sul segnale BTC e' NEUTRAL (non filtra); su ETH/SOL e' concorde o neutro.
@@ -11,7 +11,7 @@ Gruppo 1H: BTCUSDT, ETHUSDT, SOLUSDT.
 Gruppo 4H: le altre 37 criptovalute (PARAMETRI PRECEDENTI INVARIATI).
 - Breakout 4H CHIUSO su 10 precedenti 4H, buffer 0.03 ATR4H,
   chiusura nel 30% direzionale; volume >=1.35x delle 20 precedenti 4H.
-- Retest 15m CHIUSA +/-0.15 ATR15; conferma successiva 15m CHIUSA con
+- Retest 15m CHIUSA: tocco del livello (senza tolleranza ATR e senza limite wick); conferma successiva 15m CHIUSA con
   corpo >=75%, >=0.50 ATR15, wick <=15%, volume >=0.80x media 20 15m.
 - SL ultime 3 4H +0.10 ATR4H. Setup 4h. BTC15 concorde o neutro.
 
@@ -62,7 +62,7 @@ BTC_NEUTRAL_BODY_ATR_MAX = 0.20
 VOLUME_AVG_BARS_15M = 20
 LIVE_VOLUME_PACE_MIN_SECONDS = 60
 LIVE_VOLUME_PROGRESS_LOG_SECONDS = 180
-RETEST_ZONE_ATR15 = 0.15
+# Retest: deve toccare il livello di breakout; nessuna soglia ATR sul retest.
 MICRO_CLOSE_BUFFER_ATR15 = 0.02
 MACRO_CLOSE_GRACE_SECONDS = 600
 CLOSE_EVENT_MAX_DELAY_SECONDS = 12
@@ -693,22 +693,16 @@ def evaluate_closed_retest_candle(setup, candles, btc_candles, now_ms):
         log('CONFERMA SCARTATA', sym, '| ATR15 indisponibile')
         return 'WAIT', None
     level = setup['level']
-    tol = RETEST_ZONE_ATR15 * atr15
     d = setup['direction']
-    touched = (closed['l'] <= level + tol and closed['h'] >= level - tol)
-    if d == 'SHORT':
-        touched = (closed['h'] >= level - tol and closed['l'] <= level + tol)
-
-    # RETEST e invalidazione esattamente come nel codice inviato.
-    if (d == 'LONG' and closed['l'] < level - tol) or (d == 'SHORT' and closed['h'] > level + tol):
-        log('SETUP ANNULLATO', sym, '| wick retest troppo profondo',
-            '| livello', price_format(level))
-        return 'EXPIRED', None
+    # Retest: la candela 15m CHIUSA deve toccare/attraversare il livello reale.
+    # Nessuna tolleranza ATR15 e nessuna invalidazione per wick troppo profondo.
+    # La conferma resta obbligatoria su una candela 15m SUCCESSIVA e chiusa.
+    touched = closed['l'] <= level <= closed['h']
     if touched and not setup['touched']:
         setup['touched'] = True
         setup['touch_t'] = closed['t']
         setup['touched_price'] = closed['l'] if d == 'LONG' else closed['h']
-        log('RETEST 15M', sym, d, 'livello', price_format(level))
+        log('RETEST 15M', sym, d, '| tocco livello (nessun limite ATR)', price_format(level))
 
     if not setup['touched']:
         log('ATTESA RETEST', sym, d, '| candela 15m chiusa', closed['t'])
@@ -774,7 +768,7 @@ def message_for(s):
         f"Orario Italia: {now_italy}\n"
         f"Breakout {cfg['name']}: {macro_italy} ({cfg['lookback']} barre, +{cfg['breakout_buffer_atr']:.2f} ATR{cfg['name']})\n"
         f"Volume breakout {cfg['name']}: {s['macro_volume_ratio']:.2f}x (min {cfg['macro_volume_min']:.2f}x su 20 {cfg['name']})\n"
-        f"Retest 15m: {retest_italy} (+/-0.15 ATR15)\n"
+        f"Retest 15m: {retest_italy} (tocco livello, nessun filtro ATR)\n"
         f"Conferma 15m: {confirm_italy}\n"
         f"Livello: {price_format(s['breakout_level'])}\n"
         f"Volume rimbalzo 15m: {s['confirm_volume_ratio']:.2f}x (min {cfg['confirm_volume_min']:.2f}x su 20 15m)\n"
@@ -935,6 +929,7 @@ def main():
     log('MOMENTUM ONE UNIFICATO | 40 crypto | 3 strategia 1H + 37 strategia 4H | scan ~1s')
     log('1H BTC/ETH/SOL: volume breakout >=1.60x 20 1H; conferma 15m >=1.00x 20 15m')
     log('4H altre 37: volume breakout >=1.35x 20 4H; conferma 15m >=0.80x 20 15m')
+    log('RETEST 15m: tocco del livello, NESSUNA soglia ATR e nessun limite al wick del retest')
     log('TELEGRAM RETRY ATTIVO | NO COOLDOWN | anti-duplicati per breakout')
     if not BOT_TOKEN or not CHAT_ID:
         log('ATTENZIONE: mancano variabili Telegram')
@@ -950,10 +945,10 @@ def main():
     threading.Thread(target=websocket_worker, daemon=True).start()
     send_telegram('MOMENTUM ONE UNIFICATO AVVIATO [SIMULAZIONE] - 40 crypto, scan ~1s. '
                   'BTC ETH SOL: BREAKOUT 1H volume >=1.60x su 20 1H; '
-                  'RETEST 15m; CONFERMA 15m volume >=1.00x su 20 15m; '
+                  'RETEST 15m senza filtro ATR; CONFERMA 15m volume >=1.00x su 20 15m; '
                   'corpo >=80%, >=0.60 ATR15, wick <=12%; SL 5x1H +0.15 ATR1H; setup 2h. '
                   'ALTRE 37: BREAKOUT 4H volume >=1.35x su 20 4H; '
-                  'RETEST 15m; CONFERMA 15m volume >=0.80x su 20 15m; '
+                  'RETEST 15m senza filtro ATR; CONFERMA 15m volume >=0.80x su 20 15m; '
                   'corpo >=75%, >=0.50 ATR15, wick <=15%; SL 3x4H +0.10 ATR4H; setup 4h. '
                   'BTC neutro solo su BTC. TP1 0.30R / TP2 0.80R / TP3 1.50R. '
                   'NO COOLDOWN | RETRY TELEGRAM | Nessun ordine automatico.')
