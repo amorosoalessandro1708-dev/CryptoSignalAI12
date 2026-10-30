@@ -2,22 +2,23 @@
 
 Gruppo 1H: BTCUSDT, ETHUSDT, SOLUSDT.
 - Breakout 1H CHIUSO sopra/sotto le 20 precedenti 1H, buffer 0.04 ATR1H,
-  chiusura nel 35% direzionale; volume >=1.60x delle 20 precedenti 1H.
+  chiusura nel 35% direzionale; volume >=1.20x delle 20 precedenti 1H.
 - Retest su 15m CHIUSA: tocco del livello (senza tolleranza ATR e senza limite wick); conferma 15m successiva CHIUSA
-  con corpo >=80%, >=0.60 ATR15, wick <=12% per lato e volume >=1.00x
-  media delle 20 precedenti 15m. SL ultime 5 1H +0.15 ATR1H. Setup 2h.
-- BTC15 sul segnale BTC e' NEUTRAL (non filtra); su ETH/SOL e' concorde o neutro.
+  con corpo >=70%, >=0.60 ATR15, wick <=12% per lato e volume >=0.60x
+  media delle 20 precedenti 15m. SL ultime 5 1H +0.25 ATR1H. Setup 4h.
+- BTC15 sul segnale BTC e' NEUTRAL (non filtra); su ETH/SOL concorde/neutro o eccezione forza relativa 4H >=5%.
 
 Gruppo 4H: le altre 37 criptovalute (PARAMETRI PRECEDENTI INVARIATI).
 - Breakout 4H CHIUSO su 10 precedenti 4H, buffer 0.03 ATR4H,
-  chiusura nel 30% direzionale; volume >=1.35x delle 20 precedenti 4H.
+  chiusura nel 30% direzionale; volume >=1.10x delle 20 precedenti 4H.
 - Retest 15m CHIUSA: tocco del livello (senza tolleranza ATR e senza limite wick); conferma successiva 15m CHIUSA con
-  corpo >=75%, >=0.50 ATR15, wick <=15%, volume >=0.80x media 20 15m.
-- SL ultime 3 4H +0.10 ATR4H. Setup 4h. BTC15 concorde o neutro.
+  corpo >=70%, >=0.50 ATR15, wick <=15%, volume >=0.60x media 20 15m.
+- SL ultime 3 4H +0.25 ATR4H. Setup 8h. BTC15 concorde/neutro o forza relativa 4H >=5% nella direzione.
 
 Comune: 40 stream 15m WS, scan ~1s, storico 480 candele 15m,
 ATR14 solo su chiuse, TP1/TP2/TP3=0.30R/0.80R/1.50R,
 Telegram retry con anti-duplicato (coin, macro_t), nessun cooldown;
+BTC neutro se corpo <0.35 ATR15; deroga direzione contraria solo se forza relativa 4H >=5%;
 nessuna esecuzione ordini (solo avvisi in simulazione).
 """
 
@@ -58,39 +59,40 @@ SCAN_SECONDS = 1.0
 TIMEFRAME_SECONDS = 15 * 60
 FIFTEEN_MIN_MS = 15 * 60 * 1000
 ATR_PERIOD = 14
-BTC_NEUTRAL_BODY_ATR_MAX = 0.20
+BTC_NEUTRAL_BODY_ATR_MAX = 0.35
 VOLUME_AVG_BARS_15M = 20
 LIVE_VOLUME_PACE_MIN_SECONDS = 60
 LIVE_VOLUME_PROGRESS_LOG_SECONDS = 180
 # Retest: deve toccare il livello di breakout; nessuna soglia ATR sul retest.
 MICRO_CLOSE_BUFFER_ATR15 = 0.02
-MACRO_CLOSE_GRACE_SECONDS = 600
-CLOSE_EVENT_MAX_DELAY_SECONDS = 12
+MACRO_CLOSE_GRACE_SECONDS = 1800
+CLOSE_EVENT_MAX_DELAY_SECONDS = 30
 TP1_R, TP2_R, TP3_R = 0.30, 0.80, 1.50
 FOUR_HOURS_MS = 4 * 60 * 60 * 1000
 ONE_HOUR_MS = 60 * 60 * 1000
+RELATIVE_BTC_OVERRIDE_PCT = 5.0  # 5 punti percentuali rispetto a BTC in 4H
 
 # Parametri indipendenti per i due gruppi: nessuna sovrapposizione di segnali.
 STRATEGIES = {
     '1H': {
         'name': '1H', 'macro_ms': ONE_HOUR_MS,
-        'lookback': 20, 'macro_volume_min': 1.60,
+        'lookback': 20, 'macro_volume_min': 1.20,
         'volume_bars_macro': 20, 'breakout_buffer_atr': 0.04,
         'macro_close_position_min': 0.65,
-        'confirm_volume_min': 1.00, 'body_fraction': 0.80,
+        'confirm_volume_min': 0.60, 'body_fraction': 0.70,
         'body_atr_min': 0.60, 'wick_directional': 0.12,
         'wick_opposite': 0.12, 'sl_lookback': 5,
-        'sl_buffer_atr': 0.15, 'lifetime_seconds': 2 * 60 * 60,
+        'sl_buffer_atr': 0.25, 'lifetime_seconds': 4 * 60 * 60,
     },
     '4H': {
         'name': '4H', 'macro_ms': FOUR_HOURS_MS,
-        'lookback': 10, 'macro_volume_min': 1.35,
+        'lookback': 10, 'macro_volume_min': 1.10,
         'volume_bars_macro': 20, 'breakout_buffer_atr': 0.03,
         'macro_close_position_min': 0.70,
-        'confirm_volume_min': 0.80, 'body_fraction': 0.75,
+        'confirm_volume_min': 0.60, 'body_fraction': 0.70,
         'body_atr_min': 0.50, 'wick_directional': 0.15,
         'wick_opposite': 0.15, 'sl_lookback': 3,
-        'sl_buffer_atr': 0.10, 'lifetime_seconds': 4 * 60 * 60,
+        'sl_buffer_atr': 0.25, 'lifetime_seconds': 8 * 60 * 60,
     },
 }
 
@@ -495,7 +497,7 @@ def macro_structural_stop(candles_15m, direction, cfg):
 def btc15_direction(btc_candles):
     """BTC concorde oppure neutro; BTC opposto non neutro blocca il segnale.
 
-    BTC e' neutro se il corpo live e' <0.20 ATR15 sulle sole chiuse.
+    BTC e' neutro se il corpo live e' <0.35 ATR15 sulle sole chiuse.
     Se l'ATR non e' disponibile, restituisce None: niente segnali.
     Non richiede volume BTC, medie o conferme 1H.
     """
@@ -584,11 +586,69 @@ def btc15_closed_direction(btc_candles, confirmation_t):
     return 'LONG' if movement > 0 else 'SHORT'
 
 
+def relative_performance_4h(alt_candles, btc_candles, confirmation_t):
+    """Rendimento relativo percentuale su 4 ore esatte, senza usare candele live.
+
+    Prende la chiusura 15m di conferma e la chiusura di 16 barre 15m prima,
+    con 17 chiusure consecutive. Confronta altcoin e BTC allo stesso orario.
+    Se mancano dati sincronizzati non concede l'eccezione BTC.
+    """
+    bars_4h = FOUR_HOURS_MS // FIFTEEN_MIN_MS
+    needed = bars_4h + 2  # -1 live; -2 conferma chiusa; -18 quattro ore prima
+    if len(alt_candles) < needed or len(btc_candles) < needed:
+        return None
+    alt_window = alt_candles[-needed:-1]
+    btc_window = btc_candles[-needed:-1]
+    if (len(alt_window) != bars_4h + 1 or
+            alt_window[-1]['t'] != confirmation_t or
+            btc_window[-1]['t'] != confirmation_t or
+            alt_window[0]['t'] != btc_window[0]['t'] or
+            any(a['t'] != b['t'] for a, b in zip(alt_window, btc_window))):
+        return None
+    if any(alt_window[i+1]['t'] - alt_window[i]['t'] != FIFTEEN_MIN_MS
+           for i in range(bars_4h)):
+        return None
+    a0, a1 = alt_window[0]['c'], alt_window[-1]['c']
+    b0, b1 = btc_window[0]['c'], btc_window[-1]['c']
+    if min(a0, a1, b0, b1) <= 0:
+        return None
+    alt_perf = (a1 / a0 - 1.0) * 100.0
+    btc_perf = (b1 / b0 - 1.0) * 100.0
+    return {'alt_pct': alt_perf, 'btc_pct': btc_perf,
+            'relative_pct': alt_perf - btc_perf}
+
+
+def btc_direction_with_relative_exception(symbol, direction, btc_direction,
+                                          alt_candles, btc_candles, confirmation_t):
+    """Deroga BTC15 opposto solo con sovra/sottoperformance relativa >=5 pp.
+
+    BTCUSDT mantiene la propria eccezione neutra, gestita dal chiamante.
+    In assenza di dati affidabili resta attivo il filtro BTC15 originale.
+    """
+    if not ((direction == 'LONG' and btc_direction == 'SHORT') or
+            (direction == 'SHORT' and btc_direction == 'LONG')):
+        return btc_direction, None, False
+    perf = relative_performance_4h(alt_candles, btc_candles, confirmation_t)
+    if perf is None:
+        return btc_direction, None, False
+    relative = perf['relative_pct']
+    if ((direction == 'LONG' and relative >= RELATIVE_BTC_OVERRIDE_PCT) or
+            (direction == 'SHORT' and relative <= -RELATIVE_BTC_OVERRIDE_PCT)):
+        log('ECCEZIONE BTC15', symbol, direction,
+            '| BTC15 originale:', btc_direction,
+            '| alt 4H:', f"{perf['alt_pct']:+.2f}%",
+            '| BTC 4H:', f"{perf['btc_pct']:+.2f}%",
+            '| forza relativa:', f'{relative:+.2f} pp',
+            '| filtro BTC impostato NEUTRAL')
+        return 'NEUTRAL', perf, True
+    return btc_direction, perf, False
+
+
 def confirmation_15m_volume_ratio(candles):
     """Volume della 15m appena CHIUSA vs media delle 20 CHIUSE precedenti.
 
     candles[-1] e' la 15m LIVE appena iniziata, candles[-2] la conferma chiusa.
-    Nessuna proiezione: si richiede volume 0.80x reale sulla conferma.
+    Nessuna proiezione: si richiede volume reale sulla conferma.
     """
     if len(candles) < VOLUME_AVG_BARS_15M + 2:
         return 0.0
@@ -656,11 +716,13 @@ def build_confirmed_signal(setup, candles, btc_direction, candle_15m, now_ms):
         'macro_close_pos': setup['macro_close_pos'],
         'macro_volume_ratio': setup['macro_volume_ratio'],
         'btc_direction': btc_direction,
+        'btc_override': setup.get('btc_override', False),
+        'btc_relative_4h': setup.get('btc_relative_4h'),
     }
 
 
 def evaluate_closed_retest_candle(setup, candles, btc_candles, now_ms):
-    """Stessi filtri dell'originale; aggiunge SOLO motivazioni nei log."""
+    """Retest senza ATR; conferma a chiusura e deroga BTC su forza relativa 4H."""
     if len(candles) < ATR_PERIOD + 3:
         return 'WAIT', None
     live = candles[-1]
@@ -724,9 +786,20 @@ def evaluate_closed_retest_candle(setup, candles, btc_candles, now_ms):
         return 'WAIT', None
     btc_direction = ('NEUTRAL' if sym == 'BTCUSDT' and cfg['name'] == '1H'
                      else btc15_closed_direction(btc_candles, closed['t']))
+    original_btc_direction = btc_direction
+    btc_perf = None
+    btc_override = False
+    if sym != 'BTCUSDT':
+        btc_direction, btc_perf, btc_override = btc_direction_with_relative_exception(
+            sym, d, btc_direction, candles, btc_candles, closed['t'])
     if btc_direction not in (d, 'NEUTRAL'):
-        log('CONFERMA SCARTATA', sym, '| BTC15', btc_direction, 'contro', d)
+        relative_note = (f"| forza relativa 4H {btc_perf['relative_pct']:+.2f} pp"
+                         if btc_perf is not None else '| forza relativa 4H non disponibile')
+        log('CONFERMA SCARTATA', sym, '| BTC15', original_btc_direction,
+            'contro', d, relative_note)
         return 'WAIT', None
+    setup['btc_override'] = btc_override
+    setup['btc_relative_4h'] = btc_perf
     setup['atr15_retest'] = atr15
     setup['confirm_volume_ratio'] = ratio15
     signal = build_confirmed_signal(setup, candles, btc_direction, closed, now_ms)
@@ -772,7 +845,9 @@ def message_for(s):
         f"Conferma 15m: {confirm_italy}\n"
         f"Livello: {price_format(s['breakout_level'])}\n"
         f"Volume rimbalzo 15m: {s['confirm_volume_ratio']:.2f}x (min {cfg['confirm_volume_min']:.2f}x su 20 15m)\n"
-        f"BTC15: {s['btc_direction']}\n"
+        f"BTC15: {s['btc_direction']}" +
+        (f" (DEROGA forza relativa 4H {s['btc_relative_4h']['relative_pct']:+.2f} pp)"
+         if s.get('btc_override') and s.get('btc_relative_4h') else '') + "\n"
         f"ENTRY: {price_format(s['entry'])}\n"
         f"SL {cfg['name']} ({cfg['sl_lookback']} chiuse +{cfg['sl_buffer_atr']:.2f} ATR{cfg['name']}): {price_format(s['sl'])}\n"
         f"TP1 0.30R: {price_format(tp1)} / TP2 0.80R: {price_format(tp2)} / TP3 1.50R: {price_format(tp3)}\n"
@@ -890,11 +965,9 @@ def scan_market():
                 log('BREAKOUT', cfg['name'], 'CHIUSO', symbol,
                     candidate['direction'], '| livello', price_format(candidate['level']),
                     '| volume', f"{candidate['macro_volume_ratio']:.2f}x", '| media 20 precedenti')
-            elif cfg['name'] == '4H':
-                # Per le 37 altcoin mantiene il comportamento precedente.
-                active_setups.pop(symbol, None)
-            # Per BTC/ETH/SOL il setup 1H puo' durare 2 ore anche se
-            # l'ora successiva non crea un nuovo breakout valido.
+            # Non cancellare i setup ancora validi quando la candela macro
+            # successiva non crea un nuovo breakout: durate 4H (gruppo 1H)
+            # e 8H (gruppo 4H) realmente rispettate.
         setup = active_setups.get(symbol)
         if not setup:
             continue
@@ -916,7 +989,7 @@ def scan_market():
                 log('SEGNALE NON ACCODATO', cfg['name'], symbol, '| duplicato o errore coda')
         if symbol in active_setups:
             monitor_live_confirmation_volume(setup, candles, now_ms)
-    oldest_allowed = now_ms - 2 * FOUR_HOURS_MS
+    oldest_allowed = now_ms - 3 * FOUR_HOURS_MS  # memoria duplicati oltre 8h di setup
     with alert_lock:
         sent_alerts.intersection_update({k for k in sent_alerts if k[1] >= oldest_allowed})
         for key in list(failed_alert_times):
@@ -927,9 +1000,9 @@ def scan_market():
 
 def main():
     log('MOMENTUM ONE UNIFICATO | 40 crypto | 3 strategia 1H + 37 strategia 4H | scan ~1s')
-    log('1H BTC/ETH/SOL: volume breakout >=1.60x 20 1H; conferma 15m >=1.00x 20 15m')
-    log('4H altre 37: volume breakout >=1.35x 20 4H; conferma 15m >=0.80x 20 15m')
-    log('RETEST 15m: tocco del livello, NESSUNA soglia ATR e nessun limite al wick del retest')
+    log('1H BTC/ETH/SOL: volume breakout >=1.20x 20 1H; conferma 15m >=0.60x 20 15m; setup 4h')
+    log('4H altre 37: volume breakout >=1.10x 20 4H; conferma 15m >=0.60x 20 15m; setup 8h')
+    log('RETEST 15m: tocco livello senza ATR; BTC neutro <0.35 ATR15; eccezione alt-BTC +/-5pp su 4H')
     log('TELEGRAM RETRY ATTIVO | NO COOLDOWN | anti-duplicati per breakout')
     if not BOT_TOKEN or not CHAT_ID:
         log('ATTENZIONE: mancano variabili Telegram')
@@ -944,14 +1017,16 @@ def main():
     threading.Thread(target=history_worker, daemon=True).start()
     threading.Thread(target=websocket_worker, daemon=True).start()
     send_telegram('MOMENTUM ONE UNIFICATO AVVIATO [SIMULAZIONE] - 40 crypto, scan ~1s. '
-                  'BTC ETH SOL: BREAKOUT 1H volume >=1.60x su 20 1H; '
-                  'RETEST 15m senza filtro ATR; CONFERMA 15m volume >=1.00x su 20 15m; '
-                  'corpo >=80%, >=0.60 ATR15, wick <=12%; SL 5x1H +0.15 ATR1H; setup 2h. '
-                  'ALTRE 37: BREAKOUT 4H volume >=1.35x su 20 4H; '
-                  'RETEST 15m senza filtro ATR; CONFERMA 15m volume >=0.80x su 20 15m; '
-                  'corpo >=75%, >=0.50 ATR15, wick <=15%; SL 3x4H +0.10 ATR4H; setup 4h. '
-                  'BTC neutro solo su BTC. TP1 0.30R / TP2 0.80R / TP3 1.50R. '
-                  'NO COOLDOWN | RETRY TELEGRAM | Nessun ordine automatico.')
+                  'BTC ETH SOL: BREAKOUT 1H volume >=1.20x su 20 1H; '
+                  'RETEST 15m senza filtro ATR; CONFERMA 15m volume >=0.60x su 20 15m; '
+                  'corpo >=70%, >=0.60 ATR15, wick <=12%; SL 5x1H +0.25 ATR1H; setup 4h. '
+                  'ALTRE 37: BREAKOUT 4H volume >=1.10x su 20 4H; '
+                  'RETEST 15m senza filtro ATR; CONFERMA 15m volume >=0.60x su 20 15m; '
+                  'corpo >=70%, >=0.50 ATR15, wick <=15%; SL 3x4H +0.25 ATR4H; setup 8h. '
+                  'BTC neutro se corpo <0.35 ATR15; altcoin con forza relativa +/-5pp su 4H '
+                  'possono superare BTC15 opposto. BTC neutro solo su BTC. '
+                  'TP1 0.30R / TP2 0.80R / TP3 1.50R. NO COOLDOWN | RETRY TELEGRAM | '
+                  'Nessun ordine automatico.')
     next_scan = time.monotonic()
     last_log = next_scan
     while True:
