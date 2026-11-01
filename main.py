@@ -1,8 +1,6 @@
 """MOMENTUM ONE UNIFICATO - 40 COIN | UN SOLO SERVIZIO RAILWAY.
-Gruppo 1H: 18 COIN - BTC,ETH,SOL + PEPE,BONK,SHIB,WIF,TAO,FET,RENDER,SUI,SEI,JUP,INJ,ARB,OP,PENDLE,ONDO
-Gruppo 4H: le altre 22 criptovalute lente
-FIX FEED: tollera 1 candela di ritardo, feed attivi 40/40 stabile
-CONFIG OPZIONE B: 15c 1H / 6c 4H / vol 1.10x / retest+direct
+FIX BUG MACRO: la candela macro è pronta SOLO con tutte le 15m chiuse.
+Opzione B: 18x1H (6c) + 22x4H (6c) | vol 1.10x | retest+direct
 """
 
 import json
@@ -291,21 +289,6 @@ def median_volume(volumes):
     values = [max(0.0, float(v)) for v in volumes]
     return float(median(values)) if values else 0.0
 
-def live_volume_progress(candles, now_ms, threshold):
-    if len(candles) < VOLUME_AVG_BARS_15M + 1: return None
-    live = candles[-1]
-    elapsed_ms = now_ms - live['t']
-    if not 0 <= elapsed_ms < FIFTEEN_MIN_MS: return None
-    previous = candles[-(VOLUME_AVG_BARS_15M + 1):-1]
-    avg = median_volume(c['v'] for c in previous)
-    if avg <= 0: return None
-    elapsed = elapsed_ms / 1000.0
-    actual_ratio = max(0.0, live['v']) / avg
-    pace_ratio = (actual_ratio * TIMEFRAME_SECONDS / elapsed if elapsed >= LIVE_VOLUME_PACE_MIN_SECONDS else None)
-    return {'candle_t': live['t'],'elapsed_seconds': elapsed,'actual_ratio': actual_ratio,'pace_ratio': pace_ratio,'progress_percent': 100.0 * actual_ratio / threshold,}
-
-def monitor_live_confirmation_volume(setup, candles, now_ms): pass
-
 def macro_closed_candles(candles_15m, macro_ms):
     required_count = macro_ms // FIFTEEN_MIN_MS
     groups = {}
@@ -313,11 +296,17 @@ def macro_closed_candles(candles_15m, macro_ms):
         block_t = (candle['t'] // macro_ms) * macro_ms
         groups.setdefault(block_t, []).append(candle)
     result = []
-    for block_t, group in sorted(groups.items()):
-        if len(group) < required_count - 1:
+    sorted_blocks = sorted(groups.items())
+    for idx, (block_t, group) in enumerate(sorted_blocks):
+        is_last = (idx == len(sorted_blocks) - 1)
+        min_needed = required_count if is_last else required_count - 1
+        if len(group) < min_needed:
             continue
         group.sort(key=lambda c: c['t'])
-        result.append({'t': block_t, 'o': group[0]['o'],'h': max(c['h'] for c in group), 'l': min(c['l'] for c in group),'c': group[-1]['c'], 'v': sum(c['v'] for c in group),})
+        if any(group[i+1]['t'] - group[i]['t'] != FIFTEEN_MIN_MS for i in range(len(group)-1)):
+            if is_last:
+                continue
+        result.append({'t': block_t, 'o': group[0]['o'],'h': max(c['h'] for c in group), 'l': min(c['l'] for c in group),'c': group[-1]['c'], 'v': sum(c['v'] for c in group), 'count': len(group), 'required': required_count})
     return result
 
 def macro_structural_stop(candles_15m, direction, cfg):
@@ -352,6 +341,8 @@ def macro_breakout(symbol, candles, now_ms, cfg, btc_candles=None):
     required = max(ATR_PERIOD + 2, cfg['lookback'] + 1, cfg['volume_bars_macro'] + 1)
     if len(macro_bars) < required: return None
     macro = macro_bars[-1]
+    if macro.get('count', 0) < macro.get('required', 0):
+        return None
     close_ms = macro['t'] + cfg['macro_ms']
     if not (0 <= now_ms - close_ms <= MACRO_CLOSE_GRACE_SECONDS * 1000): return None
     prev = macro_bars[:-1]
@@ -593,6 +584,8 @@ def scan_market():
         if not bars: continue
         macro_t = bars[-1]['t']
         if seen_macro_bars.get(symbol) != macro_t:
+            if bars[-1].get('count', 0) < bars[-1].get('required', 0):
+                continue
             seen_macro_bars[symbol] = macro_t
             candidate = macro_breakout(symbol, candles, now_ms, cfg, btc_candles)
             if candidate: active_setups[symbol] = candidate
@@ -612,7 +605,7 @@ def scan_market():
     return queued
 
 def main():
-    log('MOMENTUM ONE OPZIONE B | 18x1H (6c) + 22x4H (15c) | vol 1.10x | retest+direct | scan ~1s')
+    log('MOMENTUM ONE OPZIONE B FIX MACRO | 18x1H (6c) + 22x4H (6c) | vol 1.10x | retest+direct | scan ~1s')
     if not BOT_TOKEN or not CHAT_ID: log('ATTENZIONE: mancano variabili Telegram')
     while True:
         try: initialize_history(); break
@@ -621,7 +614,7 @@ def main():
     threading.Thread(target=telegram_worker, daemon=True).start()
     threading.Thread(target=history_worker, daemon=True).start()
     threading.Thread(target=websocket_worker, daemon=True).start()
-    send_telegram('MOMENTUM ONE OPZIONE B AVVIATO - 18x1H 6c / 22x4H 15c / vol 1.10x / retest+direct')
+    send_telegram('MOMENTUM ONE OPZIONE B FIX MACRO AVVIATO - 18x1H 6c / 22x4H 6c / vol 1.10x / retest+direct')
     next_scan = time.monotonic(); last_log = next_scan
     while True:
         next_scan += SCAN_SECONDS
