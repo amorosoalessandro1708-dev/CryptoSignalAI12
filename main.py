@@ -1,9 +1,9 @@
-"""MOMENTUM ONE V5 - FIX TECNICI, STRATEGIA V4 INVARIATA.
+"""MOMENTUM ONE V5 - BREAKOUT 1H/4H SENZA FILTRO VOLUME.
 
 40 Binance USDT-M perpetual: 18 simboli con breakout 1H e 22 con breakout 4H.
 Parametri identici alla V4 ROBUST condivisa dall'utente: lookback 15/6,
-volumi breakout 1.10x/1.10x su mediana20, conferma 0.60x,
-booster 0.90x con forza relativa +/-7pp, filtro BTC e deroga +/-5pp,
+nessun volume minimo sul breakout 1H/4H; conferma 15m 0.60x
+sulla mediana delle ultime 20 barre, filtro BTC e deroga +/-5pp,
 body/wick/ATR, entrata DIRECT prima 15m o RETEST, SL e TP invariati.
 
 Fix infrastruttura:
@@ -71,16 +71,15 @@ TP1_R, TP2_R, TP3_R = 0.30, 0.80, 1.50
 FOUR_HOURS_MS = 4 * 60 * 60 * 1000
 ONE_HOUR_MS = 60 * 60 * 1000
 RELATIVE_BTC_OVERRIDE_PCT = 5.0  # filtro BTC15 opposto
-RELATIVE_BTC_VOLUME_BOOST_PCT = 7.0  # booster volume breakout su forza relativa 4H
-BOOSTED_MACRO_VOLUME_MIN = 0.90  # soltanto con booster valido, altrimenti base 1.20/1.10
+# Booster volume macro +/-7pp disattivato: senza soglia macro non ha funzione.
+# Resta invariata la deroga BTC +/-5pp per altcoin con forza relativa 4H.
 DIRECT_CLOSE_POSITION_MIN = 0.80  # estremo direzionale per prima 15m diretta
 
 # Parametri indipendenti per i due gruppi: nessuna sovrapposizione di segnali.
 STRATEGIES = {
     '1H': {
         'name': '1H', 'macro_ms': ONE_HOUR_MS,
-        'lookback': 15, 'macro_volume_min': 1.10,
-        'volume_bars_macro': 20, 'breakout_buffer_atr': 0.04,
+        'lookback': 15, 'breakout_buffer_atr': 0.04,
         'macro_close_position_min': 0.65,
         'confirm_volume_min': 0.60, 'body_fraction': 0.70,
         'body_atr_min': 0.60, 'wick_directional': 0.12,
@@ -89,8 +88,7 @@ STRATEGIES = {
     },
     '4H': {
         'name': '4H', 'macro_ms': FOUR_HOURS_MS,
-        'lookback': 6, 'macro_volume_min': 1.10,
-        'volume_bars_macro': 20, 'breakout_buffer_atr': 0.03,
+        'lookback': 6, 'breakout_buffer_atr': 0.03,
         'macro_close_position_min': 0.70,
         'confirm_volume_min': 0.60, 'body_fraction': 0.70,
         'body_atr_min': 0.50, 'wick_directional': 0.15,
@@ -692,7 +690,7 @@ def beyond_breakout(price, direction, level, buffer):
 def macro_breakout(symbol, candles, now_ms, cfg, btc_candles=None):
     """Breakout 1H su 18 crypto e 4H sulle restanti 22, solo chiuse."""
     macro_bars = macro_closed_candles(candles, cfg['macro_ms'])
-    required = max(ATR_PERIOD + 2, cfg['lookback'] + 1, cfg['volume_bars_macro'] + 1)
+    required = max(ATR_PERIOD + 2, cfg['lookback'] + 1)
     if len(macro_bars) < required:
         return None
     macro = macro_bars[-1]
@@ -723,35 +721,8 @@ def macro_breakout(symbol, candles, now_ms, cfg, btc_candles=None):
                  else (macro['h']-macro['c']) / span)
     if close_pos < cfg['macro_close_position_min']:
         return None
-    vols = prev[-cfg['volume_bars_macro']:]
-    median_vol = median_volume(c['v'] for c in vols)
-    if median_vol <= 0:
-        return None
-    vol_ratio = max(0.0, macro['v']) / median_vol
-    volume_threshold = cfg['macro_volume_min']  # V4: 1.10x su entrambi i gruppi
-    volume_boosted = False
-    relative_at_breakout = None
-    # Usa le ultime 4H completate AL MOMENTO del breakout, non i prezzi live.
-    # BTC non puo' ricevere un booster relativo a se stesso.
-    if symbol != 'BTCUSDT' and btc_candles is not None:
-        relative_at_breakout = relative_performance_4h(
-            candles, btc_candles, close_ms - FIFTEEN_MIN_MS)
-        if relative_at_breakout is not None:
-            rel = relative_at_breakout['relative_pct']
-            if ((direction == 'LONG' and rel >= RELATIVE_BTC_VOLUME_BOOST_PCT) or
-                    (direction == 'SHORT' and rel <= -RELATIVE_BTC_VOLUME_BOOST_PCT)):
-                volume_threshold = BOOSTED_MACRO_VOLUME_MIN
-                volume_boosted = True
-    if vol_ratio < volume_threshold:
-        log('BREAKOUT', cfg['name'], 'SCARTATO VOLUME', symbol,
-            f'{vol_ratio:.2f}x', '| minimo', f'{volume_threshold:.2f}x',
-            '| base', f"{cfg['macro_volume_min']:.2f}x", '| mediana 20')
-        return None
-    if volume_boosted:
-        log('BOOSTER VOLUME', cfg['name'], symbol, direction,
-            '| forza relativa 4H', f"{relative_at_breakout['relative_pct']:+.2f} pp",
-            '| volume minimo', f'{volume_threshold:.2f}x',
-            '| base', f"{cfg['macro_volume_min']:.2f}x")
+    # Volume di breakout 1H/4H NON richiesto: nessuna soglia ne' booster.
+    # Il controllo volume 15m di conferma resta invariato (>=0.60x mediana 20).
     if not macro_structural_stop(candles, direction, cfg):
         return None
     return {
@@ -759,10 +730,6 @@ def macro_breakout(symbol, candles, now_ms, cfg, btc_candles=None):
         'strategy': cfg['name'], 'macro_t': macro['t'],
         'macro_end_t': close_ms, 'level': level, 'macro_buffer': buffer,
         'atr_macro_at_breakout': atr_macro, 'macro_close_pos': close_pos,
-        'macro_volume_ratio': vol_ratio,
-        'volume_threshold_used': volume_threshold,
-        'volume_boosted': volume_boosted,
-        'relative_at_breakout': relative_at_breakout,
         'allow_direct': close_pos >= DIRECT_CLOSE_POSITION_MIN,
         'last_checked_15m_t': None,
         'touched': False, 'touch_t': None, 'touched_price': None,
@@ -917,10 +884,6 @@ def build_confirmed_signal(setup, candles, btc_direction, candle_15m, now_ms):
         'breakout_level': setup['level'], 'breakout_buffer': setup['macro_buffer'],
         'confirm_volume_ratio': setup['confirm_volume_ratio'],
         'macro_close_pos': setup['macro_close_pos'],
-        'macro_volume_ratio': setup['macro_volume_ratio'],
-        'volume_threshold_used': setup.get('volume_threshold_used',
-                                            strategy_for(setup['symbol'])['macro_volume_min']),
-        'volume_boosted': setup.get('volume_boosted', False),
         'btc_direction': btc_direction,
         'btc_override': setup.get('btc_override', False),
         'btc_relative_4h': setup.get('btc_relative_4h'),
@@ -1076,11 +1039,7 @@ def message_for(s):
         f"ID segnale: {signal_id}\n"
         f"Orario Italia: {now_italy}\n"
         f"Breakout {cfg['name']}: {macro_italy} ({cfg['lookback']} barre, +{cfg['breakout_buffer_atr']:.2f} ATR{cfg['name']})\n"
-        f"Volume breakout {cfg['name']}: {s['macro_volume_ratio']:.2f}x "
-        f"(min {s['volume_threshold_used']:.2f}x su mediana 20 {cfg['name']}; "
-        f"base {cfg['macro_volume_min']:.2f}x)\n"
-        + ("Volume breakout booster: forza relativa 4H >=7pp\n"
-           if s.get('volume_boosted') else '')
+        f"Volume breakout {cfg['name']}: NESSUN FILTRO\n"
         + (f"Retest 15m: {retest_italy} (tocco livello, nessun filtro ATR)\n"
            if s.get('entry_mode') != 'DIRECT'
            else 'Ingresso: DIRETTO dopo breakout macro >=80% e prima 15m chiusa\n')
@@ -1239,8 +1198,7 @@ def scan_market():
             del active_setups[symbol]
             setup = None
         if seen_macro_bars.get(symbol) != macro_t:
-            required = max(ATR_PERIOD + 2, cfg['lookback'] + 1,
-                           cfg['volume_bars_macro'] + 1)
+            required = max(ATR_PERIOD + 2, cfg['lookback'] + 1)
             if macro_tail_complete_and_consecutive(bars, required, cfg['macro_ms']):
                 # Segna il breakout gia' analizzato soltanto quando i dati sono pronti.
                 if not setup:
@@ -1249,7 +1207,7 @@ def scan_market():
                         active_setups[symbol] = candidate
                         setup = candidate
                         log('BREAKOUT', cfg['name'], symbol, candidate['direction'],
-                            '| volume', f"{candidate['macro_volume_ratio']:.2f}x",
+                            '| volume macro NON richiesto',
                             '| diretto', candidate['allow_direct'])
                 seen_macro_bars[symbol] = macro_t
             # Il vecchio setup resta attivo; NON usare 'continue' qui.
@@ -1279,11 +1237,11 @@ def scan_market():
 
 
 def main():
-    log('MOMENTUM ONE V5 ROBUST | 40 crypto | 18x1H + 22x4H | scan ~1s')
-    log('1H: lookback 15, breakout base 1.10x mediana20, conferma 0.60x, setup 6h')
-    log('4H: lookback 6, breakout base 1.10x mediana20, conferma 0.60x, setup 12h')
+    log('MOMENTUM ONE V5 SENZA VOLUME BREAKOUT | 40 crypto | 18x1H + 22x4H | scan ~1s')
+    log('1H: lookback 15, volume breakout NON richiesto, conferma 15m 0.60x, setup 6h')
+    log('4H: lookback 6, volume breakout NON richiesto, conferma 15m 0.60x, setup 12h')
     log('INGRESSO DIRETTO >=80% e prima 15m chiusa, oppure RETEST senza ATR')
-    log('BOOSTER 0.90x se forza relativa 4H +/-7pp | BTC deroga +/-5pp')
+    log('Volume macro e booster volume NON applicati | BTC deroga +/-5pp invariata')
     log('FIX TECNICI: macro complete | feed attuali | BTC retry 30s | outbox Telegram')
     if not BOT_TOKEN or not CHAT_ID:
         log('ATTENZIONE: mancano variabili Telegram')
@@ -1298,8 +1256,8 @@ def main():
     threading.Thread(target=telegram_worker, daemon=True).start()
     threading.Thread(target=history_worker, daemon=True).start()
     threading.Thread(target=websocket_worker, daemon=True).start()
-    if send_telegram('MOMENTUM ONE V5 ROBUST AVVIATO [SIMULAZIONE] - '
-                     '40 crypto (18x1H / 22x4H), lookback 15/6, breakout base 1.10x, '
+    if send_telegram('MOMENTUM ONE V5 SENZA VOLUME BREAKOUT AVVIATO [SIMULAZIONE] - '
+                     '40 crypto (18x1H / 22x4H), lookback 15/6, nessun volume 1H/4H, '
                      'conferma 15m 0.60x, direct/retest, nessun ordine automatico'):
         log('TELEGRAM AVVIO OK')
     else:
