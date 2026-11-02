@@ -1019,40 +1019,23 @@ def price_format(price):
 
 
 def message_for(s):
-    """Segnale identificato come 1H/4H; nessun ordine automatico."""
+    """Messaggio Telegram compatto: solo direzione, coppia, timeframe e livelli."""
     cfg = strategy_for(s['symbol'])
-    d = 1 if s['direction'] == 'LONG' else -1
+    direction = s['direction']
+    icon = '🟢' if direction == 'LONG' else '🔴'
+    d = 1 if direction == 'LONG' else -1
     risk = abs(s['entry'] - s['sl'])
     tp1 = s['entry'] + d * TP1_R * risk
     tp2 = s['entry'] + d * TP2_R * risk
     tp3 = s['entry'] + d * TP3_R * risk
-    now_italy = datetime.now(ITALY).strftime('%d/%m/%Y %H:%M:%S')
-    macro_italy = datetime.fromtimestamp(s['macro_t']/1000, ITALY).strftime('%d/%m %H:%M')
-    retest_italy = (datetime.fromtimestamp(s['retest_t']/1000, ITALY).strftime('%d/%m %H:%M')
-                    if s['retest_t'] is not None else None)
-    confirm_italy = datetime.fromtimestamp(s['confirm_15m_t']/1000, ITALY).strftime('%d/%m %H:%M')
-    title = 'MOMENTUM ONE 1H' if cfg['name'] == '1H' else 'MOMENTUM ONE 4H'
-    signal_id = f"{s['symbol']}-{s['macro_t']}-{s['confirm_15m_t']}"
+    pair = s['symbol'].replace('USDT', '/USDT')
     return (
-        f"{title} - {s['direction']} [SIMULAZIONE]\n"
-        f"{s['symbol'].replace('USDT', '/USDT')}\n"
-        f"ID segnale: {signal_id}\n"
-        f"Orario Italia: {now_italy}\n"
-        f"Breakout {cfg['name']}: {macro_italy} ({cfg['lookback']} barre, +{cfg['breakout_buffer_atr']:.2f} ATR{cfg['name']})\n"
-        f"Volume breakout {cfg['name']}: NESSUN FILTRO\n"
-        + (f"Retest 15m: {retest_italy} (tocco livello, nessun filtro ATR)\n"
-           if s.get('entry_mode') != 'DIRECT'
-           else 'Ingresso: DIRETTO dopo breakout macro >=80% e prima 15m chiusa\n')
-        + f"Conferma 15m: {confirm_italy}\n"
-        f"Livello: {price_format(s['breakout_level'])}\n"
-        f"Volume conferma 15m: {s['confirm_volume_ratio']:.2f}x (min {cfg['confirm_volume_min']:.2f}x su mediana 20 15m)\n"
-        f"BTC15: {s['btc_direction']}" +
-        (f" (DEROGA forza relativa 4H {s['btc_relative_4h']['relative_pct']:+.2f} pp)"
-         if s.get('btc_override') and s.get('btc_relative_4h') else '') + "\n"
-        f"ENTRY: {price_format(s['entry'])}\n"
-        f"SL {cfg['name']} ({cfg['sl_lookback']} chiuse +{cfg['sl_buffer_atr']:.2f} ATR{cfg['name']}): {price_format(s['sl'])}\n"
-        f"TP1 0.30R: {price_format(tp1)} / TP2 0.80R: {price_format(tp2)} / TP3 1.50R: {price_format(tp3)}\n"
-        'Solo avviso in simulazione, nessun ordine automatico.'
+        f"{icon} {direction} | {pair} | {cfg['name']}\n\n"
+        f"Entry: {price_format(s['entry'])}\n"
+        f"Stop Loss: {price_format(s['sl'])}\n"
+        f"TP1: {price_format(tp1)}\n"
+        f"TP2: {price_format(tp2)}\n"
+        f"TP3: {price_format(tp3)}"
     )
 
 
