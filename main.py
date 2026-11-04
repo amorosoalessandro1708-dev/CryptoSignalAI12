@@ -61,6 +61,7 @@ FIFTEEN_MIN_MS = 15 * 60 * 1000
 ATR_PERIOD = 14
 BTC_NEUTRAL_BODY_ATR_MAX = 0.35
 BTC_4H_NEUTRAL_BODY_ATR_MAX = 0.35  # SOLO segnali 1H: BTC 4H neutro se corpo < 0.35 ATR4H
+ENTRY_MAX_DISTANCE_ATR1H = 0.50  # Tutti i segnali: estensione massima dell'entry dal breakout
 VOLUME_AVG_BARS_15M = 20
 LIVE_VOLUME_PACE_MIN_SECONDS = 60
 LIVE_VOLUME_PROGRESS_LOG_SECONDS = 180
@@ -146,6 +147,10 @@ failed_alert_times = {}
 telegram_queue = queue.Queue()  # non perde alert a causa del limite di capacita'
 persisted_pending = {}
 dead_letters = {}
+# Tracking BTC1H: TP1 raggiunto blocca i nuovi segnali ALT fino a nuovo breakout 1H.
+# Persistito nello stesso file outbox per conservare lo stato tra i riavvii.
+btc1h_timing = {'active_signal': None, 'blocked': False, 'blocked_at_ms': None,
+                'last_unblock_macro_t': None}
 
 active_setups = {}             # {symbol: setup 4H confermato in attesa di retest 15m}
 seen_macro_bars = {}            # {symbol: t della 4H gia' analizzata}
@@ -168,6 +173,7 @@ def _outbox_save_locked():
             'pending': list(persisted_pending.values()),
             'failed': list(dead_letters.values()),
             'sent': [[k[0], k[1]] for k in sent_alerts],
+            'btc1h_timing': btc1h_timing,
         }
         temp_file = TELEGRAM_OUTBOX_FILE + '.tmp'
         with open(temp_file, 'w', encoding='utf-8') as file:
@@ -191,6 +197,22 @@ def load_telegram_outbox():
         return
     now = time.time()
     with alert_lock:
+        timing = payload.get('btc1h_timing')
+        if isinstance(timing, dict):
+            btc1h_timing['blocked'] = timing.get('blocked') is True
+            btc1h_timing['blocked_at_ms'] = timing.get('blocked_at_ms')
+            btc1h_timing['last_unblock_macro_t'] = timing.get('last_unblock_macro_t')
+            active = timing.get('active_signal')
+            if (isinstance(active, dict) and
+                    active.get('direction') in ('LONG', 'SHORT') and
+                    isinstance(active.get('tp1'), (int, float)) and
+                    isinstance(active.get('sl'), (int, float)) and
+                    isinstance(active.get('initial_high'), (int, float)) and
+                    isinstance(active.get('initial_low'), (int, float)) and
+                    isinstance(active.get('entry_bar_t'), int)):
+                btc1h_timing['active_signal'] = active
+            if btc1h_timing['blocked']:
+                log('BTC1H TIMING: BLOCCO ALT RIPRISTINATO DALLA OUTBOX')
         for record in payload.get('sent', []):
             if isinstance(record, list) and len(record) == 2:
                 key = (str(record[0]), int(record[1]))
@@ -644,6 +666,147 @@ def macro_tail_complete_and_consecutive(bars, count, macro_ms):
                for i in range(count - 1))
 
 
+def entry_extension_1h(signal, candles):
+    """Limite prezzo d'ingresso, indipendente dal timeframe del breakout.
+
+    ATR14 calcolato sulle ultime 1H complete; se manca lo storico,
+    il segnale e' scartato (mai ignorare il limite di estensione).
+    """
+    bars = macro_closed_candles(candles, ONE_HOUR_MS)
+    if not macro_tail_complete_and_consecutive(bars, ATR_PERIOD + 1, ONE_HOUR_MS):
+        return None
+    atr1h = true_range_atr(bars)
+    if atr1h is None or atr1h <= 0:
+        return None
+    sign = 1 if signal['direction'] == 'LONG' else -1
+    extension = sign * (signal['entry'] - signal['breakout_level'])
+    limit = ENTRY_MAX_DISTANCE_ATR1H * atr1h
+    return {'allowed': extension <= limit + 1e-12,
+            'extension': extension, 'limit': limit, 'atr1h': atr1h}
+
+
+def record_btc1h_signal(signal, btc_candles):
+    """Registra TP1 del BTC 1H realmente accodato, senza modificare i target."""
+    if signal['symbol'] != 'BTCUSDT' or signal['strategy'] != '1H':
+        return
+    direction = signal['direction']
+    risk = abs(signal['entry'] - signal['sl'])
+    tp1 = signal['entry'] + (1 if direction == 'LONG' else -1) * TP1_R * risk
+    current = btc_candles[-1]
+    with alert_lock:
+        if btc1h_timing['blocked']:
+            # Il blocco esistente si libera SOLO su nuovo breakout con volume.
+            return
+        btc1h_timing['active_signal'] = {
+            'direction': direction, 'tp1': tp1, 'sl': signal['sl'],
+            'entry_bar_t': current['t'],
+            # Non contare come TP1 o SL le wick precedenti all'entry.
+            'initial_high': current['h'], 'initial_low': current['l'],
+            'macro_t': signal['macro_t'],
+        }
+        _outbox_save_locked()
+    log('BTC1H TIMING ARMATO', direction, '| TP1', price_format(tp1))
+
+
+def btc1h_first_target(signal, btc_candles, now_ms):
+    """Identifica se TP1 precede lo SL, senza attribuire wick pre-entry.
+
+    Se TP1 e SL compaiono entrambi nella stessa candela senza ordine certo,
+    il risultato e' ambiguo: non assumiamo che TP1 sia stato preso prima.
+    """
+    entry_bar_t = signal['entry_bar_t']
+    direction = signal['direction']
+    tp1, sl = signal['tp1'], signal['sl']
+    for bar in btc_candles:
+        if bar['t'] < entry_bar_t:
+            continue
+        is_entry_bar = bar['t'] == entry_bar_t
+        is_live = bar is btc_candles[-1]
+        high, low, price = bar['h'], bar['l'], bar['c']
+        if direction == 'LONG':
+            tp_touch = (high >= tp1 and
+                        (not is_entry_bar or signal['initial_high'] < tp1))
+            sl_touch = (low <= sl and
+                        (not is_entry_bar or signal['initial_low'] > sl))
+            tp_touch |= is_live and price >= tp1
+            sl_touch |= is_live and price <= sl
+        else:
+            tp_touch = (low <= tp1 and
+                        (not is_entry_bar or signal['initial_low'] > tp1))
+            sl_touch = (high >= sl and
+                        (not is_entry_bar or signal['initial_high'] < sl))
+            tp_touch |= is_live and price <= tp1
+            sl_touch |= is_live and price >= sl
+        if tp_touch or sl_touch:
+            outcome = ('AMBIGUO' if tp_touch and sl_touch else
+                       'TP1' if tp_touch else 'SL')
+            return outcome, now_ms if is_live else bar['t'] + FIFTEEN_MIN_MS
+    return None
+
+
+def btc1h_new_breakout_with_volume(btc_candles, blocked_at_ms):
+    """Sblocco: nuova 1H chiusa oltre le ultime 15 precedenti, con volume medio.
+
+    LONG: chiusura sopra il massimo delle 15 precedenti.
+    SHORT: chiusura sotto il minimo delle 15 precedenti (simmetrico).
+    Volume della candela di breakout > media aritmetica dei volumi delle
+    15 candele 1H precedenti, tutte CHIUSE. Media ricalcolata a ogni nuova 1H.
+    """
+    bars = macro_closed_candles(btc_candles, ONE_HOUR_MS)
+    n = STRATEGIES['1H']['lookback']
+    if not macro_tail_complete_and_consecutive(bars, n + 1, ONE_HOUR_MS):
+        return None
+    curr = bars[-1]
+    close_t = curr['t'] + ONE_HOUR_MS
+    if close_t <= blocked_at_ms:
+        return None
+    prev = bars[-(n + 1):-1]
+    avg_volume = sum(bar['v'] for bar in prev) / n
+    if curr['v'] <= avg_volume:
+        return None
+    if curr['c'] > max(c['h'] for c in prev):
+        return curr['t'], 'LONG'
+    if curr['c'] < min(c['l'] for c in prev):
+        return curr['t'], 'SHORT'
+    return None
+
+
+def update_btc1h_timing(btc_candles, now_ms):
+    """Avanza il gate globale ALT: TP1 BTC1H -> blocco -> breakout nuovo."""
+    with alert_lock:
+        active = btc1h_timing['active_signal']
+        if active and not btc1h_timing['blocked']:
+            outcome = btc1h_first_target(active, btc_candles, now_ms)
+            if outcome is not None:
+                result, hit_time = outcome
+                if result == 'TP1':
+                    btc1h_timing['blocked'] = True
+                    btc1h_timing['blocked_at_ms'] = hit_time
+                    log('BTC1H TP1 RAGGIUNTO | ALT BLOCCATE', active['direction'],
+                        '| TP1', price_format(active['tp1']))
+                else:
+                    btc1h_timing['active_signal'] = None
+                    log('BTC1H TIMING: TP1 NON CONFERMATO', result,
+                        '| nessun nuovo blocco ALT')
+                _outbox_save_locked()
+        if btc1h_timing['blocked']:
+            blocked_at = btc1h_timing['blocked_at_ms']
+            if not isinstance(blocked_at, (int, float)):
+                # Stato incompleto: mai sbloccare senza un breakout verificato.
+                return
+            new_breakout = btc1h_new_breakout_with_volume(btc_candles, blocked_at)
+            if new_breakout is not None:
+                macro_t, direction = new_breakout
+                if macro_t != btc1h_timing['last_unblock_macro_t']:
+                    btc1h_timing['blocked'] = False
+                    btc1h_timing['blocked_at_ms'] = None
+                    btc1h_timing['last_unblock_macro_t'] = macro_t
+                    btc1h_timing['active_signal'] = None
+                    _outbox_save_locked()
+                    log('BTC1H NUOVO BREAKOUT + VOLUME | ALT SBLOCCATE', direction,
+                        '| candela 1H', macro_t)
+
+
 def macro_structural_stop(candles_15m, direction, cfg):
     """SL strutturale del gruppo 1H/4H e ATR solo su macro candele chiuse."""
     bars = macro_closed_candles(candles_15m, cfg['macro_ms'])
@@ -936,6 +1099,11 @@ def confirm_after_closed_15m(setup, candles, btc_candles, closed, now_ms,
         log('CONFERMA SCARTATA', sym, entry_mode, '| volume', f'{ratio15:.2f}x',
             '< soglia', f"{cfg['confirm_volume_min']:.2f}x", '| mediana 20')
         return None
+    # BTC 1H ha raggiunto TP1: blocco globale delle altcoin 1H e 4H.
+    if sym != 'BTCUSDT' and btc1h_timing['blocked']:
+        log('CONFERMA SCARTATA', sym, entry_mode,
+            '| BTC1H ha raggiunto TP1: attendo nuovo breakout 1H + volume')
+        return None
     # NUOVO FILTRO ESCLUSIVO 1H: BTC 4H deve essere concorde o neutro.
     # BTC 4H opposto blocca SEMPRE il segnale 1H, senza deroghe +/-5pp.
     # I segnali 4H non passano da questo filtro e restano invariati.
@@ -971,6 +1139,16 @@ def confirm_after_closed_15m(setup, candles, btc_candles, closed, now_ms,
     setup['entry_mode'] = entry_mode
     signal = build_confirmed_signal(setup, candles, btc_direction, closed, now_ms)
     if signal:
+        distance = entry_extension_1h(signal, candles)
+        if distance is None:
+            log('CONFERMA SCARTATA', sym, entry_mode,
+                '| ATR1H per distanza entry non disponibile')
+            return None
+        if not distance['allowed']:
+            log('CONFERMA SCARTATA', sym, entry_mode, '| ENTRY TROPPO LONTANA',
+                f"{distance['extension']/distance['atr1h']:.2f} ATR1H",
+                '| massimo', f'{ENTRY_MAX_DISTANCE_ATR1H:.2f} ATR1H')
+            return None
         return signal
     log('CONFERMA SCARTATA', sym, entry_mode,
         '| primo prezzo post-chiusura o SL non valido')
@@ -1202,6 +1380,8 @@ def scan_market():
     now_ms = int(time.time() * 1000)
     if not (btc_candles[-1]['t'] <= now_ms < btc_candles[-1]['t'] + FIFTEEN_MIN_MS):
         return 0
+    # Prima di processare qualsiasi ALT, aggiorna TP1 BTC e l'eventuale sblocco.
+    update_btc1h_timing(btc_candles, now_ms)
     queued = 0
     for symbol, candles in snapshot.items():
         if candles[-1]['t'] != btc_candles[-1]['t']:
@@ -1239,6 +1419,8 @@ def scan_market():
         elif status == 'SIGNAL' and signal:
             if enqueue_alert(signal):
                 queued += 1
+                if symbol == 'BTCUSDT' and cfg['name'] == '1H':
+                    record_btc1h_signal(signal, btc_candles)
                 del active_setups[symbol]
                 log('SEGNALE IN CODA', cfg['name'], signal['entry_mode'],
                     symbol, signal['direction'])
