@@ -60,6 +60,7 @@ TIMEFRAME_SECONDS = 15 * 60
 FIFTEEN_MIN_MS = 15 * 60 * 1000
 ATR_PERIOD = 14
 BTC_NEUTRAL_BODY_ATR_MAX = 0.35
+BTC_4H_NEUTRAL_BODY_ATR_MAX = 0.35  # SOLO segnali 1H: BTC 4H neutro se corpo < 0.35 ATR4H
 VOLUME_AVG_BARS_15M = 20
 LIVE_VOLUME_PACE_MIN_SECONDS = 60
 LIVE_VOLUME_PROGRESS_LOG_SECONDS = 180
@@ -736,6 +737,30 @@ def macro_breakout(symbol, candles, now_ms, cfg, btc_candles=None):
     }
 
 
+def btc4h_closed_direction(btc_candles, confirmation_t):
+    """Direzione dell'ultima 4H BTC completamente CHIUSA, solo per segnali 1H.
+
+    NEUTRAL se il corpo 4H e' inferiore a 0.35 ATR4H calcolato sulle
+    precedenti candele 4H chiuse. Dati mancanti/non allineati => None.
+    Nessuna modifica al filtro BTC dei segnali 4H.
+    """
+    macro_bars = macro_closed_candles(btc_candles, FOUR_HOURS_MS)
+    required = ATR_PERIOD + 2
+    if not macro_tail_complete_and_consecutive(macro_bars, required, FOUR_HOURS_MS):
+        return None
+    last = macro_bars[-1]
+    confirmation_end = confirmation_t + FIFTEEN_MIN_MS
+    if last['t'] + FOUR_HOURS_MS > confirmation_end:
+        return None
+    atr4h = true_range_atr(macro_bars[:-1])
+    if atr4h is None or atr4h <= 0:
+        return None
+    body = last['c'] - last['o']
+    if abs(body) / atr4h < BTC_4H_NEUTRAL_BODY_ATR_MAX:
+        return 'NEUTRAL'
+    return 'LONG' if body > 0 else 'SHORT'
+
+
 def btc15_closed_direction(btc_candles, confirmation_t):
     """BTC15 sulla candela appena CHIUSA, non sulla nuova LIVE quasi neutra."""
     if len(btc_candles) < ATR_PERIOD + 3 or btc_candles[-2]['t'] != confirmation_t:
@@ -911,6 +936,17 @@ def confirm_after_closed_15m(setup, candles, btc_candles, closed, now_ms,
         log('CONFERMA SCARTATA', sym, entry_mode, '| volume', f'{ratio15:.2f}x',
             '< soglia', f"{cfg['confirm_volume_min']:.2f}x", '| mediana 20')
         return None
+    # NUOVO FILTRO ESCLUSIVO 1H: BTC 4H deve essere concorde o neutro.
+    # BTC 4H opposto blocca SEMPRE il segnale 1H, senza deroghe +/-5pp.
+    # I segnali 4H non passano da questo filtro e restano invariati.
+    if cfg['name'] == '1H':
+        btc4h_direction = btc4h_closed_direction(btc_candles, closed['t'])
+        if btc4h_direction is None:
+            return 'BTC_PENDING'
+        if btc4h_direction not in (d, 'NEUTRAL'):
+            log('CONFERMA SCARTATA', sym, entry_mode,
+                '| BTC4H', btc4h_direction, 'opposto a', d, '| filtro SOLO 1H')
+            return None
     btc_direction = ('NEUTRAL' if sym == 'BTCUSDT' and cfg['name'] == '1H'
                      else btc15_closed_direction(btc_candles, closed['t']))
     if sym != 'BTCUSDT' and btc_direction is None:
