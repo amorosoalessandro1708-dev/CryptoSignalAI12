@@ -1099,8 +1099,9 @@ def confirm_after_closed_15m(setup, candles, btc_candles, closed, now_ms,
         log('CONFERMA SCARTATA', sym, entry_mode, '| volume', f'{ratio15:.2f}x',
             '< soglia', f"{cfg['confirm_volume_min']:.2f}x", '| mediana 20')
         return None
-    # BTC 1H ha raggiunto TP1: blocco globale delle altcoin 1H e 4H.
-    if sym != 'BTCUSDT' and btc1h_timing['blocked']:
+    # BTC 1H ha raggiunto TP1: blocca SOLO le altcoin della strategia 1H.
+    # Le altcoin 4H ignorano questo blocco e conservano tutti gli altri filtri.
+    if cfg['name'] == '1H' and sym != 'BTCUSDT' and btc1h_timing['blocked']:
         log('CONFERMA SCARTATA', sym, entry_mode,
             '| BTC1H ha raggiunto TP1: attendo nuovo breakout 1H + volume')
         return None
