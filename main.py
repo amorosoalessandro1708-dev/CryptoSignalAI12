@@ -61,6 +61,8 @@ FIFTEEN_MIN_MS = 15 * 60 * 1000
 ATR_PERIOD = 14
 BTC_NEUTRAL_BODY_ATR_MAX = 0.35
 BTC_4H_NEUTRAL_BODY_ATR_MAX = 0.35  # SOLO segnali 1H: BTC 4H neutro se corpo < 0.35 ATR4H
+BTC_TP1_VOLUME_MEDIAN_BARS_1H = 5  # Nuovo blocco dopo TP1: mediana 5 volumi 1H precedenti
+BTC_TP1_BLOCK_VOLUME_RATIO = 0.60  # Blocca ALT 1H solo con volume 1H <0.60x
 ENTRY_MAX_DISTANCE_ATR1H = 0.50  # Tutti i segnali: estensione massima dell'entry dal breakout
 VOLUME_AVG_BARS_15M = 20
 LIVE_VOLUME_PACE_MIN_SECONDS = 60
@@ -150,7 +152,8 @@ dead_letters = {}
 # Tracking BTC1H: TP1 raggiunto blocca i nuovi segnali ALT fino a nuovo breakout 1H.
 # Persistito nello stesso file outbox per conservare lo stato tra i riavvii.
 btc1h_timing = {'active_signal': None, 'blocked': False, 'blocked_at_ms': None,
-                'last_unblock_macro_t': None}
+                'last_unblock_macro_t': None,
+                'tp1_wait_hour_t': None, 'tp1_last_checked_hour_t': None}
 
 active_setups = {}             # {symbol: setup 4H confermato in attesa di retest 15m}
 seen_macro_bars = {}            # {symbol: t della 4H gia' analizzata}
@@ -202,6 +205,12 @@ def load_telegram_outbox():
             btc1h_timing['blocked'] = timing.get('blocked') is True
             btc1h_timing['blocked_at_ms'] = timing.get('blocked_at_ms')
             btc1h_timing['last_unblock_macro_t'] = timing.get('last_unblock_macro_t')
+            # Mantiene l'attesa del volume BTC 1H anche dopo un riavvio.
+            wait_t = timing.get('tp1_wait_hour_t')
+            checked_t = timing.get('tp1_last_checked_hour_t')
+            btc1h_timing['tp1_wait_hour_t'] = wait_t if isinstance(wait_t, int) else None
+            btc1h_timing['tp1_last_checked_hour_t'] = (
+                checked_t if isinstance(checked_t, int) else None)
             active = timing.get('active_signal')
             if (isinstance(active, dict) and
                     active.get('direction') in ('LONG', 'SHORT') and
@@ -697,6 +706,10 @@ def record_btc1h_signal(signal, btc_candles):
         if btc1h_timing['blocked']:
             # Il blocco esistente si libera SOLO su nuovo breakout con volume.
             return
+        if btc1h_timing['tp1_wait_hour_t'] is not None:
+            # Un TP1 gia' acquisito deve completare i controlli 1H;
+            # un altro alert BTC non puo' cancellare l'attesa.
+            return
         btc1h_timing['active_signal'] = {
             'direction': direction, 'tp1': tp1, 'sl': signal['sl'],
             'entry_bar_t': current['t'],
@@ -740,7 +753,10 @@ def btc1h_first_target(signal, btc_candles, now_ms):
         if tp_touch or sl_touch:
             outcome = ('AMBIGUO' if tp_touch and sl_touch else
                        'TP1' if tp_touch else 'SL')
-            return outcome, now_ms if is_live else bar['t'] + FIFTEEN_MIN_MS
+            # Restituisce anche l'apertura della 15m in cui e' avvenuto
+            # il tocco: evita errori alle chiusure esatte delle ore.
+            return (outcome, now_ms if is_live else bar['t'] + FIFTEEN_MIN_MS,
+                    bar['t'])
     return None
 
 
@@ -772,27 +788,83 @@ def btc1h_new_breakout_with_volume(btc_candles, blocked_at_ms):
 
 
 def update_btc1h_timing(btc_candles, now_ms):
-    """Avanza il gate globale ALT: TP1 BTC1H -> blocco -> breakout nuovo."""
+    """TP1 BTC1H -> attesa chiusura 1H -> volume basso -> blocco ALT 1H.
+
+    Un TP1 non blocca subito. Si verifica il volume della 1H che lo
+    contiene e di ogni 1H successiva: volume / mediana 5 1H precedenti.
+    Lo sblocco resta il breakout 1H + volume sopra MEDIA 15 precedente.
+    """
     with alert_lock:
         active = btc1h_timing['active_signal']
-        if active and not btc1h_timing['blocked']:
+        pending_hour_t = btc1h_timing['tp1_wait_hour_t']
+        if active and not btc1h_timing['blocked'] and pending_hour_t is None:
             outcome = btc1h_first_target(active, btc_candles, now_ms)
             if outcome is not None:
-                result, hit_time = outcome
+                result, hit_time, hit_bar_t = outcome
                 if result == 'TP1':
-                    btc1h_timing['blocked'] = True
-                    btc1h_timing['blocked_at_ms'] = hit_time
-                    log('BTC1H TP1 RAGGIUNTO | ALT BLOCCATE', active['direction'],
-                        '| TP1', price_format(active['tp1']))
+                    # TP1 rilevato: nessun blocco finche' la 1H non chiude.
+                    pending_hour_t = (hit_bar_t // ONE_HOUR_MS) * ONE_HOUR_MS
+                    btc1h_timing['tp1_wait_hour_t'] = pending_hour_t
+                    btc1h_timing['tp1_last_checked_hour_t'] = None
+                    log('BTC1H TP1 RAGGIUNTO | ALT 1H ANCORA LIBERE',
+                        active['direction'], '| TP1', price_format(active['tp1']),
+                        '| attendo chiusura 1H', pending_hour_t)
                 else:
                     btc1h_timing['active_signal'] = None
                     log('BTC1H TIMING: TP1 NON CONFERMATO', result,
                         '| nessun nuovo blocco ALT')
                 _outbox_save_locked()
+
+        # Controlla la 1H contenente TP1 SOLO dopo la sua chiusura;
+        # se volume >=0.60x continua sulle successive 1H chiuse.
+        pending_hour_t = btc1h_timing['tp1_wait_hour_t']
+        if not btc1h_timing['blocked'] and isinstance(pending_hour_t, int):
+            bars = macro_closed_candles(btc_candles, ONE_HOUR_MS)
+            n = BTC_TP1_VOLUME_MEDIAN_BARS_1H
+            last_checked_t = btc1h_timing['tp1_last_checked_hour_t']
+            for i in range(n, len(bars)):
+                closed_hour = bars[i]
+                hour_t = closed_hour['t']
+                if hour_t < pending_hour_t or (last_checked_t is not None and
+                                              hour_t <= last_checked_t):
+                    continue
+                window = bars[i-n:i+1]
+                if not macro_tail_complete_and_consecutive(window, n+1,
+                                                           ONE_HOUR_MS):
+                    # Senza 5 candele antecedenti consecutive niente ratio valido.
+                    continue
+                base_volume = median_volume(c['v'] for c in window[:-1])
+                if base_volume <= 0:
+                    log('BTC1H TP1 VOLUME NON VALUTABILE', '| 1H', hour_t,
+                        '| mediana 5 volumi non positiva')
+                    continue
+                ratio = closed_hour['v'] / base_volume
+                btc1h_timing['tp1_last_checked_hour_t'] = hour_t
+                last_checked_t = hour_t
+                if ratio < BTC_TP1_BLOCK_VOLUME_RATIO:
+                    btc1h_timing['blocked'] = True
+                    btc1h_timing['blocked_at_ms'] = hour_t + ONE_HOUR_MS
+                    btc1h_timing['tp1_wait_hour_t'] = None
+                    btc1h_timing['tp1_last_checked_hour_t'] = None
+                    log('BTC1H VOLUME BASSO DOPO TP1 | ALT 1H BLOCCATE',
+                        '| volume', f'{ratio:.2f}x',
+                        '| soglia', f'{BTC_TP1_BLOCK_VOLUME_RATIO:.2f}x',
+                        '| candela 1H', hour_t)
+                else:
+                    log('BTC1H TP1 | ALT 1H LIBERE',
+                        '| volume', f'{ratio:.2f}x',
+                        '| soglia', f'{BTC_TP1_BLOCK_VOLUME_RATIO:.2f}x',
+                        '| ricontrollo prossima 1H')
+                _outbox_save_locked()
+                if btc1h_timing['blocked']:
+                    break
+
+        # Sblocco IDENTICO al precedente: breakout BTC 1H con volume
+        # superiore alla media ARITMETICA delle 15 candele 1H precedenti.
         if btc1h_timing['blocked']:
             blocked_at = btc1h_timing['blocked_at_ms']
             if not isinstance(blocked_at, (int, float)):
-                # Stato incompleto: mai sbloccare senza un breakout verificato.
+                # Stato incompleto: mai sbloccare senza breakout verificato.
                 return
             new_breakout = btc1h_new_breakout_with_volume(btc_candles, blocked_at)
             if new_breakout is not None:
@@ -802,6 +874,8 @@ def update_btc1h_timing(btc_candles, now_ms):
                     btc1h_timing['blocked_at_ms'] = None
                     btc1h_timing['last_unblock_macro_t'] = macro_t
                     btc1h_timing['active_signal'] = None
+                    btc1h_timing['tp1_wait_hour_t'] = None
+                    btc1h_timing['tp1_last_checked_hour_t'] = None
                     _outbox_save_locked()
                     log('BTC1H NUOVO BREAKOUT + VOLUME | ALT SBLOCCATE', direction,
                         '| candela 1H', macro_t)
