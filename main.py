@@ -787,11 +787,37 @@ def btc1h_new_breakout_with_volume(btc_candles, blocked_at_ms):
     return None
 
 
+def btc1h_breakout_during_tp1_wait(macro_bars, hour_index):
+    """Verifica un breakout BTC su UNA specifica 1H gia' chiusa.
+
+    Stessa regola dello sblocco: prezzo oltre le 15 precedenti e volume
+    superiore alla MEDIA ARITMETICA dei loro volumi. Serve solo ad annullare
+    l'attesa TP1 prima che possa attivarsi un blocco delle altcoin 1H.
+    """
+    n = STRATEGIES['1H']['lookback']
+    if hour_index < n:
+        return None
+    window = macro_bars[hour_index - n:hour_index + 1]
+    if not macro_tail_complete_and_consecutive(window, n + 1, ONE_HOUR_MS):
+        return None
+    current = window[-1]
+    previous = window[:-1]
+    avg_volume = sum(bar['v'] for bar in previous) / n
+    if current['v'] <= avg_volume:
+        return None
+    if current['c'] > max(bar['h'] for bar in previous):
+        return 'LONG'
+    if current['c'] < min(bar['l'] for bar in previous):
+        return 'SHORT'
+    return None
+
+
 def update_btc1h_timing(btc_candles, now_ms):
     """TP1 BTC1H -> attesa chiusura 1H -> volume basso -> blocco ALT 1H.
 
     Un TP1 non blocca subito. Si verifica il volume della 1H che lo
     contiene e di ogni 1H successiva: volume / mediana 5 1H precedenti.
+    Un nuovo breakout valido durante l'attesa la annulla prima del blocco.
     Lo sblocco resta il breakout 1H + volume sopra MEDIA 15 precedente.
     """
     with alert_lock:
@@ -828,6 +854,21 @@ def update_btc1h_timing(btc_candles, now_ms):
                 if hour_t < pending_hour_t or (last_checked_t is not None and
                                               hour_t <= last_checked_t):
                     continue
+                # Il breakout valido della 1H CHIUSA prevale sul volume basso:
+                # annulla l'attesa TP1, invalida il vecchio segnale BTC e
+                # mantiene libere le ALT 1H. Mai eseguire su una 1H live.
+                breakout_direction = btc1h_breakout_during_tp1_wait(bars, i)
+                if breakout_direction is not None:
+                    btc1h_timing['active_signal'] = None
+                    btc1h_timing['tp1_wait_hour_t'] = None
+                    btc1h_timing['tp1_last_checked_hour_t'] = None
+                    btc1h_timing['blocked'] = False
+                    btc1h_timing['blocked_at_ms'] = None
+                    _outbox_save_locked()
+                    log('BTC1H BREAKOUT VALIDO DURANTE ATTESA TP1 | ATTESA ANNULLATA',
+                        breakout_direction, '| candela 1H', hour_t,
+                        '| ALT 1H LIBERE; vecchio TP1 invalidato')
+                    break
                 window = bars[i-n:i+1]
                 if not macro_tail_complete_and_consecutive(window, n+1,
                                                            ONE_HOUR_MS):
