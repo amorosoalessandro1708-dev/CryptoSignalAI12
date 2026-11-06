@@ -60,7 +60,7 @@ STRATEGIES = {
         'macro_close_position_min': 0.65,
         'confirm_volume_min': 0.60, 'body_fraction': 0.60,
         'body_atr_min': 0.60, 'wick_directional': 0.12,
-        'wick_opposite': 0.12, 'sl_lookback': 5,
+        'wick_opposite': 0.25, 'sl_lookback': 5,
         'sl_buffer_atr': 0.25, 'lifetime_seconds': 6 * 60 * 60,
     },
     '4H': {
@@ -69,7 +69,7 @@ STRATEGIES = {
         'macro_close_position_min': 0.70,
         'confirm_volume_min': 0.60, 'body_fraction': 0.60,
         'body_atr_min': 0.50, 'wick_directional': 0.15,
-        'wick_opposite': 0.15, 'sl_lookback': 3,
+        'wick_opposite': 0.25, 'sl_lookback': 3,
         'sl_buffer_atr': 0.25, 'lifetime_seconds': 12 * 60 * 60,
     },
 }
