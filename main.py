@@ -1,22 +1,3 @@
-"""MOMENTUM ONE V5 - BREAKOUT 1H/4H SENZA FILTRO VOLUME.
-
-40 Binance USDT-M perpetual: 18 simboli con breakout 1H e 22 con breakout 4H.
-Parametri identici alla V4 ROBUST condivisa dall'utente: lookback 15/6,
-nessun volume minimo sul breakout 1H/4H; conferma 15m 0.60x
-sulla mediana delle ultime 20 barre, filtro BTC e deroga +/-5pp,
-body/wick/ATR, entrata DIRECT prima 15m o RETEST, SL e TP invariati.
-
-Fix infrastruttura:
-- Candele macro complete, allineate e consecutive per i filtri necessari.
-- Feed operativo solo con 15m corrente E fonte WS/REST realmente recente.
-- Conferma entro 30s dalla chiusura; BTC non pronto => ritenta senza consumarla.
-- Setup protetti anche all'apertura di nuove macro e ri-valutati a ogni scan.
-- Outbox Telegram su disco, retry fino a 5 minuti, delivery log, dead-letter.
-
-Nessun ordine automatico. Solo segnali Telegram [SIMULAZIONE].
-"""
-
-
 import json
 import os
 import queue
@@ -26,33 +7,30 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from statistics import median
 from zoneinfo import ZoneInfo
-
 import requests
 import websocket
-
-# Variabili ambiente gia' usate nel progetto Telegram/Railway
 BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
-
 SYMBOLS = [
     'SOLUSDT', 'BTCUSDT', 'ETHUSDT', 'XRPUSDT', 'BNBUSDT',
     'DOGEUSDT', 'AVAXUSDT', 'SUIUSDT', 'LINKUSDT', 'ADAUSDT',
     'NEARUSDT', 'UNIUSDT', 'LTCUSDT', 'DOTUSDT', 'APTUSDT',
     'ARBUSDT', 'OPUSDT', 'INJUSDT', 'RENDERUSDT', '1000PEPEUSDT',
     'FILUSDT', 'ETCUSDT', 'AAVEUSDT', 'TIAUSDT', 'SEIUSDT',
-    # 15 nuove altcoin: SOLO strategia 4H; nessun filtro modificato.
     'HBARUSDT', 'XLMUSDT', 'TRXUSDT', 'ONDOUSDT', 'ENAUSDT',
     'WIFUSDT', 'TAOUSDT', '1000SHIBUSDT', '1000BONKUSDT', 'WLDUSDT',
     'FETUSDT', 'ATOMUSDT', 'BCHUSDT', 'JUPUSDT', 'PENDLEUSDT',
+    'HYPEUSDT', 'ZECUSDT', 'XTZUSDT', 'CRVUSDT', 'STXUSDT',
+    'ICPUSDT', 'SANDUSDT', 'POLUSDT', 'ALGOUSDT', 'LDOUSDT',
 ]
-
-# Le 40 coppie restano monitorate in un solo processo.
 ONE_HOUR_SYMBOLS = frozenset((
     'BTCUSDT', 'ETHUSDT', 'SOLUSDT',
     '1000PEPEUSDT', '1000BONKUSDT', '1000SHIBUSDT', 'WIFUSDT',
     'TAOUSDT', 'FETUSDT', 'RENDERUSDT',
     'SUIUSDT', 'SEIUSDT', 'JUPUSDT', 'INJUSDT',
     'ARBUSDT', 'OPUSDT', 'PENDLEUSDT', 'ONDOUSDT',
+    'HYPEUSDT', 'ZECUSDT', 'XTZUSDT', 'CRVUSDT', 'STXUSDT',
+    'ICPUSDT', 'SANDUSDT', 'POLUSDT', 'ALGOUSDT', 'LDOUSDT',
 ))
 FOUR_HOUR_SYMBOLS = frozenset(s for s in SYMBOLS if s not in ONE_HOUR_SYMBOLS)
 SCAN_SECONDS = 1.0
@@ -60,26 +38,21 @@ TIMEFRAME_SECONDS = 15 * 60
 FIFTEEN_MIN_MS = 15 * 60 * 1000
 ATR_PERIOD = 14
 BTC_NEUTRAL_BODY_ATR_MAX = 0.35
-BTC_4H_NEUTRAL_BODY_ATR_MAX = 0.35  # SOLO segnali 1H: BTC 4H neutro se corpo < 0.35 ATR4H
-BTC_TP1_VOLUME_MEDIAN_BARS_1H = 5  # Nuovo blocco dopo TP1: mediana 5 volumi 1H precedenti
-BTC_TP1_BLOCK_VOLUME_RATIO = 0.60  # Blocca ALT 1H solo con volume 1H <0.60x
-ENTRY_MAX_DISTANCE_ATR1H = 0.50  # Tutti i segnali: estensione massima dell'entry dal breakout
+BTC_4H_NEUTRAL_BODY_ATR_MAX = 0.35
+BTC_TP1_VOLUME_MEDIAN_BARS_1H = 5
+BTC_TP1_BLOCK_VOLUME_RATIO = 0.60
+ENTRY_MAX_DISTANCE_ATR1H = 0.50
 VOLUME_AVG_BARS_15M = 20
 LIVE_VOLUME_PACE_MIN_SECONDS = 60
 LIVE_VOLUME_PROGRESS_LOG_SECONDS = 180
-# Retest: deve toccare il livello di breakout; nessuna soglia ATR sul retest.
 MICRO_CLOSE_BUFFER_ATR15 = 0.02
 MACRO_CLOSE_GRACE_SECONDS = 1800
 CLOSE_EVENT_MAX_DELAY_SECONDS = 30
 TP1_R, TP2_R, TP3_R = 0.30, 0.80, 1.50
 FOUR_HOURS_MS = 4 * 60 * 60 * 1000
 ONE_HOUR_MS = 60 * 60 * 1000
-RELATIVE_BTC_OVERRIDE_PCT = 5.0  # filtro BTC15 opposto
-# Booster volume macro +/-7pp disattivato: senza soglia macro non ha funzione.
-# Resta invariata la deroga BTC +/-5pp per altcoin con forza relativa 4H.
-DIRECT_CLOSE_POSITION_MIN = 0.80  # estremo direzionale per prima 15m diretta
-
-# Parametri indipendenti per i due gruppi: nessuna sovrapposizione di segnali.
+RELATIVE_BTC_OVERRIDE_PCT = 5.0
+DIRECT_CLOSE_POSITION_MIN = 0.80
 STRATEGIES = {
     '1H': {
         'name': '1H', 'macro_ms': ONE_HOUR_MS,
@@ -100,20 +73,16 @@ STRATEGIES = {
         'sl_buffer_atr': 0.25, 'lifetime_seconds': 12 * 60 * 60,
     },
 }
-
 def strategy_for(symbol):
     return STRATEGIES['1H'] if symbol in ONE_HOUR_SYMBOLS else STRATEGIES['4H']
-
-
-# Configurazione affidabilita'/trasporto e storico sufficiente ai filtri 4H
 KLINES_URL = 'https://fapi.binance.com/fapi/v1/klines'
 WS_BASE_URL = 'wss://fstream.binance.com/market/stream?streams='
-WS_STALE_SECONDS = 90.0  # 5s scartava feed anche durante brevi pause negli scambi
-REST_FRESH_SECONDS = 90.0  # REST recente e' un backup, non una finta notifica WS
-REST_FALLBACK_TRIGGER_SECONDS = 15.0  # WS silenzioso: valuta recupero dati
-REST_FALLBACK_POLL_SECONDS = 30.0  # limita le richieste REST per simbolo
-REST_BOUNDARY_POLL_SECONDS = 5.0  # recupero rapido se la 15m live non e' ancora arrivata
-REST_FALLBACK_RECENT_BARS = 5  # recupera solo ultime barre, non 480 ogni volta
+WS_STALE_SECONDS = 90.0
+REST_FRESH_SECONDS = 90.0
+REST_FALLBACK_TRIGGER_SECONDS = 15.0
+REST_FALLBACK_POLL_SECONDS = 30.0
+REST_BOUNDARY_POLL_SECONDS = 5.0
+REST_FALLBACK_RECENT_BARS = 5
 WS_MAX_RECONNECT_SECONDS = 30
 REST_GAP_SECONDS = 0.30
 REST_RETRY_WAIT = (5, 10, 20)
@@ -121,54 +90,38 @@ REST_REFRESH_SECONDS = 300
 GAP_REFRESH_SECONDS = 15
 LOG_INTERVAL_SECONDS = 15
 TELEGRAM_RETRY_SECONDS = 30
-HISTORY_MAXLEN = 480  # almeno 20 4H precedenti + breakout per le altcoin
-# Parametri trasporto Telegram (NON influiscono sui requisiti di trading)
+HISTORY_MAXLEN = 480
 TELEGRAM_MAX_ATTEMPTS = 8
 TELEGRAM_DELIVERY_WINDOW_SECONDS = 300
 TELEGRAM_RETRY_INITIAL_SECONDS = 3
 TELEGRAM_RETRY_MAX_SECONDS = 40
-# Imposta TELEGRAM_OUTBOX_FILE su un volume persistente Railway per durabilita' ai redeploy.
-# Senza volume, il contenuto della directory /tmp NON sopravvive ai nuovi container.
 TELEGRAM_OUTBOX_FILE = os.getenv('TELEGRAM_OUTBOX_FILE', '/tmp/momentum_one_telegram_outbox.json')
 TELEGRAM_RETRY_ROUND_SECONDS = 45
 ITALY = ZoneInfo('Europe/Rome')
-
 cache_lock = threading.RLock()
 rest_lock = threading.Lock()
 alert_lock = threading.Lock()
-market_cache = {}              # {symbol: [candele 15m, ...]}
-last_ws_receive = {}          # {symbol: time.monotonic()}
-last_rest_receive = {}        # {symbol: REST corrente verificato, monotonic()}
-last_rest_recovery_try = {}   # {symbol: ultimo tentativo REST mirato, monotonic()}
-needs_refresh = set()         # buchi nella serie, recuperati REST
+market_cache = {}
+last_ws_receive = {}
+last_rest_receive = {}
+last_rest_recovery_try = {}
+needs_refresh = set()
 websocket_connected = False
 last_rest_call = 0.0
-sent_alerts = set()           # (symbol, apertura della candela)
+sent_alerts = set()
 pending_alerts = set()
 failed_alert_times = {}
-telegram_queue = queue.Queue()  # non perde alert a causa del limite di capacita'
+telegram_queue = queue.Queue()
 persisted_pending = {}
 dead_letters = {}
-# Tracking BTC1H: TP1 raggiunto blocca i nuovi segnali ALT fino a nuovo breakout 1H.
-# Persistito nello stesso file outbox per conservare lo stato tra i riavvii.
 btc1h_timing = {'active_signal': None, 'blocked': False, 'blocked_at_ms': None,
                 'last_unblock_macro_t': None,
                 'tp1_wait_hour_t': None, 'tp1_last_checked_hour_t': None}
-
-active_setups = {}             # {symbol: setup 4H confermato in attesa di retest 15m}
-seen_macro_bars = {}            # {symbol: t della 4H gia' analizzata}
-
-
+active_setups = {}
+seen_macro_bars = {}
 def log(*parts):
     print(*parts, flush=True)
-
-
 def _outbox_save_locked():
-    """Invocare con alert_lock: serializza jobs prima dell'invio.
-
-    Per sopravvivere ai deploy Railway configurare un Volume e la variabile
-    TELEGRAM_OUTBOX_FILE su quel mount. I/O su file separato dalla strategia.
-    """
     try:
         folder = os.path.dirname(os.path.abspath(TELEGRAM_OUTBOX_FILE))
         os.makedirs(folder, exist_ok=True)
@@ -186,10 +139,7 @@ def _outbox_save_locked():
         os.replace(temp_file, TELEGRAM_OUTBOX_FILE)
     except Exception as exc:
         log('TELEGRAM OUTBOX: scrittura non riuscita', repr(exc))
-
-
 def load_telegram_outbox():
-    """Riprende gli alert recenti non confermati dopo un riavvio."""
     try:
         with open(TELEGRAM_OUTBOX_FILE, 'r', encoding='utf-8') as file:
             payload = json.load(file)
@@ -205,7 +155,6 @@ def load_telegram_outbox():
             btc1h_timing['blocked'] = timing.get('blocked') is True
             btc1h_timing['blocked_at_ms'] = timing.get('blocked_at_ms')
             btc1h_timing['last_unblock_macro_t'] = timing.get('last_unblock_macro_t')
-            # Mantiene l'attesa del volume BTC 1H anche dopo un riavvio.
             wait_t = timing.get('tp1_wait_hour_t')
             checked_t = timing.get('tp1_last_checked_hour_t')
             btc1h_timing['tp1_wait_hour_t'] = wait_t if isinstance(wait_t, int) else None
@@ -252,15 +201,7 @@ def load_telegram_outbox():
             except (KeyError, ValueError, TypeError):
                 continue
         _outbox_save_locked()
-
-
 def telegram_send_once(text):
-    """Restituisce (consegnato, ritentabile, attesa_suggerita).
-
-    Un timeout puo' essere ambiguo: Telegram potrebbe aver ricevuto il
-    messaggio, anche se il client non ha ricevuto la conferma. L'ID stabile
-    nel testo rende riconoscibili eventuali copie, senza poterle impedire.
-    """
     if not BOT_TOKEN or not CHAT_ID:
         log('TELEGRAM NON CONFIGURATO: mancano TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID')
         return False, False, 0
@@ -293,14 +234,9 @@ def telegram_send_once(text):
     except (requests.RequestException, ValueError) as exc:
         log('Telegram errore di rete/risposta:', repr(exc))
         return False, True, 0
-
-
 def send_telegram(text):
-    """Compatibilita' con messaggio di avvio (non segnale operativo)."""
     ok, _, _ = telegram_send_once(text)
     return ok
-
-
 def request_klines(symbol, limit=HISTORY_MAXLEN):
     global last_rest_call
     error = None
@@ -341,17 +277,7 @@ def request_klines(symbol, limit=HISTORY_MAXLEN):
         if attempt < len(REST_RETRY_WAIT):
             time.sleep(REST_RETRY_WAIT[attempt])
     raise RuntimeError(f'{symbol}: impossibile recuperare dati 15m ({error})')
-
-
 def refresh_symbol(symbol, recent=False):
-    """Aggiorna le candele da REST, con merge sicuro per fallback rapido.
-
-    - All'avvio e nei refresh completi scarica 480 barre.
-    - Per feed WS silenziosi scarica 5 barre e le fonde con lo storico.
-    - Se mancano candele tra le 2 fonti, non inventa dati: richiede
-      un recupero integrale e blocca il simbolo fino al ripristino.
-    - Un backup REST e' marcato fresco SOLO se include la 15m corrente.
-    """
     with cache_lock:
         has_cache = bool(market_cache.get(symbol))
     use_recent = recent and has_cache
@@ -361,10 +287,8 @@ def refresh_symbol(symbol, recent=False):
     with cache_lock:
         old = market_cache.get(symbol)
         if old and old[-1]['t'] > candles[-1]['t']:
-            # REST in ritardo: non retrocedere la serie aggiornata dal WS.
             return False
         if old and use_recent:
-            # Serve una sovrapposizione reale per unire serie senza buchi.
             old_by_t = {c['t']: c for c in old}
             if not any(c['t'] in old_by_t for c in candles):
                 needs_refresh.add(symbol)
@@ -385,13 +309,9 @@ def refresh_symbol(symbol, recent=False):
                 candles[-1] = old[-1]
             market_cache[symbol] = candles[-HISTORY_MAXLEN:]
         needs_refresh.discard(symbol)
-        # I dati REST NON garantiscono continuita' di aggiornamenti WS.
-        # Il backup vale solo se la sua risposta ha la candela oraria corrente.
         if candles[-1]['t'] == expected_t:
             last_rest_receive[symbol] = time.monotonic()
     return True
-
-
 def initialize_history():
     log('Caricamento storico 15m per', len(SYMBOLS), 'coppie...')
     with ThreadPoolExecutor(max_workers=6) as executor:
@@ -406,8 +326,6 @@ def initialize_history():
     if available == 0:
         raise RuntimeError('Nessun dato Binance disponibile')
     log('Storico inizializzato:', available, '/', len(SYMBOLS))
-
-
 def receive_kline(payload):
     event = payload.get('data', payload)
     if event.get('e') != 'kline':
@@ -425,7 +343,6 @@ def receive_kline(payload):
             return
     except (KeyError, ValueError, TypeError):
         return
-
     with cache_lock:
         previous = market_cache.get(symbol)
         if not previous:
@@ -435,17 +352,15 @@ def receive_kline(payload):
         if c['t'] < last['t']:
             return
         if c['t'] == last['t']:
-            if c['v'] < last['v']:  # scarta pacchetti cumulativi vecchi
+            if c['v'] < last['v']:
                 return
             market_cache[symbol] = previous[:-1] + [c]
         elif c['t'] == last['t'] + TIMEFRAME_SECONDS * 1000:
             market_cache[symbol] = (previous + [c])[-HISTORY_MAXLEN:]
         else:
-            needs_refresh.add(symbol)  # serie incompleta: niente segnali finche' recuperata
+            needs_refresh.add(symbol)
             return
         last_ws_receive[symbol] = time.monotonic()
-
-
 def websocket_worker():
     global websocket_connected
     streams = '/'.join(f'{s.lower()}@kline_15m' for s in SYMBOLS)
@@ -460,22 +375,18 @@ def websocket_worker():
                 with cache_lock:
                     websocket_connected = True
                 log('WS connesso,', len(SYMBOLS), 'stream 15m')
-
             def on_message(ws, message):
                 try:
                     receive_kline(json.loads(message))
                 except (ValueError, TypeError, AttributeError) as exc:
                     log('Messaggio WS non valido:', exc)
-
             def on_error(ws, error):
                 log('WebSocket errore:', error)
-
             def on_close(ws, code, reason):
                 global websocket_connected
                 with cache_lock:
                     websocket_connected = False
                 log('WS disconnesso:', code, reason)
-
             ws = websocket.WebSocketApp(
                 url, on_open=on_open, on_message=on_message,
                 on_error=on_error, on_close=on_close,
@@ -488,15 +399,7 @@ def websocket_worker():
                 websocket_connected = False
         time.sleep(delay)
         delay = min(delay * 2, WS_MAX_RECONNECT_SECONDS)
-
-
 def history_worker():
-    """Recupera buchi e feed poco attivi senza modificare i segnali.
-
-    Il fallback REST e' mirato: 5 candele, massimo ogni 30s per simbolo;
-    dopo un cambio di candela 15m non ancora ricevuto, riprova ogni 5s.
-    Queste chiamate sono nel worker e non bloccano la scansione ~1s.
-    """
     last_full = time.monotonic()
     last_gap = 0.0
     while True:
@@ -521,7 +424,6 @@ def history_worker():
                     continue
                 last_rest_recovery_try[symbol] = now
                 fallback.append(symbol)
-
         if now - last_gap >= GAP_REFRESH_SECONDS:
             for symbol in set(gaps + missing):
                 try:
@@ -529,15 +431,12 @@ def history_worker():
                 except Exception as exc:
                     log('Recupero REST fallito:', symbol, exc)
             last_gap = now
-
         for symbol in fallback:
             try:
                 if not refresh_symbol(symbol, recent=True):
-                    # Il simbolo resta escluso se richiede uno storico completo.
                     pass
             except Exception as exc:
                 log('Fallback feed REST fallito:', symbol, exc)
-
         if now - last_full >= REST_REFRESH_SECONDS:
             for symbol in SYMBOLS:
                 try:
@@ -546,10 +445,7 @@ def history_worker():
                     log('Refresh REST fallito:', symbol, exc)
             last_full = time.monotonic()
         time.sleep(1)
-
-
 def true_range_atr(closed_candles):
-    """ATR14 su sole candele CHIUSE: non usa mai quella live."""
     if len(closed_candles) < ATR_PERIOD + 1:
         return None
     bars = closed_candles[-(ATR_PERIOD + 1):]
@@ -558,22 +454,10 @@ def true_range_atr(closed_candles):
         c, prev = bars[i], bars[i - 1]
         tr.append(max(c['h']-c['l'], abs(c['h']-prev['c']), abs(c['l']-prev['c'])))
     return sum(tr) / ATR_PERIOD
-
-
 def median_volume(volumes):
-    """Mediana dei volumi non negativi (nessuna candela corrente inclusa)."""
     values = [max(0.0, float(v)) for v in volumes]
     return float(median(values)) if values else 0.0
-
-
 def live_volume_progress(candles, now_ms, threshold):
-    """Misura il volume cumulativo della candela LIVE senza anticipare il segnale.
-
-    actual_ratio = volume gia' scambiato / mediana delle 20 precedenti CHIUSE.
-    pace_ratio = proiezione lineare a fine 15m, solo INDICATIVA; non e' il
-    volume definitivo, ne' un filtro di ingresso. La mediana e' fissata per
-    tutta la durata della candela live e non include mai la live stessa.
-    """
     if len(candles) < VOLUME_AVG_BARS_15M + 1:
         return None
     live = candles[-1]
@@ -595,13 +479,7 @@ def live_volume_progress(candles, now_ms, threshold):
         'pace_ratio': pace_ratio,
         'progress_percent': 100.0 * actual_ratio / threshold,
     }
-
-
 def monitor_live_confirmation_volume(setup, candles, now_ms):
-    """Solo log del volume live: durante la prima 15m diretta o dopo retest.
-
-    Il segnale usa ESCLUSIVAMENTE il volume definitivo alla chiusura 15m.
-    """
     if not candles:
         return
     first_direct = (setup.get('allow_direct') and not setup['touched']
@@ -623,7 +501,6 @@ def monitor_live_confirmation_volume(setup, candles, now_ms):
             'next_log_elapsed': LIVE_VOLUME_PROGRESS_LOG_SECONDS,
         }
         setup['live_volume_state'] = state
-    # Il dato viene aggiornato ogni secondo; i log sono meno frequenti.
     state['actual_ratio'] = progress['actual_ratio']
     state['pace_ratio'] = progress['pace_ratio']
     state['progress_percent'] = progress['progress_percent']
@@ -642,13 +519,10 @@ def monitor_live_confirmation_volume(setup, candles, now_ms):
             f"({progress['progress_percent']:.0f}% della soglia)",
             f"ritmo stimato {progress['pace_ratio']:.2f}x",
             '| conferma SOLO dopo chiusura 15m')
-
-
 def macro_closed_candles(candles_15m, macro_ms):
-    """Ricostruisce candele 1H/4H solo da blocchi completi di 15m CHIUSE."""
     required_count = macro_ms // FIFTEEN_MIN_MS
     groups = {}
-    for candle in candles_15m[:-1]:  # l'ultima 15m e' LIVE
+    for candle in candles_15m[:-1]:
         block_t = (candle['t'] // macro_ms) * macro_ms
         groups.setdefault(block_t, []).append(candle)
     result = []
@@ -664,23 +538,13 @@ def macro_closed_candles(candles_15m, macro_ms):
             'c': group[-1]['c'], 'v': sum(c['v'] for c in group),
         })
     return result
-
-
 def macro_tail_complete_and_consecutive(bars, count, macro_ms):
-    """Controlla l'ultimo segmento necessario, senza bloccare per buchi remoti."""
     if len(bars) < count:
         return False
     tail = bars[-count:]
     return all(tail[i]['t'] + macro_ms == tail[i + 1]['t']
                for i in range(count - 1))
-
-
 def entry_extension_1h(signal, candles):
-    """Limite prezzo d'ingresso, indipendente dal timeframe del breakout.
-
-    ATR14 calcolato sulle ultime 1H complete; se manca lo storico,
-    il segnale e' scartato (mai ignorare il limite di estensione).
-    """
     bars = macro_closed_candles(candles, ONE_HOUR_MS)
     if not macro_tail_complete_and_consecutive(bars, ATR_PERIOD + 1, ONE_HOUR_MS):
         return None
@@ -692,10 +556,7 @@ def entry_extension_1h(signal, candles):
     limit = ENTRY_MAX_DISTANCE_ATR1H * atr1h
     return {'allowed': extension <= limit + 1e-12,
             'extension': extension, 'limit': limit, 'atr1h': atr1h}
-
-
 def record_btc1h_signal(signal, btc_candles):
-    """Registra TP1 del BTC 1H realmente accodato, senza modificare i target."""
     if signal['symbol'] != 'BTCUSDT' or signal['strategy'] != '1H':
         return
     direction = signal['direction']
@@ -704,29 +565,18 @@ def record_btc1h_signal(signal, btc_candles):
     current = btc_candles[-1]
     with alert_lock:
         if btc1h_timing['blocked']:
-            # Il blocco esistente si libera SOLO su nuovo breakout con volume.
             return
         if btc1h_timing['tp1_wait_hour_t'] is not None:
-            # Un TP1 gia' acquisito deve completare i controlli 1H;
-            # un altro alert BTC non puo' cancellare l'attesa.
             return
         btc1h_timing['active_signal'] = {
             'direction': direction, 'tp1': tp1, 'sl': signal['sl'],
             'entry_bar_t': current['t'],
-            # Non contare come TP1 o SL le wick precedenti all'entry.
             'initial_high': current['h'], 'initial_low': current['l'],
             'macro_t': signal['macro_t'],
         }
         _outbox_save_locked()
     log('BTC1H TIMING ARMATO', direction, '| TP1', price_format(tp1))
-
-
 def btc1h_first_target(signal, btc_candles, now_ms):
-    """Identifica se TP1 precede lo SL, senza attribuire wick pre-entry.
-
-    Se TP1 e SL compaiono entrambi nella stessa candela senza ordine certo,
-    il risultato e' ambiguo: non assumiamo che TP1 sia stato preso prima.
-    """
     entry_bar_t = signal['entry_bar_t']
     direction = signal['direction']
     tp1, sl = signal['tp1'], signal['sl']
@@ -753,21 +603,10 @@ def btc1h_first_target(signal, btc_candles, now_ms):
         if tp_touch or sl_touch:
             outcome = ('AMBIGUO' if tp_touch and sl_touch else
                        'TP1' if tp_touch else 'SL')
-            # Restituisce anche l'apertura della 15m in cui e' avvenuto
-            # il tocco: evita errori alle chiusure esatte delle ore.
             return (outcome, now_ms if is_live else bar['t'] + FIFTEEN_MIN_MS,
                     bar['t'])
     return None
-
-
 def btc1h_new_breakout_with_volume(btc_candles, blocked_at_ms):
-    """Sblocco: nuova 1H chiusa oltre le ultime 15 precedenti, con volume medio.
-
-    LONG: chiusura sopra il massimo delle 15 precedenti.
-    SHORT: chiusura sotto il minimo delle 15 precedenti (simmetrico).
-    Volume della candela di breakout > media aritmetica dei volumi delle
-    15 candele 1H precedenti, tutte CHIUSE. Media ricalcolata a ogni nuova 1H.
-    """
     bars = macro_closed_candles(btc_candles, ONE_HOUR_MS)
     n = STRATEGIES['1H']['lookback']
     if not macro_tail_complete_and_consecutive(bars, n + 1, ONE_HOUR_MS):
@@ -785,15 +624,7 @@ def btc1h_new_breakout_with_volume(btc_candles, blocked_at_ms):
     if curr['c'] < min(c['l'] for c in prev):
         return curr['t'], 'SHORT'
     return None
-
-
 def btc1h_breakout_during_tp1_wait(macro_bars, hour_index):
-    """Verifica un breakout BTC su UNA specifica 1H gia' chiusa.
-
-    Stessa regola dello sblocco: prezzo oltre le 15 precedenti e volume
-    superiore alla MEDIA ARITMETICA dei loro volumi. Serve solo ad annullare
-    l'attesa TP1 prima che possa attivarsi un blocco delle altcoin 1H.
-    """
     n = STRATEGIES['1H']['lookback']
     if hour_index < n:
         return None
@@ -810,16 +641,7 @@ def btc1h_breakout_during_tp1_wait(macro_bars, hour_index):
     if current['c'] < min(bar['l'] for bar in previous):
         return 'SHORT'
     return None
-
-
 def update_btc1h_timing(btc_candles, now_ms):
-    """TP1 BTC1H -> attesa chiusura 1H -> volume basso -> blocco ALT 1H.
-
-    Un TP1 non blocca subito. Si verifica il volume della 1H che lo
-    contiene e di ogni 1H successiva: volume / mediana 5 1H precedenti.
-    Un nuovo breakout valido durante l'attesa la annulla prima del blocco.
-    Lo sblocco resta il breakout 1H + volume sopra MEDIA 15 precedente.
-    """
     with alert_lock:
         active = btc1h_timing['active_signal']
         pending_hour_t = btc1h_timing['tp1_wait_hour_t']
@@ -828,7 +650,6 @@ def update_btc1h_timing(btc_candles, now_ms):
             if outcome is not None:
                 result, hit_time, hit_bar_t = outcome
                 if result == 'TP1':
-                    # TP1 rilevato: nessun blocco finche' la 1H non chiude.
                     pending_hour_t = (hit_bar_t // ONE_HOUR_MS) * ONE_HOUR_MS
                     btc1h_timing['tp1_wait_hour_t'] = pending_hour_t
                     btc1h_timing['tp1_last_checked_hour_t'] = None
@@ -840,9 +661,6 @@ def update_btc1h_timing(btc_candles, now_ms):
                     log('BTC1H TIMING: TP1 NON CONFERMATO', result,
                         '| nessun nuovo blocco ALT')
                 _outbox_save_locked()
-
-        # Controlla la 1H contenente TP1 SOLO dopo la sua chiusura;
-        # se volume >=0.60x continua sulle successive 1H chiuse.
         pending_hour_t = btc1h_timing['tp1_wait_hour_t']
         if not btc1h_timing['blocked'] and isinstance(pending_hour_t, int):
             bars = macro_closed_candles(btc_candles, ONE_HOUR_MS)
@@ -854,9 +672,6 @@ def update_btc1h_timing(btc_candles, now_ms):
                 if hour_t < pending_hour_t or (last_checked_t is not None and
                                               hour_t <= last_checked_t):
                     continue
-                # Il breakout valido della 1H CHIUSA prevale sul volume basso:
-                # annulla l'attesa TP1, invalida il vecchio segnale BTC e
-                # mantiene libere le ALT 1H. Mai eseguire su una 1H live.
                 breakout_direction = btc1h_breakout_during_tp1_wait(bars, i)
                 if breakout_direction is not None:
                     btc1h_timing['active_signal'] = None
@@ -872,7 +687,6 @@ def update_btc1h_timing(btc_candles, now_ms):
                 window = bars[i-n:i+1]
                 if not macro_tail_complete_and_consecutive(window, n+1,
                                                            ONE_HOUR_MS):
-                    # Senza 5 candele antecedenti consecutive niente ratio valido.
                     continue
                 base_volume = median_volume(c['v'] for c in window[:-1])
                 if base_volume <= 0:
@@ -899,13 +713,9 @@ def update_btc1h_timing(btc_candles, now_ms):
                 _outbox_save_locked()
                 if btc1h_timing['blocked']:
                     break
-
-        # Sblocco IDENTICO al precedente: breakout BTC 1H con volume
-        # superiore alla media ARITMETICA delle 15 candele 1H precedenti.
         if btc1h_timing['blocked']:
             blocked_at = btc1h_timing['blocked_at_ms']
             if not isinstance(blocked_at, (int, float)):
-                # Stato incompleto: mai sbloccare senza breakout verificato.
                 return
             new_breakout = btc1h_new_breakout_with_volume(btc_candles, blocked_at)
             if new_breakout is not None:
@@ -920,10 +730,7 @@ def update_btc1h_timing(btc_candles, now_ms):
                     _outbox_save_locked()
                     log('BTC1H NUOVO BREAKOUT + VOLUME | ALT SBLOCCATE', direction,
                         '| candela 1H', macro_t)
-
-
 def macro_structural_stop(candles_15m, direction, cfg):
-    """SL strutturale del gruppo 1H/4H e ATR solo su macro candele chiuse."""
     bars = macro_closed_candles(candles_15m, cfg['macro_ms'])
     if len(bars) < max(cfg['sl_lookback'], ATR_PERIOD + 1):
         return None
@@ -941,15 +748,7 @@ def macro_structural_stop(candles_15m, direction, cfg):
         extreme = max(max(c['h'] for c in structural), live['h'])
         sl = extreme + cfg['sl_buffer_atr'] * atr
     return {'sl': sl, 'atr_macro': atr, 'structure_extreme': extreme}
-
-
 def btc15_direction(btc_candles):
-    """BTC concorde oppure neutro; BTC opposto non neutro blocca il segnale.
-
-    BTC e' neutro se il corpo live e' <0.35 ATR15 sulle sole chiuse.
-    Se l'ATR non e' disponibile, restituisce None: niente segnali.
-    Non richiede volume BTC, medie o conferme 1H.
-    """
     if len(btc_candles) < ATR_PERIOD + 2:
         return None
     atr15 = true_range_atr(btc_candles[:-1])
@@ -960,14 +759,9 @@ def btc15_direction(btc_candles):
     if abs(displacement) / atr15 < BTC_NEUTRAL_BODY_ATR_MAX:
         return 'NEUTRAL'
     return 'LONG' if displacement > 0 else 'SHORT'
-
-
 def beyond_breakout(price, direction, level, buffer):
     return price >= level + buffer if direction == 'LONG' else price <= level - buffer
-
-
 def macro_breakout(symbol, candles, now_ms, cfg, btc_candles=None):
-    """Breakout 1H su 18 crypto e 4H sulle restanti 22, solo chiuse."""
     macro_bars = macro_closed_candles(candles, cfg['macro_ms'])
     required = max(ATR_PERIOD + 2, cfg['lookback'] + 1)
     if len(macro_bars) < required:
@@ -976,8 +770,6 @@ def macro_breakout(symbol, candles, now_ms, cfg, btc_candles=None):
     close_ms = macro['t'] + cfg['macro_ms']
     if not (0 <= now_ms - close_ms <= MACRO_CLOSE_GRACE_SECONDS * 1000):
         return None
-    # Solo le 'required' macro recenti devono essere complete/consecutive.
-    # Un buco di dati remoto non deve bloccare tutti i nuovi breakout.
     if not macro_tail_complete_and_consecutive(macro_bars, required, cfg['macro_ms']):
         return None
     prev = macro_bars[:-1]
@@ -1000,8 +792,6 @@ def macro_breakout(symbol, candles, now_ms, cfg, btc_candles=None):
                  else (macro['h']-macro['c']) / span)
     if close_pos < cfg['macro_close_position_min']:
         return None
-    # Volume di breakout 1H/4H NON richiesto: nessuna soglia ne' booster.
-    # Il controllo volume 15m di conferma resta invariato (>=0.60x mediana 20).
     if not macro_structural_stop(candles, direction, cfg):
         return None
     return {
@@ -1013,15 +803,7 @@ def macro_breakout(symbol, candles, now_ms, cfg, btc_candles=None):
         'last_checked_15m_t': None,
         'touched': False, 'touch_t': None, 'touched_price': None,
     }
-
-
 def btc4h_closed_direction(btc_candles, confirmation_t):
-    """Direzione dell'ultima 4H BTC completamente CHIUSA, solo per segnali 1H.
-
-    NEUTRAL se il corpo 4H e' inferiore a 0.35 ATR4H calcolato sulle
-    precedenti candele 4H chiuse. Dati mancanti/non allineati => None.
-    Nessuna modifica al filtro BTC dei segnali 4H.
-    """
     macro_bars = macro_closed_candles(btc_candles, FOUR_HOURS_MS)
     required = ATR_PERIOD + 2
     if not macro_tail_complete_and_consecutive(macro_bars, required, FOUR_HOURS_MS):
@@ -1037,10 +819,7 @@ def btc4h_closed_direction(btc_candles, confirmation_t):
     if abs(body) / atr4h < BTC_4H_NEUTRAL_BODY_ATR_MAX:
         return 'NEUTRAL'
     return 'LONG' if body > 0 else 'SHORT'
-
-
 def btc15_closed_direction(btc_candles, confirmation_t):
-    """BTC15 sulla candela appena CHIUSA, non sulla nuova LIVE quasi neutra."""
     if len(btc_candles) < ATR_PERIOD + 3 or btc_candles[-2]['t'] != confirmation_t:
         return None
     atr = true_range_atr(btc_candles[:-2])
@@ -1051,17 +830,8 @@ def btc15_closed_direction(btc_candles, confirmation_t):
     if abs(movement) / atr < BTC_NEUTRAL_BODY_ATR_MAX:
         return 'NEUTRAL'
     return 'LONG' if movement > 0 else 'SHORT'
-
-
 def relative_performance_4h(alt_candles, btc_candles, confirmation_t):
-    """Rendimento relativo con 17 chiusure 15m sincronizzate su 4H esatte.
-
-    confirmation_t e' il timestamp di APERTURA della 15m CHIUSA terminale.
-    Si possono interrogare anche chiusure macro passate (e.g. breakout 4H),
-    senza usare candele future ne' la live. Se mancano dati, None.
-    """
     bars_4h = FOUR_HOURS_MS // FIFTEEN_MIN_MS
-
     def window_ending_at(candles):
         closed = candles[:-1]
         idx = next((i for i in range(len(closed)-1, -1, -1)
@@ -1073,7 +843,6 @@ def relative_performance_4h(alt_candles, btc_candles, confirmation_t):
                for i in range(bars_4h)):
             return None
         return win
-
     alt_window = window_ending_at(alt_candles)
     btc_window = window_ending_at(btc_candles)
     if alt_window is None or btc_window is None:
@@ -1088,15 +857,8 @@ def relative_performance_4h(alt_candles, btc_candles, confirmation_t):
     btc_perf = (b1 / b0 - 1.0) * 100.0
     return {'alt_pct': alt_perf, 'btc_pct': btc_perf,
             'relative_pct': alt_perf - btc_perf}
-
-
 def btc_direction_with_relative_exception(symbol, direction, btc_direction,
                                           alt_candles, btc_candles, confirmation_t):
-    """Deroga BTC15 opposto solo con sovra/sottoperformance relativa >=5 pp.
-
-    BTCUSDT mantiene la propria eccezione neutra, gestita dal chiamante.
-    In assenza di dati affidabili resta attivo il filtro BTC15 originale.
-    """
     if not ((direction == 'LONG' and btc_direction == 'SHORT') or
             (direction == 'SHORT' and btc_direction == 'LONG')):
         return btc_direction, None, False
@@ -1114,14 +876,7 @@ def btc_direction_with_relative_exception(symbol, direction, btc_direction,
             '| filtro BTC impostato NEUTRAL')
         return 'NEUTRAL', perf, True
     return btc_direction, perf, False
-
-
 def confirmation_15m_volume_ratio(candles):
-    """Volume della 15m appena CHIUSA vs MEDIANA delle 20 CHIUSE precedenti.
-
-    candles[-1] e' la 15m LIVE appena iniziata, candles[-2] la conferma chiusa.
-    Nessuna proiezione: si richiede volume reale sulla conferma.
-    """
     if len(candles) < VOLUME_AVG_BARS_15M + 2:
         return 0.0
     confirmation = candles[-2]
@@ -1130,10 +885,7 @@ def confirmation_15m_volume_ratio(candles):
     if avg <= 0:
         return 0.0
     return max(0.0, confirmation['v']) / avg
-
-
 def confirmation_15m_valid(candle, direction, level, atr15, cfg):
-    """Conferma 15m CHIUSA secondo i parametri specifici 1H oppure 4H."""
     if atr15 is None or atr15 <= 0:
         return False
     span = candle['h'] - candle['l']
@@ -1158,10 +910,7 @@ def confirmation_15m_valid(candle, direction, level, atr15, cfg):
     leading = upper_wick if direction == 'LONG' else lower_wick
     trailing = lower_wick if direction == 'LONG' else upper_wick
     return leading <= cfg['wick_directional'] and trailing <= cfg['wick_opposite']
-
-
 def build_confirmed_signal(setup, candles, btc_direction, candle_15m, now_ms):
-    """Entry sul primo tick dopo la chiusura 15m e stop strutturale per gruppo."""
     if btc_direction not in (setup['direction'], 'NEUTRAL'):
         return None
     live = candles[-1]
@@ -1191,14 +940,8 @@ def build_confirmed_signal(setup, candles, btc_direction, candle_15m, now_ms):
         'btc_override': setup.get('btc_override', False),
         'btc_relative_4h': setup.get('btc_relative_4h'),
     }
-
-
 def confirm_after_closed_15m(setup, candles, btc_candles, closed, now_ms,
                              atr15, entry_mode):
-    """Filtri originali identici per entrata DIRETTA o DOPO RETEST.
-
-    Non anticipa la chiusura, richiede la candela intera 15m appena chiusa.
-    """
     sym = setup['symbol']
     d = setup['direction']
     cfg = strategy_for(sym)
@@ -1214,15 +957,10 @@ def confirm_after_closed_15m(setup, candles, btc_candles, closed, now_ms,
         log('CONFERMA SCARTATA', sym, entry_mode, '| volume', f'{ratio15:.2f}x',
             '< soglia', f"{cfg['confirm_volume_min']:.2f}x", '| mediana 20')
         return None
-    # BTC 1H ha raggiunto TP1: blocca SOLO le altcoin della strategia 1H.
-    # Le altcoin 4H ignorano questo blocco e conservano tutti gli altri filtri.
     if cfg['name'] == '1H' and sym != 'BTCUSDT' and btc1h_timing['blocked']:
         log('CONFERMA SCARTATA', sym, entry_mode,
             '| BTC1H ha raggiunto TP1: attendo nuovo breakout 1H + volume')
         return None
-    # NUOVO FILTRO ESCLUSIVO 1H: BTC 4H deve essere concorde o neutro.
-    # BTC 4H opposto blocca SEMPRE il segnale 1H, senza deroghe +/-5pp.
-    # I segnali 4H non passano da questo filtro e restano invariati.
     if cfg['name'] == '1H':
         btc4h_direction = btc4h_closed_direction(btc_candles, closed['t'])
         if btc4h_direction is None:
@@ -1234,7 +972,6 @@ def confirm_after_closed_15m(setup, candles, btc_candles, closed, now_ms,
     btc_direction = ('NEUTRAL' if sym == 'BTCUSDT' and cfg['name'] == '1H'
                      else btc15_closed_direction(btc_candles, closed['t']))
     if sym != 'BTCUSDT' and btc_direction is None:
-        # Mancano i dati allineati BTC15: riprova entro 30s, SENZA consumare la candela.
         return 'BTC_PENDING'
     original_btc_direction = btc_direction
     btc_perf = None
@@ -1250,7 +987,7 @@ def confirm_after_closed_15m(setup, candles, btc_candles, closed, now_ms,
         return None
     setup['btc_override'] = btc_override
     setup['btc_relative_4h'] = btc_perf
-    setup['atr15_retest'] = atr15  # nome storico usato nel calcolo dell'entry
+    setup['atr15_retest'] = atr15
     setup['confirm_volume_ratio'] = ratio15
     setup['entry_mode'] = entry_mode
     signal = build_confirmed_signal(setup, candles, btc_direction, closed, now_ms)
@@ -1269,14 +1006,34 @@ def confirm_after_closed_15m(setup, candles, btc_candles, closed, now_ms,
     log('CONFERMA SCARTATA', sym, entry_mode,
         '| primo prezzo post-chiusura o SL non valido')
     return None
-
-
+def direct_retry_eligible_after_first_rejection(setup, candles, closed, atr15):
+    if atr15 is None or atr15 <= 0:
+        return False
+    cfg = strategy_for(setup['symbol'])
+    direction = setup['direction']
+    level = setup['level']
+    if not (closed['c'] > level if direction == 'LONG' else closed['c'] < level):
+        return False
+    span = closed['h'] - closed['l']
+    if span <= 0:
+        return False
+    opening, closing = closed['o'], closed['c']
+    body = abs(closing - opening)
+    upper = max(0.0, closed['h'] - max(opening, closing)) / span
+    lower = max(0.0, min(opening, closing) - closed['l']) / span
+    leading = upper if direction == 'LONG' else lower
+    trailing = lower if direction == 'LONG' else upper
+    bad_candle = (
+        (direction == 'LONG' and closing <= opening) or
+        (direction == 'SHORT' and closing >= opening) or
+        body / span < cfg['body_fraction'] or
+        body / atr15 < cfg['body_atr_min'] or
+        leading > cfg['wick_directional'] or
+        trailing > cfg['wick_opposite']
+    )
+    bad_volume = confirmation_15m_volume_ratio(candles) < cfg['confirm_volume_min']
+    return bad_candle or bad_volume
 def evaluate_closed_retest_candle(setup, candles, btc_candles, now_ms):
-    """Identica conferma V4: diretta prima 15m o dopo retest.
-
-    La 15m puo' essere valutata piu' volte SOLO se BTC non e' ancora pronto.
-    Nessuna conferma puo' essere inviata oltre 30s dalla sua chiusura.
-    """
     if len(candles) < ATR_PERIOD + 3:
         return 'WAIT', None
     live, closed = candles[-1], candles[-2]
@@ -1284,7 +1041,6 @@ def evaluate_closed_retest_candle(setup, candles, btc_candles, now_ms):
     sym = setup['symbol']
     cfg = strategy_for(sym)
     if live['t'] != closed_end:
-        # In attesa di REST/WS: non eliminare setup sano a causa di un lag.
         return 'WAIT', None
     if closed['t'] < setup['macro_end_t']:
         return 'WAIT', None
@@ -1295,9 +1051,34 @@ def evaluate_closed_retest_candle(setup, candles, btc_candles, now_ms):
         return 'WAIT', None
     if now_ms < closed_end:
         return 'WAIT', None
-
-    # Un retest e' valido per le candele successive anche se il feed arrivo' tardi.
-    # Una CONFERMA di ingresso non puo' invece essere inviata fuori dalla finestra.
+    retry_t = setup.get('direct_retry_15m_t')
+    if retry_t is not None:
+        if closed['t'] < retry_t:
+            return 'WAIT', None
+        if closed['t'] != retry_t:
+            log('DIRECT RETRY SCADUTO', sym, '| seconda 15m non disponibile')
+            return 'EXPIRED', None
+        if now_ms - closed_end > CLOSE_EVENT_MAX_DELAY_SECONDS * 1000:
+            log('DIRECT RETRY SCADUTO', sym, '| seconda 15m arrivata in ritardo')
+            return 'EXPIRED', None
+        level = setup['level']
+        direction = setup['direction']
+        if not (closed['c'] > level if direction == 'LONG' else closed['c'] < level):
+            log('DIRECT RETRY FALLITO', sym, '| chiusura oltre livello non rispettata')
+            return 'EXPIRED', None
+        atr15 = true_range_atr(candles[:-2])
+        if not atr15 or atr15 <= 0:
+            return 'WAIT', None
+        signal = confirm_after_closed_15m(
+            setup, candles, btc_candles, closed, now_ms, atr15, 'DIRECT')
+        if signal == 'BTC_PENDING':
+            return 'WAIT', None
+        if signal:
+            setup['last_checked_15m_t'] = closed['t']
+            log('DIRECT RETRY CONFERMATO', sym, direction, '| seconda 15m')
+            return 'SIGNAL', signal
+        log('DIRECT RETRY FALLITO', sym, direction, '| seconda 15m scartata: setup invalidato')
+        return 'EXPIRED', None
     level, d = setup['level'], setup['direction']
     touched = closed['l'] <= level <= closed['h']
     if touched and not setup['touched']:
@@ -1305,19 +1086,18 @@ def evaluate_closed_retest_candle(setup, candles, btc_candles, now_ms):
         setup['touch_t'] = closed['t']
         setup['touched_price'] = closed['l'] if d == 'LONG' else closed['h']
         log('RETEST 15M', sym, d, '| tocco livello senza limite ATR', price_format(level))
-
     if now_ms - closed_end > CLOSE_EVENT_MAX_DELAY_SECONDS * 1000:
         setup['last_checked_15m_t'] = closed['t']
         log('15M CHIUSA TARDIVA', sym, '| nessun alert vecchio',
             '| ritardo', round((now_ms - closed_end) / 1000), 'sec')
         return 'WAIT', None
-
     atr15 = true_range_atr(candles[:-2])
     if not atr15 or atr15 <= 0:
-        # Se la cache e' in recupero, ritenta finche' siamo nella finestra.
         return 'WAIT', None
-
     if setup.get('allow_direct') and closed['t'] == setup['macro_end_t']:
+        if not (closed['c'] > level if d == 'LONG' else closed['c'] < level):
+            log('DIRECT INVALIDATO', sym, d, '| prima 15m chiusa dentro il livello')
+            return 'EXPIRED', None
         signal = confirm_after_closed_15m(
             setup, candles, btc_candles, closed, now_ms, atr15, 'DIRECT')
         if signal == 'BTC_PENDING':
@@ -1325,19 +1105,22 @@ def evaluate_closed_retest_candle(setup, candles, btc_candles, now_ms):
         if signal:
             setup['last_checked_15m_t'] = closed['t']
             return 'SIGNAL', signal
-
+        if direct_retry_eligible_after_first_rejection(setup, candles, closed, atr15):
+            setup['direct_retry_15m_t'] = closed['t'] + FIFTEEN_MIN_MS
+            setup['last_checked_15m_t'] = closed['t']
+            log('DIRECT RETRY PRENOTATO', sym, d,
+                '| prima 15m scartata per corpo/wick/volume',
+                '| seconda 15m da chiudere', setup['direct_retry_15m_t'])
+            return 'WAIT', None
     if not setup['touched'] or closed['t'] <= setup['touch_t']:
         setup['last_checked_15m_t'] = closed['t']
         return 'WAIT', None
-
     signal = confirm_after_closed_15m(
         setup, candles, btc_candles, closed, now_ms, atr15, 'RETEST')
     if signal == 'BTC_PENDING':
         return 'WAIT', None
     setup['last_checked_15m_t'] = closed['t']
     return ('SIGNAL', signal) if signal else ('WAIT', None)
-
-
 def price_format(price):
     if price >= 1000:
         return f'{price:.2f}'
@@ -1346,10 +1129,7 @@ def price_format(price):
     if price >= 0.01:
         return f'{price:.6f}'
     return f'{price:.9f}'
-
-
 def message_for(s):
-    """Messaggio Telegram compatto: solo direzione, coppia, timeframe e livelli."""
     cfg = strategy_for(s['symbol'])
     direction = s['direction']
     icon = '🟢' if direction == 'LONG' else '🔴'
@@ -1367,10 +1147,7 @@ def message_for(s):
         f"TP2: {price_format(tp2)}\n"
         f"TP3: {price_format(tp3)}"
     )
-
-
 def enqueue_alert(signal):
-    """Accoda e salva l'alert prima dell'invio, non cambia i requisiti strategici."""
     key = (signal['symbol'], signal['macro_t'])
     message = message_for(signal)
     with alert_lock:
@@ -1386,14 +1163,7 @@ def enqueue_alert(signal):
         telegram_queue.put_nowait((key, message, created_at))
     log('TELEGRAM IN CODA', key[0], '| breakout', key[1])
     return True
-
-
 def telegram_worker():
-    """Tenta la consegna, riprende dopo 8 tentativi e conserva dead-letter.
-
-    Non invia dopo 5 minuti: un ENTRY ormai vecchio sarebbe potenzialmente
-    pericoloso. Il job fallito resta visibile nel file outbox.
-    """
     while True:
         key, message, created_at = telegram_queue.get()
         delivered = False
@@ -1422,7 +1192,6 @@ def telegram_worker():
                     last_error = 'Telegram ha rifiutato definitivamente la richiesta (HTTP 4xx)'
                     break
                 if attempt >= TELEGRAM_MAX_ATTEMPTS:
-                    # Un nuovo ciclo (non perdita definitiva dopo 8 tentativi).
                     delay = TELEGRAM_RETRY_ROUND_SECONDS
                     attempt = 0
                 else:
@@ -1450,13 +1219,7 @@ def telegram_worker():
                     key[0], key[1], '|', last_error)
         finally:
             telegram_queue.task_done()
-
-
 def snapshot_with_sources():
-    """Ammette solo serie corrente e WS/REST effettivamente recente.
-
-    Obsoleti = simboli non idonei alla scansione, mai conteggiati fra attivi.
-    """
     now = time.monotonic()
     expected_t = (int(time.time() * 1000) // FIFTEEN_MIN_MS) * FIFTEEN_MIN_MS
     fresh_ws, fresh_rest, obsolete = 0, 0, 0
@@ -1480,15 +1243,9 @@ def snapshot_with_sources():
                 continue
             snapshot[symbol] = list(candles)
     return snapshot, fresh_ws, fresh_rest, obsolete
-
-
 def current_snapshot():
-    """Compatibilita' con la strategia di scansione preesistente."""
     return snapshot_with_sources()[0]
-
-
 def scan_market():
-    """18 simboli 1H e 22 simboli 4H. Nessun filtro di trading modificato."""
     snapshot, _, _, _ = snapshot_with_sources()
     if 'BTCUSDT' not in snapshot:
         return 0
@@ -1496,7 +1253,6 @@ def scan_market():
     now_ms = int(time.time() * 1000)
     if not (btc_candles[-1]['t'] <= now_ms < btc_candles[-1]['t'] + FIFTEEN_MIN_MS):
         return 0
-    # Prima di processare qualsiasi ALT, aggiorna TP1 BTC e l'eventuale sblocco.
     update_btc1h_timing(btc_candles, now_ms)
     queued = 0
     for symbol, candles in snapshot.items():
@@ -1515,7 +1271,6 @@ def scan_market():
         if seen_macro_bars.get(symbol) != macro_t:
             required = max(ATR_PERIOD + 2, cfg['lookback'] + 1)
             if macro_tail_complete_and_consecutive(bars, required, cfg['macro_ms']):
-                # Segna il breakout gia' analizzato soltanto quando i dati sono pronti.
                 if not setup:
                     candidate = macro_breakout(symbol, candles, now_ms, cfg, btc_candles)
                     if candidate:
@@ -1525,7 +1280,6 @@ def scan_market():
                             '| volume macro NON richiesto',
                             '| diretto', candidate['allow_direct'])
                 seen_macro_bars[symbol] = macro_t
-            # Il vecchio setup resta attivo; NON usare 'continue' qui.
         setup = active_setups.get(symbol)
         if not setup:
             continue
@@ -1551,10 +1305,8 @@ def scan_market():
             sent_alerts.intersection_update(recent)
             _outbox_save_locked()
     return queued
-
-
 def main():
-    log('MOMENTUM ONE V5 SENZA VOLUME BREAKOUT | 40 crypto | 18x1H + 22x4H | scan ~1s')
+    log('MOMENTUM ONE V5 SENZA VOLUME BREAKOUT | 50 crypto | 28x1H + 22x4H | scan ~1s')
     log('1H: lookback 15, volume breakout NON richiesto, conferma 15m 0.60x, setup 6h')
     log('4H: lookback 6, volume breakout NON richiesto, conferma 15m 0.60x, setup 12h')
     log('INGRESSO DIRETTO >=80% e prima 15m chiusa, oppure RETEST senza ATR')
@@ -1574,7 +1326,7 @@ def main():
     threading.Thread(target=history_worker, daemon=True).start()
     threading.Thread(target=websocket_worker, daemon=True).start()
     if send_telegram('MOMENTUM ONE V5 SENZA VOLUME BREAKOUT AVVIATO [SIMULAZIONE] - '
-                     '40 crypto (18x1H / 22x4H), lookback 15/6, nessun volume 1H/4H, '
+                     '50 crypto (28x1H / 22x4H), lookback 15/6, nessun volume 1H/4H, '
                      'conferma 15m 0.60x, direct/retest, nessun ordine automatico'):
         log('TELEGRAM AVVIO OK')
     else:
@@ -1596,7 +1348,7 @@ def main():
                 failures = len(dead_letters)
             s1 = sum(1 for s in active_setups if s in ONE_HOUR_SYMBOLS)
             s4 = sum(1 for s in active_setups if s in FOUR_HOUR_SYMBOLS)
-            log('Scansione ~1s | feed attivi:', len(snap), '/40',
+            log('Scansione ~1s | feed attivi:', len(snap), '/50',
                 f'| WS: {ws_count} | REST: {rest_count} | obsoleti: {obsolete}',
                 '| BTC15:', b, '| setup 1H:', s1, '| setup 4H:', s4,
                 '| Telegram in coda:', in_delivery, '| Telegram falliti:', failures)
@@ -1604,7 +1356,5 @@ def main():
         time.sleep(max(0.0, next_scan - time.monotonic()))
         if next_scan < time.monotonic() - SCAN_SECONDS:
             next_scan = time.monotonic()
-
-
 if __name__ == '__main__':
     main()
