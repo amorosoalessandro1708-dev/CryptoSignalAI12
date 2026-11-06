@@ -58,7 +58,7 @@ STRATEGIES = {
         'name': '1H', 'macro_ms': ONE_HOUR_MS,
         'lookback': 15, 'breakout_buffer_atr': 0.04,
         'macro_close_position_min': 0.65,
-        'confirm_volume_min': 0.60, 'body_fraction': 0.70,
+        'confirm_volume_min': 0.60, 'body_fraction': 0.60,
         'body_atr_min': 0.60, 'wick_directional': 0.12,
         'wick_opposite': 0.12, 'sl_lookback': 5,
         'sl_buffer_atr': 0.25, 'lifetime_seconds': 6 * 60 * 60,
@@ -67,7 +67,7 @@ STRATEGIES = {
         'name': '4H', 'macro_ms': FOUR_HOURS_MS,
         'lookback': 6, 'breakout_buffer_atr': 0.03,
         'macro_close_position_min': 0.70,
-        'confirm_volume_min': 0.60, 'body_fraction': 0.70,
+        'confirm_volume_min': 0.60, 'body_fraction': 0.60,
         'body_atr_min': 0.50, 'wick_directional': 0.15,
         'wick_opposite': 0.15, 'sl_lookback': 3,
         'sl_buffer_atr': 0.25, 'lifetime_seconds': 12 * 60 * 60,
@@ -1306,7 +1306,7 @@ def scan_market():
             _outbox_save_locked()
     return queued
 def main():
-    log('MOMENTUM ONE V5 SENZA VOLUME BREAKOUT | 50 crypto | 28x1H + 22x4H | scan ~1s')
+    log('MOMENTUM ONE V6 SENZA VOLUME BREAKOUT | 50 crypto | 28x1H + 22x4H | scan ~1s')
     log('1H: lookback 15, volume breakout NON richiesto, conferma 15m 0.60x, setup 6h')
     log('4H: lookback 6, volume breakout NON richiesto, conferma 15m 0.60x, setup 12h')
     log('INGRESSO DIRETTO >=80% e prima 15m chiusa, oppure RETEST senza ATR')
@@ -1325,7 +1325,7 @@ def main():
     threading.Thread(target=telegram_worker, daemon=True).start()
     threading.Thread(target=history_worker, daemon=True).start()
     threading.Thread(target=websocket_worker, daemon=True).start()
-    if send_telegram('MOMENTUM ONE V5 SENZA VOLUME BREAKOUT AVVIATO [SIMULAZIONE] - '
+    if send_telegram('MOMENTUM ONE V6 SENZA VOLUME BREAKOUT AVVIATO [SIMULAZIONE] - '
                      '50 crypto (28x1H / 22x4H), lookback 15/6, nessun volume 1H/4H, '
                      'conferma 15m 0.60x, direct/retest, nessun ordine automatico'):
         log('TELEGRAM AVVIO OK')
