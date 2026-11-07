@@ -913,9 +913,8 @@ def trend_1h_direction(candles):
 
 
 def continuation_wicks_ok(candle, direction):
-    """Ogni wick non supera il 15% del CORPO, non del range complessivo.
-    Sulla candela LIVE la condizione e' provvisoria e verificata al momento
-    dell'invio: la sua forma puo' ancora cambiare fino alla chiusura.
+    """SOLO prima 15m CHIUSA del micro-breakout: ogni wick <= 15% del CORPO.
+    Il filtro NON si applica alle candele 15m successive o alla live d'ingresso.
     """
     if direction not in ('LONG', 'SHORT'):
         return False
@@ -1118,8 +1117,6 @@ def evaluate_continuation(symbol, candles, btc_candles, now_ms):
     # Quando la precedente ha interrotto la progressione, il confronto
     # rimane con la candela PRIMA dell'interruzione.
     if not continuation_progresses(live, direction, setup['last_good']):
-        return None
-    if not continuation_wicks_ok(live, direction):
         return None
     vol_info = live_volume_progress(candles, now_ms, CONT_VOLUME_RATIO_MIN)
     if not vol_info or vol_info['actual_ratio'] < CONT_VOLUME_RATIO_MIN:
@@ -1350,10 +1347,10 @@ def scan_market():
     return queued
 
 def main():
-    log('MOMENTUM ONE V7.1 | 50 crypto tutte 1H | RETEST 1.50x | CONTINUAZIONE live 1.80x')
+    log('MOMENTUM ONE V7.2 | 50 crypto tutte 1H | RETEST 1.50x | CONTINUAZIONE live 1.80x')
     log('1H RETEST: breakout 15 candele 1H + rimbalzo 15m chiuso, mediana volume 20')
     log('CONTINUAZIONE: direzione 1H, micro-breakout 6x15m chiuso, volume progressivo 1.80x, qualsiasi 15m successiva')
-    log('STRUTTURA CONTINUAZIONE: HH+HL o LH+LL; una pausa con recupero immediato; ogni wick <=15% corpo')
+    log('STRUTTURA CONTINUAZIONE: HH+HL o LH+LL; una pausa con recupero immediato; wick <=15% corpo SOLO prima 15m chiusa del breakout')
     log('SL CONTINUAZIONE: 3x15m precedenti + buffer 0.15 ATR15 | TP 0.30R/0.80R/1.50R')
     log('BTC: solo neutro/concorde su ultima 15m chiusa; gate TP1 BTC1H mantenuto')
     if not BOT_TOKEN or not CHAT_ID:
@@ -1369,7 +1366,7 @@ def main():
     threading.Thread(target=telegram_worker, daemon=True).start()
     threading.Thread(target=history_worker, daemon=True).start()
     threading.Thread(target=websocket_worker, daemon=True).start()
-    if send_telegram('MOMENTUM ONE V7.1 AVVIATO [SIMULAZIONE] - '
+    if send_telegram('MOMENTUM ONE V7.2 AVVIATO [SIMULAZIONE] - '
                      '50 crypto tutte 1H | RETEST 15m chiuso volume 1.50x | '
                      'CONTINUAZIONE micro 15m + live volume 1.80x | '
                      'BTC neutro/concorde | TP invariati | nessun ordine automatico'):
