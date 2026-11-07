@@ -36,9 +36,8 @@ ENTRY_MAX_DISTANCE_ATR1H = 0.50
 VOLUME_AVG_BARS_15M = 20
 RETEST_VOLUME_RATIO_MIN = 1.50
 CONT_VOLUME_RATIO_MIN = 1.80
-CONT_MICRO_LOOKBACK_15M = 6
-CONT_SL_LOOKBACK_15M = 3
-CONT_SL_BUFFER_ATR15 = 0.15
+CONT_BREAKOUT_LOOKBACK_1H = 4  # Resistenza/supporto delle 4 candele 1H precedenti
+CONT_SL_BUFFER_ATR1H = 0.15     # Buffer del livello 1H rotto, non delle 15m
 CONT_WICK_MAX_BODY = 0.15  # Ciascuna wick <= 15% del corpo: solo CONTINUAZIONE
 LIVE_VOLUME_PACE_MIN_SECONDS = 60
 LIVE_VOLUME_PROGRESS_LOG_SECONDS = 180
@@ -105,7 +104,7 @@ btc1h_timing = {'active_signal': None, 'blocked': False, 'blocked_at_ms': None,
                 'last_unblock_macro_t': None,
                 'tp1_wait_hour_t': None, 'tp1_last_checked_hour_t': None}
 active_setups = {}
-continuation_setups = {}  # Setup micro-breakout indipendente da RETEST
+continuation_setups = {}  # Breakout 1H a 4 candele, indipendente dal RETEST
 continuation_initialized = set()  # Ricostruzione dello storico una volta per simbolo
 continuation_consumed = {}  # Ultimo breakout CONTINUAZIONE gia' utilizzato, per deduplica riavvii
 seen_macro_bars = {}
@@ -913,7 +912,7 @@ def trend_1h_direction(candles):
 
 
 def continuation_wicks_ok(candle, direction):
-    """SOLO prima 15m CHIUSA del micro-breakout: ogni wick <= 15% del CORPO.
+    """SOLO prima 15m CHIUSA dopo breakout 1H: ogni wick <= 15% del CORPO.
     Il filtro NON si applica alle candele 15m successive o alla live d'ingresso.
     """
     if direction not in ('LONG', 'SHORT'):
@@ -940,67 +939,95 @@ def continuation_progresses(candle, direction, reference):
     return candle['h'] < reference['h'] and candle['l'] < reference['l']
 
 
-def micro_breakout_closed(candles, direction, now_ms):
-    """Prima 15m chiusa oltre il micro-livello delle 6 precedenti.
-    Il volume 1.80x e' richiesto sulle candele LIVE successive, non qui.
+def continuation_hour_breakout(candles):
+    """Breakout CONTINUAZIONE della 1H chiusa sulle 4 precedenti.
+
+    La rottura e' valida solo dopo la CHIUSURA della candela 1H:
+    LONG sopra il massimo delle ultime quattro 1H precedenti;
+    SHORT sotto il minimo delle ultime quattro 1H precedenti.
+    Si conservano buffer breakout 0.04 ATR1H e close position 65% della V7.2.
+    ATR1H(14) e' calcolato su candele 1H chiuse precedenti alla rottura.
     """
-    n = CONT_MICRO_LOOKBACK_15M
-    if len(candles) < max(n + 2, ATR_PERIOD + 3):
+    bars = macro_closed_candles(candles, ONE_HOUR_MS)
+    cfg = STRATEGIES['1H']
+    required = max(ATR_PERIOD + 2, CONT_BREAKOUT_LOOKBACK_1H + 1)
+    if not macro_tail_complete_and_consecutive(bars, required, ONE_HOUR_MS):
+        return None
+    bar = bars[-1]
+    previous = bars[:-1]
+    direction = ('LONG' if bar['c'] > bar['o'] else
+                 'SHORT' if bar['c'] < bar['o'] else None)
+    if direction is None:
+        return None
+    atr1h = true_range_atr(previous)
+    if atr1h is None or atr1h <= 0:
+        return None
+    previous_four = previous[-CONT_BREAKOUT_LOOKBACK_1H:]
+    level = (max(x['h'] for x in previous_four) if direction == 'LONG'
+             else min(x['l'] for x in previous_four))
+    if not beyond_breakout(bar['c'], direction, level,
+                           cfg['breakout_buffer_atr'] * atr1h):
+        return None
+    span = bar['h'] - bar['l']
+    if span <= 0:
+        return None
+    close_position = ((bar['c'] - bar['l']) / span if direction == 'LONG'
+                      else (bar['h'] - bar['c']) / span)
+    if close_position < cfg['macro_close_position_min']:
+        return None
+    # SL LONG sotto la resistenza rotta; SL SHORT sopra il supporto rotto.
+    stop = (level - CONT_SL_BUFFER_ATR1H * atr1h if direction == 'LONG'
+            else level + CONT_SL_BUFFER_ATR1H * atr1h)
+    return {
+        'direction': direction,
+        'macro_t': bar['t'], 'macro_end_t': bar['t'] + ONE_HOUR_MS,
+        'level': level, 'sl': stop, 'atr1h': atr1h,
+    }
+
+
+def continuation_first_15m_closed(candles, direction):
+    """Solo la prima 15m CHIUSA dopo il breakout 1H puo' confermarlo.
+
+    La sua chiusura resta oltre il livello 1H rotto e le sue due wick
+    rispettano 15% del CORPO. La candela che invia il segnale piu' tardi
+    NON ha un nuovo filtro wick.
+    """
+    if len(candles) < ATR_PERIOD + 3:
         return None
     live, closed = candles[-1], candles[-2]
     if live['t'] != closed['t'] + FIFTEEN_MIN_MS:
         return None
-    previous = candles[-(n + 2):-2]
-    if any(previous[i + 1]['t'] - previous[i]['t'] != FIFTEEN_MIN_MS
-           for i in range(len(previous) - 1)):
+    breakout = continuation_hour_breakout(candles)
+    if breakout is None or breakout['direction'] != direction:
         return None
-    if previous[-1]['t'] + FIFTEEN_MIN_MS != closed['t']:
+    # La prima 15m successiva inizia esattamente alla chiusura breakout 1H.
+    if closed['t'] != breakout['macro_end_t']:
         return None
-    level = (max(x['h'] for x in previous) if direction == 'LONG'
-             else min(x['l'] for x in previous))
     atr15 = true_range_atr(candles[:-2])
     if atr15 is None or atr15 <= 0:
         return None
-    if not confirmation_15m_valid(closed, direction, level, atr15, STRATEGIES['1H']):
+    if not confirmation_15m_valid(closed, direction, breakout['level'],
+                                   atr15, STRATEGIES['1H']):
         return None
     if not continuation_wicks_ok(closed, direction):
         return None
-    return {'direction': direction, 'level': level, 'closed_t': closed['t'],
-            'atr15': atr15}
-
-
-def continuation_stop(candles, direction, micro_break_t):
-    """Tre 15m CHIUSE immediatamente PRIMA della rottura + 0.15 ATR15."""
-    closed = candles[:-1]
-    pos = next((i for i in range(len(closed) - 1, -1, -1)
-                if closed[i]['t'] == micro_break_t), None)
-    if pos is None or pos < CONT_SL_LOOKBACK_15M:
-        return None
-    prev = closed[pos - CONT_SL_LOOKBACK_15M:pos]
-    if any(prev[i + 1]['t'] - prev[i]['t'] != FIFTEEN_MIN_MS
-           for i in range(len(prev) - 1)) or prev[-1]['t'] + FIFTEEN_MIN_MS != micro_break_t:
-        return None
-    atr = true_range_atr(closed[:pos])
-    if atr is None or atr <= 0:
-        return None
-    if direction == 'LONG':
-        return min(x['l'] for x in prev) - CONT_SL_BUFFER_ATR15 * atr
-    return max(x['h'] for x in prev) + CONT_SL_BUFFER_ATR15 * atr
+    breakout['breakout_t'] = closed['t']
+    breakout['atr15'] = atr15
+    return breakout
 
 
 def create_continuation_setup(candles, direction, now_ms):
-    """Ancora la struttura al breakout iniziale: livello, SL e ultima 15m valida."""
-    micro = micro_breakout_closed(candles, direction, now_ms)
-    if micro is None:
-        return None
-    sl = continuation_stop(candles, direction, micro['closed_t'])
-    if sl is None:
+    """Ancora la continuazione al livello 1H rotto e alla prima 15m valida."""
+    confirmation = continuation_first_15m_closed(candles, direction)
+    if confirmation is None:
         return None
     initial = candles[-2]
     return {
-        'direction': direction, 'level': micro['level'],
-        'breakout_t': micro['closed_t'], 'atr15': micro['atr15'],
-        'sl': sl, 'last_processed_t': micro['closed_t'],
+        'direction': direction, 'level': confirmation['level'],
+        'macro_breakout_t': confirmation['macro_t'],
+        'breakout_t': confirmation['breakout_t'],
+        'atr15': confirmation['atr15'], 'sl': confirmation['sl'],
+        'last_processed_t': confirmation['breakout_t'],
         'last_good': {'t': initial['t'], 'h': initial['h'], 'l': initial['l']},
         'pending_recovery': False, 'sent': False,
     }
@@ -1032,9 +1059,8 @@ def advance_continuation_setup(setup, closed):
 
 
 def rebuild_continuation_setup(symbol, candles, direction, now_ms):
-    """Ricostruisce un setup eventualmente iniziato prima di un riavvio.
-    Considera solo candele consecutive e un breakout dalla storia disponibile;
-    non invia alert retroattivi, ma puo' valutare la candela live corrente.
+    """Ricostruisce una continuazione nata da breakout 1H + prima 15m valida.
+    Non invia alert retroattivi: controlla solo la candela live corrente.
     """
     setup = None
     if len(candles) < max(VOLUME_AVG_BARS_15M + 3, ATR_PERIOD + 3):
@@ -1046,7 +1072,7 @@ def rebuild_continuation_setup(symbol, candles, direction, now_ms):
             if not advance_continuation_setup(setup, closed):
                 setup = None
         if setup is None:
-            # Possibile nuovo breakout con la 15m 'pos' e una candela dopo.
+            # Possibile 1H chiusa in breakout + prima 15m successiva valida.
             prefix = candles[:pos+2]
             candidate = create_continuation_setup(prefix, direction, now_ms)
             if candidate:
@@ -1089,13 +1115,14 @@ def update_continuation_setup(symbol, candles, direction, now_ms):
         if setup:
             setup['sent'] = (continuation_consumed.get(symbol) == setup['breakout_t'])
             continuation_setups[symbol] = setup
-            log('MICRO-BREAKOUT CONTINUAZIONE', symbol, direction,
-                '| 15m', setup['breakout_t'], '| livello', price_format(setup['level']))
+            log('BREAKOUT 1H CONTINUAZIONE', symbol, direction,
+                '| 1H', setup['macro_breakout_t'], '| prima 15m', setup['breakout_t'],
+                '| livello', price_format(setup['level']), '| stop', price_format(setup['sl']))
     return setup
 
 
 def evaluate_continuation(symbol, candles, btc_candles, now_ms):
-    """Qualunque 15m LIVE dopo breakout; conferma progressione anche dopo 1 pausa."""
+    """Qualunque 15m LIVE dopo breakout 1H e prima 15m confermata; 1 pausa."""
     if len(candles) < VOLUME_AVG_BARS_15M + 3:
         return None
     trend, hour_t = trend_1h_direction(candles)
@@ -1139,7 +1166,8 @@ def evaluate_continuation(symbol, candles, btc_candles, now_ms):
         'entry_mode': 'CONTINUAZIONE', 'entry': price, 'sl': sl,
         'breakout_level': setup['level'], 'macro_t': hour_t,
         'confirm_15m_t': live['t'], 'confirm_volume_ratio': vol_info['actual_ratio'],
-        'micro_break_t': setup['breakout_t'],
+        'micro_break_t': setup['breakout_t'],  # Identificatore 15m, deduplica conservata
+        'macro_breakout_1h_t': setup['macro_breakout_t'],
     }
     distance = entry_extension_1h(signal, candles)
     if not distance or not distance['allowed']:
@@ -1319,9 +1347,10 @@ def scan_market():
                     log('SEGNALE RETEST IN CODA', symbol, retest_signal['direction'])
                 else:
                     log('RETEST NON ACCODATO', symbol)
-        # CONTINUAZIONE: micro-breakout 15m chiuso, ogni successiva 15m live
-        # con HH+HL / LH+LL; una interruzione consentita con recupero
-        # immediato rispetto all'ultima candela valida.
+        # CONTINUAZIONE: breakout della 1H chiusa sulle 4 precedenti,
+        # prima 15m successiva chiusa oltre il livello con wick <=15% corpo;
+        # ogni 15m live successiva puo' entrare a volume reale >=1.80x,
+        # HH+HL / LH+LL e una interruzione con recupero immediato.
         cont_signal = evaluate_continuation(symbol, candles, btc_candles, now_ms)
         if cont_signal:
             accepted = enqueue_alert(cont_signal)
@@ -1347,11 +1376,11 @@ def scan_market():
     return queued
 
 def main():
-    log('MOMENTUM ONE V7.2 | 50 crypto tutte 1H | RETEST 1.50x | CONTINUAZIONE live 1.80x')
+    log('MOMENTUM ONE V7.3 | 50 crypto tutte 1H | RETEST 1.50x | CONTINUAZIONE live 1.80x')
     log('1H RETEST: breakout 15 candele 1H + rimbalzo 15m chiuso, mediana volume 20')
-    log('CONTINUAZIONE: direzione 1H, micro-breakout 6x15m chiuso, volume progressivo 1.80x, qualsiasi 15m successiva')
+    log('CONTINUAZIONE: breakout 1H sulle 4 precedenti + prima 15m chiusa oltre livello; volume live 1.80x su qualunque successiva')
     log('STRUTTURA CONTINUAZIONE: HH+HL o LH+LL; una pausa con recupero immediato; wick <=15% corpo SOLO prima 15m chiusa del breakout')
-    log('SL CONTINUAZIONE: 3x15m precedenti + buffer 0.15 ATR15 | TP 0.30R/0.80R/1.50R')
+    log('SL CONTINUAZIONE: livello di resistenza/supporto 1H rotto +/- 0.15 ATR1H | TP 0.30R/0.80R/1.50R')
     log('BTC: solo neutro/concorde su ultima 15m chiusa; gate TP1 BTC1H mantenuto')
     if not BOT_TOKEN or not CHAT_ID:
         log('ATTENZIONE: mancano variabili Telegram')
@@ -1366,9 +1395,9 @@ def main():
     threading.Thread(target=telegram_worker, daemon=True).start()
     threading.Thread(target=history_worker, daemon=True).start()
     threading.Thread(target=websocket_worker, daemon=True).start()
-    if send_telegram('MOMENTUM ONE V7.2 AVVIATO [SIMULAZIONE] - '
+    if send_telegram('MOMENTUM ONE V7.3 AVVIATO [SIMULAZIONE] - '
                      '50 crypto tutte 1H | RETEST 15m chiuso volume 1.50x | '
-                     'CONTINUAZIONE micro 15m + live volume 1.80x | '
+                     'CONTINUAZIONE breakout 4x1H + 15m e volume live 1.80x | '
                      'BTC neutro/concorde | TP invariati | nessun ordine automatico'):
         log('TELEGRAM AVVIO OK')
     else:
