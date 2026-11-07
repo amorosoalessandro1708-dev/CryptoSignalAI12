@@ -38,6 +38,7 @@ RETEST_VOLUME_RATIO_MIN = 1.50
 CONT_VOLUME_RATIO_MIN = 1.80
 CONT_BREAKOUT_LOOKBACK_1H = 4  # Resistenza/supporto delle 4 candele 1H precedenti
 CONT_SL_BUFFER_ATR1H = 0.15     # Buffer del livello 1H rotto, non delle 15m
+RETEST_SL_BUFFER_ATR1H = CONT_SL_BUFFER_ATR1H  # RETEST: stesso SL su livello 1H
 CONT_WICK_MAX_BODY = 0.15  # Ciascuna wick <= 15% del corpo: solo CONTINUAZIONE
 LIVE_VOLUME_PACE_MIN_SECONDS = 60
 LIVE_VOLUME_PROGRESS_LOG_SECONDS = 180
@@ -50,12 +51,12 @@ ONE_HOUR_MS = 60 * 60 * 1000
 STRATEGIES = {
     '1H': {
         'name': '1H', 'macro_ms': ONE_HOUR_MS,
-        'lookback': 15, 'breakout_buffer_atr': 0.04,
+        'lookback': 4, 'breakout_buffer_atr': 0.04,
         'macro_close_position_min': 0.65,
         'confirm_volume_min': 0.60, 'body_fraction': 0.60,
         'body_atr_min': 0.60, 'wick_directional': 0.12,
-        'wick_opposite': 0.25, 'sl_lookback': 5,
-        'sl_buffer_atr': 0.25, 'lifetime_seconds': 6 * 60 * 60,
+        'wick_opposite': 0.25,
+        'lifetime_seconds': 6 * 60 * 60,
     },
 
 }
@@ -686,24 +687,6 @@ def update_btc1h_timing(btc_candles, now_ms):
                     _outbox_save_locked()
                     log('BTC1H NUOVO BREAKOUT + VOLUME | ALT SBLOCCATE', direction,
                         '| candela 1H', macro_t)
-def macro_structural_stop(candles_15m, direction, cfg):
-    bars = macro_closed_candles(candles_15m, cfg['macro_ms'])
-    if len(bars) < max(cfg['sl_lookback'], ATR_PERIOD + 1):
-        return None
-    if not macro_tail_complete_and_consecutive(bars, ATR_PERIOD + 1, cfg['macro_ms']):
-        return None
-    atr = true_range_atr(bars)
-    if atr is None or atr <= 0:
-        return None
-    structural = bars[-cfg['sl_lookback']:]
-    live = candles_15m[-1]
-    if direction == 'LONG':
-        extreme = min(min(c['l'] for c in structural), live['l'])
-        sl = extreme - cfg['sl_buffer_atr'] * atr
-    else:
-        extreme = max(max(c['h'] for c in structural), live['h'])
-        sl = extreme + cfg['sl_buffer_atr'] * atr
-    return {'sl': sl, 'atr_macro': atr, 'structure_extreme': extreme}
 def btc15_direction(btc_candles):
     if len(btc_candles) < ATR_PERIOD + 2:
         return None
@@ -748,13 +731,15 @@ def macro_breakout(symbol, candles, now_ms, cfg, btc_candles=None):
                  else (macro['h']-macro['c']) / span)
     if close_pos < cfg['macro_close_position_min']:
         return None
-    if not macro_structural_stop(candles, direction, cfg):
-        return None
+    # RETEST: stesso SL della CONTINUAZIONE, ancorato al livello 1H rotto.
+    # Il buffer ATR1H(14) viene fissato alla chiusura della candela breakout 1H.
+    stop = (level - RETEST_SL_BUFFER_ATR1H * atr_macro if direction == 'LONG'
+            else level + RETEST_SL_BUFFER_ATR1H * atr_macro)
     return {
         'symbol': symbol, 'direction': direction,
         'strategy': cfg['name'], 'macro_t': macro['t'],
         'macro_end_t': close_ms, 'level': level, 'macro_buffer': buffer,
-        'atr_macro_at_breakout': atr_macro, 'macro_close_pos': close_pos,
+        'atr_macro_at_breakout': atr_macro, 'macro_close_pos': close_pos, 'sl': stop,
         'last_checked_15m_t': None,
         'touched': False, 'touch_t': None, 'touched_price': None,
     }
@@ -778,7 +763,7 @@ def confirmation_15m_volume_ratio(candles):
     if avg <= 0:
         return 0.0
     return max(0.0, confirmation['v']) / avg
-def confirmation_15m_valid(candle, direction, level, atr15, cfg):
+def confirmation_15m_valid(candle, direction, level, atr15, cfg, check_wicks=True):
     if atr15 is None or atr15 <= 0:
         return False
     span = candle['h'] - candle['l']
@@ -798,6 +783,10 @@ def confirmation_15m_valid(candle, direction, level, atr15, cfg):
         return False
     if body / atr15 < cfg['body_atr_min']:
         return False
+    if not check_wicks:
+        # Solo CONTINUAZIONE: non applicare il vecchio filtro wick 12%/25%.
+        # Il limite autonomo 15% di ciascuna wick rispetto al CORPO resta obbligatorio.
+        return True
     upper_wick = max(0.0, candle['h'] - max(opening, closing)) / span
     lower_wick = max(0.0, min(opening, closing) - candle['l']) / span
     leading = upper_wick if direction == 'LONG' else lower_wick
@@ -842,16 +831,14 @@ def retest_confirmation(setup, candles, btc_candles, closed, now_ms, atr15):
     # Nessun ingresso se il prezzo e gia tornato nel range dopo la chiusura 15m.
     if not beyond_breakout(live['c'], direction, level, MICRO_CLOSE_BUFFER_ATR15 * atr15):
         return None
-    info = macro_structural_stop(candles, direction, cfg)
-    if not info:
-        return None
+    sl = setup['sl']  # Livello 1H rotto +/- 0.15 ATR1H, fissato al breakout.
     price = live['c']
-    risk = price - info['sl'] if direction == 'LONG' else info['sl'] - price
+    risk = price - sl if direction == 'LONG' else sl - price
     if risk <= 0:
         return None
     signal = {
         'symbol': symbol, 'direction': direction, 'strategy': '1H',
-        'entry_mode': 'RETEST', 'entry': price, 'sl': info['sl'],
+        'entry_mode': 'RETEST', 'entry': price, 'sl': sl,
         'breakout_level': level, 'macro_t': setup['macro_t'],
         'confirm_15m_t': closed['t'], 'confirm_volume_ratio': ratio,
     }
@@ -1007,7 +994,7 @@ def continuation_first_15m_closed(candles, direction):
     if atr15 is None or atr15 <= 0:
         return None
     if not confirmation_15m_valid(closed, direction, breakout['level'],
-                                   atr15, STRATEGIES['1H']):
+                                   atr15, STRATEGIES['1H'], check_wicks=False):
         return None
     if not continuation_wicks_ok(closed, direction):
         return None
@@ -1376,10 +1363,10 @@ def scan_market():
     return queued
 
 def main():
-    log('MOMENTUM ONE V7.3 | 50 crypto tutte 1H | RETEST 1.50x | CONTINUAZIONE live 1.80x')
-    log('1H RETEST: breakout 15 candele 1H + rimbalzo 15m chiuso, mediana volume 20')
+    log('MOMENTUM ONE V7.4 | 50 crypto tutte 1H | RETEST 1.50x | CONTINUAZIONE live 1.80x')
+    log('1H RETEST: breakout 4 candele 1H + rimbalzo 15m chiuso a volume 1.50x; SL livello 1H +/-0.15 ATR1H')
     log('CONTINUAZIONE: breakout 1H sulle 4 precedenti + prima 15m chiusa oltre livello; volume live 1.80x su qualunque successiva')
-    log('STRUTTURA CONTINUAZIONE: HH+HL o LH+LL; una pausa con recupero immediato; wick <=15% corpo SOLO prima 15m chiusa del breakout')
+    log('STRUTTURA CONTINUAZIONE: HH+HL o LH+LL; una pausa con recupero immediato; wick <=15% corpo SOLO prima 15m chiusa, senza vecchio filtro 12%/25%')
     log('SL CONTINUAZIONE: livello di resistenza/supporto 1H rotto +/- 0.15 ATR1H | TP 0.30R/0.80R/1.50R')
     log('BTC: solo neutro/concorde su ultima 15m chiusa; gate TP1 BTC1H mantenuto')
     if not BOT_TOKEN or not CHAT_ID:
@@ -1395,8 +1382,8 @@ def main():
     threading.Thread(target=telegram_worker, daemon=True).start()
     threading.Thread(target=history_worker, daemon=True).start()
     threading.Thread(target=websocket_worker, daemon=True).start()
-    if send_telegram('MOMENTUM ONE V7.3 AVVIATO [SIMULAZIONE] - '
-                     '50 crypto tutte 1H | RETEST 15m chiuso volume 1.50x | '
+    if send_telegram('MOMENTUM ONE V7.4 AVVIATO [SIMULAZIONE] - '
+                     '50 crypto tutte 1H | RETEST breakout 4x1H + 15m volume 1.50x | '
                      'CONTINUAZIONE breakout 4x1H + 15m e volume live 1.80x | '
                      'BTC neutro/concorde | TP invariati | nessun ordine automatico'):
         log('TELEGRAM AVVIO OK')
