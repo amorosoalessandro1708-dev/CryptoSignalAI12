@@ -38,7 +38,7 @@ RETEST_VOLUME_RATIO_MIN = 1.50
 RETEST_COUNTER_BTC1H_VOLUME_RATIO_MIN = 1.80  # Solo RETEST contro direzione BTC 1H chiusa
 CONT_VOLUME_RATIO_MIN = 1.80
 CONT_BREAKOUT_LOOKBACK_1H = 4  # Resistenza/supporto delle 4 candele 1H precedenti
-CONT_SL_BUFFER_ATR1H = 0.15     # Buffer del livello 1H rotto, non delle 15m
+CONT_SL_BUFFER_ATR1H = 0.35     # Buffer del livello 1H rotto, non delle 15m
 RETEST_SL_BUFFER_ATR1H = CONT_SL_BUFFER_ATR1H  # RETEST: stesso SL su livello 1H
 CONT_WICK_MAX_BODY = 0.15  # Ciascuna wick <= 15% del corpo: solo CONTINUAZIONE
 LIVE_VOLUME_PACE_MIN_SECONDS = 60
@@ -874,7 +874,7 @@ def retest_confirmation(setup, candles, btc_candles, closed, now_ms, atr15):
     # Nessun ingresso se il prezzo e gia tornato nel range dopo la chiusura 15m.
     if not beyond_breakout(live['c'], direction, level, MICRO_CLOSE_BUFFER_ATR15 * atr15):
         return None
-    sl = setup['sl']  # Livello 1H rotto +/- 0.15 ATR1H, fissato al breakout.
+    sl = setup['sl']  # Livello 1H rotto +/- 0.35 ATR1H, fissato al breakout.
     price = live['c']
     risk = price - sl if direction == 'LONG' else sl - price
     if risk <= 0:
@@ -1406,11 +1406,11 @@ def scan_market():
     return queued
 
 def main():
-    log('MOMENTUM ONE V7.4.1 | 50 crypto tutte 1H | RETEST BTC1H 1.50x/1.80x | CONTINUAZIONE live 1.80x')
-    log('1H RETEST: breakout 4x1H + rimbalzo 15m chiuso; volume 1.50x concorde/neutro BTC1H, 1.80x contro BTC1H; SL livello 1H +/-0.15 ATR1H')
+    log('MOMENTUM ONE V7.4.2 | 50 crypto tutte 1H | RETEST BTC1H 1.50x/1.80x | CONTINUAZIONE live 1.80x')
+    log('1H RETEST: breakout 4x1H + rimbalzo 15m chiuso; volume 1.50x concorde/neutro BTC1H, 1.80x contro BTC1H; SL livello 1H +/-0.35 ATR1H')
     log('CONTINUAZIONE: breakout 1H sulle 4 precedenti + prima 15m chiusa oltre livello; volume live 1.80x su qualunque successiva')
     log('STRUTTURA CONTINUAZIONE: HH+HL o LH+LL; una pausa con recupero immediato; wick <=15% corpo SOLO prima 15m chiusa, senza vecchio filtro 12%/25%')
-    log('SL CONTINUAZIONE: livello di resistenza/supporto 1H rotto +/- 0.15 ATR1H | TP 0.30R/0.80R/1.50R')
+    log('SL CONTINUAZIONE: livello di resistenza/supporto 1H rotto +/- 0.35 ATR1H | TP 0.30R/0.80R/1.50R')
     log('BTC RETEST: BTC1H/15m da colore ultime chiuse; contro BTC1H volume 1.80x e BTC15 direzionale; gate TP1 invariato')
     if not BOT_TOKEN or not CHAT_ID:
         log('ATTENZIONE: mancano variabili Telegram')
@@ -1425,7 +1425,7 @@ def main():
     threading.Thread(target=telegram_worker, daemon=True).start()
     threading.Thread(target=history_worker, daemon=True).start()
     threading.Thread(target=websocket_worker, daemon=True).start()
-    if send_telegram('MOMENTUM ONE V7.4.1 AVVIATO [SIMULAZIONE] - '
+    if send_telegram('MOMENTUM ONE V7.4.2 AVVIATO [SIMULAZIONE] - '
                      '50 crypto tutte 1H | RETEST 4x1H BTC1H con/contro volume 1.50x/1.80x | '
                      'CONTINUAZIONE breakout 4x1H + 15m e volume live 1.80x | '
                      'BTC neutro/concorde | TP invariati | nessun ordine automatico'):
