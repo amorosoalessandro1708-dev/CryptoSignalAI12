@@ -35,6 +35,7 @@ BTC_TP1_BLOCK_VOLUME_RATIO = 0.60
 ENTRY_MAX_DISTANCE_ATR1H = 0.50
 VOLUME_AVG_BARS_15M = 20
 RETEST_VOLUME_RATIO_MIN = 1.50
+RETEST_COUNTER_BTC1H_VOLUME_RATIO_MIN = 1.80  # Solo RETEST contro direzione BTC 1H chiusa
 CONT_VOLUME_RATIO_MIN = 1.80
 CONT_BREAKOUT_LOOKBACK_1H = 4  # Resistenza/supporto delle 4 candele 1H precedenti
 CONT_SL_BUFFER_ATR1H = 0.15     # Buffer del livello 1H rotto, non delle 15m
@@ -804,25 +805,67 @@ def btc_guard_on_closed15(btc_candles, confirmation_t, direction, symbol):
     return bias
 
 
+def retest_btc1h_15m_filter(btc_candles, confirmation_t, direction):
+    """Solo RETEST: BTC 1H e 15m dall'ultima candela CHIUSA (colore esatto).
+
+    Con BTC1H o BTC1H neutro: BTC15 neutro/concorde, volume >= 1.50x.
+    Contro BTC1H: BTC15 obbligatoriamente concorde, volume >= 1.80x.
+    None = dati BTC 15m/1H ancora non sincronizzati o non completi.
+    """
+    if direction not in ('LONG', 'SHORT') or len(btc_candles) < 2:
+        return None
+    btc_15m = btc_candles[-2]
+    if btc_15m['t'] != confirmation_t:
+        return None
+    close_t = confirmation_t + FIFTEEN_MIN_MS
+    hourly = macro_closed_candles(btc_candles, ONE_HOUR_MS)
+    if not hourly:
+        return None
+    btc_1h = hourly[-1]
+    # Esige l'ultima ora COMPLETAMENTE chiusa, non un'ora parziale o vecchia.
+    expected_1h_end_t = (close_t // ONE_HOUR_MS) * ONE_HOUR_MS
+    if btc_1h['t'] + ONE_HOUR_MS != expected_1h_end_t:
+        return None
+
+    def candle_direction(candle):
+        if candle['c'] > candle['o']:
+            return 'LONG'
+        if candle['c'] < candle['o']:
+            return 'SHORT'
+        return 'NEUTRAL'
+
+    btc_1h_dir = candle_direction(btc_1h)
+    btc_15m_dir = candle_direction(btc_15m)
+    against_1h = btc_1h_dir in ('LONG', 'SHORT') and btc_1h_dir != direction
+    threshold = (RETEST_COUNTER_BTC1H_VOLUME_RATIO_MIN if against_1h
+                 else RETEST_VOLUME_RATIO_MIN)
+    permitted_15m = (btc_15m_dir == direction if against_1h else
+                     btc_15m_dir in (direction, 'NEUTRAL'))
+    return {'allowed': permitted_15m, 'threshold': threshold,
+            'btc1h': btc_1h_dir, 'btc15m': btc_15m_dir,
+            'against_1h': against_1h}
+
+
 def retest_confirmation(setup, candles, btc_candles, closed, now_ms, atr15):
     direction, level = setup['direction'], setup['level']
     cfg = STRATEGIES['1H']
     if not confirmation_15m_valid(closed, direction, level, atr15, cfg):
         log('RETEST SCARTATO', setup['symbol'], '| struttura 15m/corpo/ATR/wick')
         return None
-    ratio = confirmation_15m_volume_ratio(candles)
-    if ratio < RETEST_VOLUME_RATIO_MIN:
-        log('RETEST SCARTATO', setup['symbol'], '| volume', f'{ratio:.2f}x',
-            '| minimo', f'{RETEST_VOLUME_RATIO_MIN:.2f}x')
-        return None
     symbol = setup['symbol']
-    if symbol != 'BTCUSDT' and btc_candles[-2]['t'] != closed['t']:
+    btc_filter = retest_btc1h_15m_filter(btc_candles, closed['t'], direction)
+    if btc_filter is None:
         return 'BTC_PENDING'
-    btc_dir = btc_guard_on_closed15(btc_candles, closed['t'], direction, symbol)
-    if btc_dir is None:
-        if symbol != 'BTCUSDT' and btc15_closed_direction(btc_candles, closed['t']) is None:
-            return 'BTC_PENDING'
-        log('RETEST SCARTATO', symbol, '| BTC15 opposto')
+    if not btc_filter['allowed']:
+        log('RETEST SCARTATO', symbol, '| BTC1H', btc_filter['btc1h'],
+            '| BTC15m', btc_filter['btc15m'], '| direzione', direction)
+        return None
+    ratio = confirmation_15m_volume_ratio(candles)
+    minimum_volume = btc_filter['threshold']
+    if ratio < minimum_volume:
+        log('RETEST SCARTATO', symbol, '| volume', f'{ratio:.2f}x',
+            '| minimo', f'{minimum_volume:.2f}x',
+            '| BTC1H', btc_filter['btc1h'], '| BTC15m', btc_filter['btc15m'])
         return None
     if symbol != 'BTCUSDT' and btc1h_timing['blocked']:
         log('RETEST BLOCCATO', symbol, '| BTC TP1 1H: aspetto sblocco')
@@ -1363,12 +1406,12 @@ def scan_market():
     return queued
 
 def main():
-    log('MOMENTUM ONE V7.4 | 50 crypto tutte 1H | RETEST 1.50x | CONTINUAZIONE live 1.80x')
-    log('1H RETEST: breakout 4 candele 1H + rimbalzo 15m chiuso a volume 1.50x; SL livello 1H +/-0.15 ATR1H')
+    log('MOMENTUM ONE V7.4.1 | 50 crypto tutte 1H | RETEST BTC1H 1.50x/1.80x | CONTINUAZIONE live 1.80x')
+    log('1H RETEST: breakout 4x1H + rimbalzo 15m chiuso; volume 1.50x concorde/neutro BTC1H, 1.80x contro BTC1H; SL livello 1H +/-0.15 ATR1H')
     log('CONTINUAZIONE: breakout 1H sulle 4 precedenti + prima 15m chiusa oltre livello; volume live 1.80x su qualunque successiva')
     log('STRUTTURA CONTINUAZIONE: HH+HL o LH+LL; una pausa con recupero immediato; wick <=15% corpo SOLO prima 15m chiusa, senza vecchio filtro 12%/25%')
     log('SL CONTINUAZIONE: livello di resistenza/supporto 1H rotto +/- 0.15 ATR1H | TP 0.30R/0.80R/1.50R')
-    log('BTC: solo neutro/concorde su ultima 15m chiusa; gate TP1 BTC1H mantenuto')
+    log('BTC RETEST: BTC1H/15m da colore ultime chiuse; contro BTC1H volume 1.80x e BTC15 direzionale; gate TP1 invariato')
     if not BOT_TOKEN or not CHAT_ID:
         log('ATTENZIONE: mancano variabili Telegram')
     load_telegram_outbox()
@@ -1382,8 +1425,8 @@ def main():
     threading.Thread(target=telegram_worker, daemon=True).start()
     threading.Thread(target=history_worker, daemon=True).start()
     threading.Thread(target=websocket_worker, daemon=True).start()
-    if send_telegram('MOMENTUM ONE V7.4 AVVIATO [SIMULAZIONE] - '
-                     '50 crypto tutte 1H | RETEST breakout 4x1H + 15m volume 1.50x | '
+    if send_telegram('MOMENTUM ONE V7.4.1 AVVIATO [SIMULAZIONE] - '
+                     '50 crypto tutte 1H | RETEST 4x1H BTC1H con/contro volume 1.50x/1.80x | '
                      'CONTINUAZIONE breakout 4x1H + 15m e volume live 1.80x | '
                      'BTC neutro/concorde | TP invariati | nessun ordine automatico'):
         log('TELEGRAM AVVIO OK')
