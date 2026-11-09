@@ -34,7 +34,7 @@ ADDED_10 = [
 SYMBOLS = ORIGINAL_50 + ADDED_10
 assert len(SYMBOLS) == 60 and len(set(SYMBOLS)) == 60
 BOT_NAME = "MOMENTUM 4H 60"
-BOT_VERSION = "1.0"
+BOT_VERSION = "1.1"
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 FOUR_HOUR_LOOKBACK = 6
@@ -375,6 +375,9 @@ class SignalEngine:
         self.bars: dict[str, dict[int, dict]] = {}
         self.last_processed: dict[str, int] = {}
         self.last_macro_checked: dict[str, int] = {}
+        self.checked_15m: dict[str, int] = {}
+        self.checked_4h: dict[str, int] = {}
+        self.scan_errors = 0
         self.setups: dict[str, Breakout] = {}
         self.pending: dict[str, tuple[int, float, float]] = {}
         self.events: queue.Queue[tuple[str, dict]] = queue.Queue(maxsize=4096)
@@ -542,6 +545,7 @@ class SignalEngine:
                     (not btc_hourly or btc_hourly[-1]["t"] + ONE_HOUR_MS < target_btc_hour_end)):
                 return False
             bias = btc_regime(btc, close_t)
+            self.checked_15m[symbol] = bar_t
             setup = self.setups.get(symbol)
             if setup and close_t - setup.macro_close_ms > SETUP_LIFETIME_MS:
                 self.setups.pop(symbol, None)
@@ -549,6 +553,7 @@ class SignalEngine:
             if close_t % FOUR_HOURS_MS == 0 and self.last_macro_checked.get(symbol) != close_t:
                 self.last_macro_checked[symbol] = close_t
                 candidate = detect_breakout(symbol, history, close_t)
+                self.checked_4h[symbol] = close_t
                 if candidate:
                     self.setups[symbol] = candidate
                     setup = candidate
@@ -613,6 +618,8 @@ class SignalEngine:
                 try:
                     finished = self.process(sym, bar_t)
                 except Exception:
+                    self.scan_errors += 1
+                    self.checked_15m.pop(sym, None)
                     log.exception("Errore scansione %s", sym)
                     finished = False
                 if not finished and time.monotonic() < deadline:
@@ -624,9 +631,16 @@ class SignalEngine:
                     self.pending.pop(sym, None)
             if time.monotonic() - last_health >= 20:
                 last_health = time.monotonic()
+                bar_t = (now_ms() // FIFTEEN_MIN_MS - 1) * FIFTEEN_MIN_MS
+                hour4_end = (now_ms() // FOUR_HOURS_MS) * FOUR_HOURS_MS
                 with self.lock:
-                    log.info("SALUTE | simboli %d | pending %d | setup 4H %d | WS ultimo messaggio %.1fs fa",
-                             len(self.active_symbols), len(self.pending), len(self.setups),
+                    total = len(self.active_symbols)
+                    feed = sum(bar_t in self.bars.get(s, {}) for s in self.active_symbols)
+                    checked = sum(self.checked_15m.get(s) == bar_t for s in self.active_symbols)
+                    checked_4h = sum(self.checked_4h.get(s) == hour4_end for s in self.active_symbols)
+                    log.info("SCAN 15m | feed %d/%d | analizzate %d/%d | 4H ultima chiusura %d/%d | errori %d | pending %d | setup 4H %d | WS %.1fs fa",
+                             feed, total, checked, total, checked_4h, total,
+                             self.scan_errors, len(self.pending), len(self.setups),
                              time.monotonic() - self.ws_last_message if self.ws_last_message else -1)
     def stop(self, *_args) -> None:
         log.info("Interruzione richiesta")
