@@ -425,7 +425,7 @@ class SignalEngine:
             f"🟢 {BOT_NAME} V{BOT_VERSION} AVVIATO [SIMULAZIONE]\n"
             f"{len(self.active_symbols)}/{len(SYMBOLS)} crypto USDT perpetual | 4H: rottura su 6 candele (24h)\n"
             "15m DIRETTO volume >=1.50x | RETEST tocco <1.00x + ripartenza >1.00x\n"
-            "BTC1H favorevole/laterale | SL livello 4H +/-0.15 ATR4H\n"
+            "BTC1H favorevole/laterale | SL livello 4H +/-0.50 ATR4H\n"
             "TP fissi 2% / 4% / 6% dall'Entry | nessun ordine automatico"
         )
         telegram_send(status)
