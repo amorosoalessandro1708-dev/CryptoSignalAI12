@@ -622,7 +622,7 @@ class SignalEngine:
                 with self.lock:
                     self.last_processed[sym] = bar_t
                     self.pending.pop(sym, None)
-            if time.monotonic() - last_health >= 180:
+            if time.monotonic() - last_health >= 20:
                 last_health = time.monotonic()
                 with self.lock:
                     log.info("SALUTE | simboli %d | pending %d | setup 4H %d | WS ultimo messaggio %.1fs fa",
