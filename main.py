@@ -4,6 +4,7 @@ import logging
 import os
 import queue
 import signal
+import sys
 import threading
 import time
 from collections import defaultdict
@@ -76,6 +77,7 @@ ROME = ZoneInfo("Europe/Rome")
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s %(levelname)s %(message)s",
+    stream=sys.stdout,
 )
 log = logging.getLogger(BOT_NAME)
 def now_ms() -> int:
