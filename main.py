@@ -34,7 +34,7 @@ ADDED_10 = [
 SYMBOLS = ORIGINAL_50 + ADDED_10
 assert len(SYMBOLS) == 60 and len(set(SYMBOLS)) == 60
 BOT_NAME = "MOMENTUM 4H 60"
-BOT_VERSION = "1.1"
+BOT_VERSION = "1.2"
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 FOUR_HOUR_LOOKBACK = 6
@@ -52,7 +52,7 @@ ATR_PERIOD = 14
 TAKE_PROFITS_PERCENT = (0.02, 0.04, 0.06)
 BTC_STRUCTURE_HOURS = 6
 BTC_GROUP_SIZE = 3
-SETUP_LIFETIME_HOURS = 8
+SETUP_LIFETIME_HOURS = 1
 HISTORY_LIMIT = 420
 FIFTEEN_MIN_MS = 15 * 60 * 1000
 ONE_HOUR_MS = 60 * 60 * 1000
@@ -195,6 +195,7 @@ class Breakout:
     sl: float
     touched_at: int = 0
     sent: bool = False
+    direct_valid: bool = True
 def detect_breakout(symbol: str, candles_15m: list[dict], close_time: int) -> Optional[Breakout]:
     macro = aggregate_closed(candles_15m, FOUR_HOURS_MS)
     if not macro or macro[-1]["t"] + FOUR_HOURS_MS != close_time:
@@ -257,6 +258,8 @@ def evaluate_entry(setup: Breakout, candles: list[dict], btc_bias: str,
         return None, False
     direction, level = setup.direction, setup.level
     closed_beyond = beyond_level(bar["c"], direction, level)
+    if not closed_beyond:
+        setup.direct_valid = False
     strong = closed_beyond and candle_shape_ok(bar, direction, macro=False)
     if setup.touched_at:
         if (close_time > setup.touched_at + FIFTEEN_MIN_MS and strong
@@ -267,7 +270,8 @@ def evaluate_entry(setup: Breakout, candles: list[dict], btc_bias: str,
     if touched_level(bar, level) and ratio < RETEST_TOUCH_VOLUME_MAX:
         setup.touched_at = bar["t"]
         return None, False
-    if strong and ratio >= DIRECT_VOLUME_MIN and btc_compatible(btc_bias, direction, setup.symbol):
+    if (setup.direct_valid and strong and ratio >= DIRECT_VOLUME_MIN
+            and btc_compatible(btc_bias, direction, setup.symbol)):
         return make_signal(setup, bar, "BREAKOUT DIRETTO", ratio, btc_bias), False
     return None, False
 def load_state() -> dict:
@@ -425,6 +429,7 @@ class SignalEngine:
             f"🟢 {BOT_NAME} V{BOT_VERSION} AVVIATO [SIMULAZIONE]\n"
             f"{len(self.active_symbols)}/{len(SYMBOLS)} crypto USDT perpetual | 4H: rottura su 6 candele (24h)\n"
             "15m DIRETTO volume >=1.50x | RETEST tocco <1.00x + ripartenza >1.00x\n"
+            "DIRETTO e RETEST: massimo 4 candele 15m dalla chiusura 4H (1 ora)\n"
             "BTC1H favorevole/laterale | SL livello 4H +/-0.50 ATR4H\n"
             "TP fissi 2% / 4% / 6% dall'Entry | nessun ordine automatico"
         )
