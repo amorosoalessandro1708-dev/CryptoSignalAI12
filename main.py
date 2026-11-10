@@ -41,7 +41,7 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 FOUR_HOUR_LOOKBACK = 6
 FOUR_HOUR_BODY_MIN = 0.55
 FOUR_HOUR_EACH_WICK_MAX = 0.225
-ONE_HOUR_LOOKBACK = 36
+ONE_HOUR_LOOKBACK = 24
 ONE_HOUR_BODY_MIN = FOUR_HOUR_BODY_MIN
 ONE_HOUR_EACH_WICK_MAX = FOUR_HOUR_EACH_WICK_MAX
 FIFTEEN_MIN_BODY_MIN = 0.85
@@ -499,7 +499,7 @@ class SignalEngine:
             "RETEST annullato se il prezzo avanza oltre 1.00 ATR4H dal livello rotto\n"
             "BTC1H favorevole/laterale | SL livello 4H +/-0.50 ATR4H\n"
             "TP fissi 2% / 4% / 6% dall'Entry | nessun ordine automatico\n"
-            "NUOVA 1H: breakout 36 candele 1H (36h), conferma 15m | SL 0.35 ATR1H\n"
+            "NUOVA 1H: breakout 24 candele 1H (24h), conferma 15m | SL 0.35 ATR1H\n"
             "1H TP dall'Entry: 0.50% / 2% / 3% | DIRETTO 1h, RETEST 8h"
         )
         telegram_send(status)
@@ -670,7 +670,7 @@ class SignalEngine:
                 if candidate and not setup:
                     self.setups_1h[symbol] = candidate
                     setup = candidate
-                    log.info("BREAKOUT 1H %s %s livello %s (36h)", symbol,
+                    log.info("BREAKOUT 1H %s %s livello %s (24h)", symbol,
                              candidate.direction, price_string(candidate.level))
             if not setup:
                 return
