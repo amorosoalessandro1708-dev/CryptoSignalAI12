@@ -34,7 +34,7 @@ ADDED_10 = [
 SYMBOLS = ORIGINAL_50 + ADDED_10
 assert len(SYMBOLS) == 60 and len(set(SYMBOLS)) == 60
 BOT_NAME = "MOMENTUM 4H 60"
-BOT_VERSION = "1.2"
+BOT_VERSION = "1.3"
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 FOUR_HOUR_LOOKBACK = 6
@@ -52,12 +52,15 @@ ATR_PERIOD = 14
 TAKE_PROFITS_PERCENT = (0.02, 0.04, 0.06)
 BTC_STRUCTURE_HOURS = 6
 BTC_GROUP_SIZE = 3
-SETUP_LIFETIME_HOURS = 1
+DIRECT_LIFETIME_HOURS = 1
+RETEST_LIFETIME_HOURS = 8
+RETEST_MAX_EXCURSION_ATR4H = 1.00
 HISTORY_LIMIT = 420
 FIFTEEN_MIN_MS = 15 * 60 * 1000
 ONE_HOUR_MS = 60 * 60 * 1000
 FOUR_HOURS_MS = 4 * ONE_HOUR_MS
-SETUP_LIFETIME_MS = SETUP_LIFETIME_HOURS * ONE_HOUR_MS
+DIRECT_LIFETIME_MS = DIRECT_LIFETIME_HOURS * ONE_HOUR_MS
+RETEST_LIFETIME_MS = RETEST_LIFETIME_HOURS * ONE_HOUR_MS
 EVENT_LOOP_POLL_SECONDS = 0.10
 EVENT_DEBOUNCE_SECONDS = 2.0
 EVENT_MAX_RETRY_SECONDS = 40.0
@@ -242,16 +245,29 @@ def make_signal(setup: Breakout, bar: dict, mode: str, ratio: float, btc: str) -
         "level": setup.level, "confirm_time": bar["t"] + FIFTEEN_MIN_MS,
         "breakout_time": setup.macro_close_ms,
     }
+def retest_excursion_exceeded(setup: Breakout, candles: list[dict], close_time: int) -> bool:
+    limit = RETEST_MAX_EXCURSION_ATR4H * setup.atr4h
+    return any(
+        c["h"] > setup.level + limit if setup.direction == "LONG"
+        else c["l"] < setup.level - limit
+        for c in candles
+        if setup.macro_close_ms <= c["t"] < close_time
+    )
 def evaluate_entry(setup: Breakout, candles: list[dict], btc_bias: str,
                    close_time: int) -> tuple[Optional[dict], bool]:
     if setup.sent or not candles or close_time <= setup.macro_close_ms:
         return None, False
-    if close_time - setup.macro_close_ms > SETUP_LIFETIME_MS:
+    elapsed = close_time - setup.macro_close_ms
+    if elapsed > RETEST_LIFETIME_MS:
         return None, True
     bar = candles[-1]
     if bar["t"] + FIFTEEN_MIN_MS != close_time:
         return None, False
     if invalidated(setup, bar):
+        return None, True
+    direct_window = elapsed <= DIRECT_LIFETIME_MS
+    retest_valid = not retest_excursion_exceeded(setup, candles, close_time)
+    if (not retest_valid and (setup.touched_at or not direct_window)):
         return None, True
     ratio = volume_ratio(candles, len(candles) - 1)
     if ratio is None:
@@ -267,10 +283,10 @@ def evaluate_entry(setup: Breakout, candles: list[dict], btc_bias: str,
                 and btc_compatible(btc_bias, direction, setup.symbol)):
             return make_signal(setup, bar, "RETEST", ratio, btc_bias), False
         return None, False
-    if touched_level(bar, level) and ratio < RETEST_TOUCH_VOLUME_MAX:
+    if retest_valid and touched_level(bar, level) and ratio < RETEST_TOUCH_VOLUME_MAX:
         setup.touched_at = bar["t"]
         return None, False
-    if (setup.direct_valid and strong and ratio >= DIRECT_VOLUME_MIN
+    if (direct_window and setup.direct_valid and strong and ratio >= DIRECT_VOLUME_MIN
             and btc_compatible(btc_bias, direction, setup.symbol)):
         return make_signal(setup, bar, "BREAKOUT DIRETTO", ratio, btc_bias), False
     return None, False
@@ -429,7 +445,8 @@ class SignalEngine:
             f"🟢 {BOT_NAME} V{BOT_VERSION} AVVIATO [SIMULAZIONE]\n"
             f"{len(self.active_symbols)}/{len(SYMBOLS)} crypto USDT perpetual | 4H: rottura su 6 candele (24h)\n"
             "15m DIRETTO volume >=1.50x | RETEST tocco <1.00x + ripartenza >1.00x\n"
-            "DIRETTO e RETEST: massimo 4 candele 15m dalla chiusura 4H (1 ora)\n"
+            "DIRETTO max 4 candele 15m (1h) | RETEST max 32 candele 15m (8h)\n"
+            "RETEST annullato se il prezzo avanza oltre 1.00 ATR4H dal livello rotto\n"
             "BTC1H favorevole/laterale | SL livello 4H +/-0.50 ATR4H\n"
             "TP fissi 2% / 4% / 6% dall'Entry | nessun ordine automatico"
         )
@@ -552,21 +569,18 @@ class SignalEngine:
             bias = btc_regime(btc, close_t)
             self.checked_15m[symbol] = bar_t
             setup = self.setups.get(symbol)
-            if setup and close_t - setup.macro_close_ms > SETUP_LIFETIME_MS:
+            if setup and close_t - setup.macro_close_ms > RETEST_LIFETIME_MS:
                 self.setups.pop(symbol, None)
                 setup = None
             if close_t % FOUR_HOURS_MS == 0 and self.last_macro_checked.get(symbol) != close_t:
                 self.last_macro_checked[symbol] = close_t
                 candidate = detect_breakout(symbol, history, close_t)
                 self.checked_4h[symbol] = close_t
-                if candidate:
+                if candidate and not setup:
                     self.setups[symbol] = candidate
                     setup = candidate
                     log.info("BREAKOUT 4H %s %s, livello %s", symbol,
                              candidate.direction, price_string(candidate.level))
-                else:
-                    self.setups.pop(symbol, None)
-                    setup = None
             if not setup:
                 return True
             dedup_key = f"{symbol}:{setup.macro_close_ms}"
