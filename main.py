@@ -44,6 +44,12 @@ FOUR_HOUR_EACH_WICK_MAX = 0.225
 ONE_HOUR_LOOKBACK = 48
 ONE_HOUR_BODY_MIN = FOUR_HOUR_BODY_MIN
 ONE_HOUR_EACH_WICK_MAX = FOUR_HOUR_EACH_WICK_MAX
+ONE_HOUR_FOUR_BAR_LOOKBACK = 4
+FOUR_BAR_TIMEFRAME = "1H-4C"
+FOUR_BAR_BODY_MIN = 0.90
+FOUR_BAR_EACH_WICK_MAX = 0.05
+FOUR_BAR_RETEST_BOUNCE_VOLUME_MIN = 1.20
+FOUR_BAR_TAKE_PROFITS_PERCENT = (0.0025, 0.004, 0.005)
 FIFTEEN_MIN_BODY_MIN = 0.85
 FIFTEEN_MIN_EACH_WICK_MAX = 0.075
 FIFTEEN_MIN_WICKS_SUM_MAX = 0.15
@@ -109,7 +115,7 @@ def ratios(c: dict) -> Optional[tuple[float, float, float]]:
     upper = max(0.0, c["h"] - max(c["o"], c["c"])) / span
     lower = max(0.0, min(c["o"], c["c"]) - c["l"]) / span
     return body, upper, lower
-def candle_shape_ok(c: dict, direction: str, *, macro: bool) -> bool:
+def candle_shape_ok(c: dict, direction: str, *, macro: bool, four_bar: bool = False) -> bool:
     if not ((direction == "LONG" and is_bull(c)) or (direction == "SHORT" and is_bear(c))):
         return False
     r = ratios(c)
@@ -121,6 +127,10 @@ def candle_shape_ok(c: dict, direction: str, *, macro: bool) -> bool:
         return (body + eps >= FOUR_HOUR_BODY_MIN
                 and upper <= FOUR_HOUR_EACH_WICK_MAX + eps
                 and lower <= FOUR_HOUR_EACH_WICK_MAX + eps)
+    if four_bar:
+        return (body + eps >= FOUR_BAR_BODY_MIN
+                and upper <= FOUR_BAR_EACH_WICK_MAX + eps
+                and lower <= FOUR_BAR_EACH_WICK_MAX + eps)
     return (body + eps >= FIFTEEN_MIN_BODY_MIN
             and upper <= FIFTEEN_MIN_EACH_WICK_MAX + eps
             and lower <= FIFTEEN_MIN_EACH_WICK_MAX + eps
@@ -229,17 +239,18 @@ def detect_breakout(symbol: str, candles_15m: list[dict], close_time: int) -> Op
         return None
     sl = level - SL_BUFFER_ATR4H * atr if direction == "LONG" else level + SL_BUFFER_ATR4H * atr
     return Breakout(symbol, direction, last["t"], close_time, level, atr, sl)
-def detect_breakout_1h(symbol: str, candles_15m: list[dict], close_time: int) -> Optional[Breakout]:
+def detect_breakout_1h(symbol: str, candles_15m: list[dict], close_time: int,
+                       *, lookback: int = ONE_HOUR_LOOKBACK) -> Optional[Breakout]:
     hourly = aggregate_closed(candles_15m, ONE_HOUR_MS)
     if not hourly or hourly[-1]["t"] + ONE_HOUR_MS != close_time:
         return None
-    if len(hourly) < max(ONE_HOUR_LOOKBACK + 1, ATR_PERIOD + 2):
+    if len(hourly) < max(lookback + 1, ATR_PERIOD + 2):
         return None
     last, prior = hourly[-1], hourly[:-1]
     atr = average_true_range(prior)
     if atr is None:
         return None
-    levels = prior[-ONE_HOUR_LOOKBACK:]
+    levels = prior[-lookback:]
     high, low = max(c["h"] for c in levels), min(c["l"] for c in levels)
     if last["c"] > high:
         direction, level = "LONG", high
@@ -254,16 +265,23 @@ def detect_breakout_1h(symbol: str, candles_15m: list[dict], close_time: int) ->
     # Campo atr4h riutilizzato nel setup 1H con il valore ATR1H.
     return Breakout(symbol, direction, last["t"], close_time, level, atr, sl)
 def evaluate_entry_1h(setup: Breakout, candles: list[dict], btc_bias: str,
-                      close_time: int) -> tuple[Optional[dict], bool]:
+                      close_time: int, *, four_bar: bool = False) -> tuple[Optional[dict], bool]:
     # Stessa logica 15m/volumi/tempi/retest della strategia 4H, ma livelli 1H.
-    out, expired = evaluate_entry(setup, candles, btc_bias, close_time)
+    out, expired = evaluate_entry(setup, candles, btc_bias, close_time, four_bar=four_bar)
     if out:
         sign = 1 if out["direction"] == "LONG" else -1
         entry = out["entry"]
-        out.update(timeframe="1H", tp1=entry * (1 + sign * TAKE_PROFITS_1H_PERCENT[0]),
-                   tp2=entry * (1 + sign * TAKE_PROFITS_1H_PERCENT[1]),
-                   tp3=entry * (1 + sign * TAKE_PROFITS_1H_PERCENT[2]))
+        targets = FOUR_BAR_TAKE_PROFITS_PERCENT if four_bar else TAKE_PROFITS_1H_PERCENT
+        out.update(timeframe=FOUR_BAR_TIMEFRAME if four_bar else "1H",
+                   tp1=entry * (1 + sign * targets[0]),
+                   tp2=entry * (1 + sign * targets[1]),
+                   tp3=entry * (1 + sign * targets[2]))
     return out, expired
+def closed_4h_agrees(candles: list[dict], direction: str, close_time: int) -> bool:
+    end = close_time - close_time % FOUR_HOURS_MS
+    start = end - FOUR_HOURS_MS
+    last_4h = aggregate_closed([c for c in candles if start <= c["t"] < end], FOUR_HOURS_MS)
+    return bool(last_4h and candle_shape_ok(last_4h[0], direction, macro=True))
 def beyond_level(price: float, direction: str, level: float) -> bool:
     return price > level if direction == "LONG" else price < level
 def touched_level(bar: dict, level: float) -> bool:
@@ -296,7 +314,7 @@ def retest_excursion_exceeded(setup: Breakout, candles: list[dict], close_time: 
         if setup.macro_close_ms <= c["t"] < close_time
     )
 def evaluate_entry(setup: Breakout, candles: list[dict], btc_bias: str,
-                   close_time: int) -> tuple[Optional[dict], bool]:
+                   close_time: int, *, four_bar: bool = False) -> tuple[Optional[dict], bool]:
     if setup.sent or not candles or close_time <= setup.macro_close_ms:
         return None, False
     elapsed = close_time - setup.macro_close_ms
@@ -318,10 +336,11 @@ def evaluate_entry(setup: Breakout, candles: list[dict], btc_bias: str,
     closed_beyond = beyond_level(bar["c"], direction, level)
     if not closed_beyond:
         setup.direct_valid = False
-    strong = closed_beyond and candle_shape_ok(bar, direction, macro=False)
+    strong = closed_beyond and candle_shape_ok(bar, direction, macro=False, four_bar=four_bar)
     if setup.touched_at:
+        bounce_min = FOUR_BAR_RETEST_BOUNCE_VOLUME_MIN if four_bar else RETEST_BOUNCE_VOLUME_MIN
         if (close_time > setup.touched_at + FIFTEEN_MIN_MS and strong
-                and ratio > RETEST_BOUNCE_VOLUME_MIN
+                and ratio > bounce_min
                 and btc_compatible(btc_bias, direction, setup.symbol)):
             return make_signal(setup, bar, "RETEST", ratio, btc_bias), False
         return None, False
@@ -376,6 +395,8 @@ def format_signal(s: dict) -> str:
     when = datetime.fromtimestamp(s["confirm_time"] / 1000, ROME).strftime("%d/%m/%Y %H:%M")
     tf = s.get("timeframe", "4H")
     labels = ("0.50", "2", "3") if tf == "1H" else ("2", "4", "6")
+    if tf == FOUR_BAR_TIMEFRAME:
+        labels = tuple(f"{value * 100:.2f}" for value in FOUR_BAR_TAKE_PROFITS_PERCENT)
     return (
         f"{emoji} {s['direction']} | {sym} | {tf} | {s['mode']}\n\n"
         f"Entry: {price_string(s['entry'])}\n"
@@ -446,6 +467,8 @@ class SignalEngine:
         self.scan_errors = 0
         self.setups: dict[str, Breakout] = {}
         self.setups_1h: dict[str, Breakout] = {}
+        self.setups_1h_four_bar: dict[str, Breakout] = {}
+        self.last_regular_signal: dict[tuple[str, str], int] = {}
         self.pending: dict[str, tuple[int, float, float]] = {}
         self.events: queue.Queue[tuple[str, dict]] = queue.Queue(maxsize=4096)
         self.state = load_state()
@@ -454,7 +477,6 @@ class SignalEngine:
         self.ws_last_message = 0.0
         self.ws = None
         self.last_recovery = defaultdict(float)
-        self.startup_warning = ""
     def persist(self) -> None:
         recent = sorted(self.sent)[-5000:]
         self.state["sent"] = recent
@@ -465,8 +487,7 @@ class SignalEngine:
         self.active_symbols = [s for s in SYMBOLS if s in tradable]
         missing = [s for s in SYMBOLS if s not in tradable]
         if missing:
-            self.startup_warning = "NON disponibili su Binance futures USDT: " + ", ".join(missing)
-            log.warning(self.startup_warning)
+            log.warning("NON disponibili su Binance futures USDT: %s", ", ".join(missing))
         if "BTCUSDT" not in self.active_symbols:
             raise RuntimeError("BTCUSDT non disponibile: impossibile applicare filtro BTC1H")
         log.info("Avvio raccolta dati: %s/%s coppie disponibili", len(self.active_symbols), len(SYMBOLS))
@@ -502,9 +523,8 @@ class SignalEngine:
             "NUOVA 1H: breakout 48 candele 1H (48h), conferma 15m | SL 0.35 ATR1H\n"
             "1H TP dall'Entry: 0.50% / 2% / 3% | DIRETTO 1h, RETEST 8h"
         )
-        telegram_send(status)
-        if missing:
-            telegram_send("⚠️ " + self.startup_warning + "\nSostituire queste coppie per arrivare a 60 attive.")
+        log.info("%s", status)
+        log.info("Ramo %s attivo: breakout 4 candele 1H, direzione 4H chiusa, conferma 15m", FOUR_BAR_TIMEFRAME)
     def recent(self, symbol: str) -> list[dict]:
         return [v for _, v in sorted(self.bars.get(symbol, {}).items())]
     def merge(self, symbol: str, additions: list[dict]) -> None:
@@ -647,6 +667,7 @@ class SignalEngine:
                 self.sent.add(dedup_key)
                 self.outbox[dedup_key] = out
                 self.persist()
+                self.last_regular_signal[(symbol, out["direction"])] = close_t
                 self.setups.pop(symbol, None)
             else:
                 return True
@@ -688,11 +709,51 @@ class SignalEngine:
                 self.sent.add(key)
                 self.outbox[key] = out
                 self.persist()
+                self.last_regular_signal[(symbol, out["direction"])] = close_t
                 self.setups_1h.pop(symbol, None)
             else:
                 return
         log.info("SEGNALE 1H IN CODA %s %s %s volume %.2fx BTC %s",
                  symbol, out["direction"], out["mode"], out["volume_ratio"], out["btc"])
+    def process_1h_four_bar(self, symbol: str, bar_t: int) -> None:
+        close_t = bar_t + FIFTEEN_MIN_MS
+        with self.lock:
+            history = self.recent(symbol)
+            if not history or history[-1]["t"] != bar_t:
+                return
+            setup = self.setups_1h_four_bar.get(symbol)
+            if setup and close_t - setup.macro_close_ms > RETEST_LIFETIME_MS:
+                self.setups_1h_four_bar.pop(symbol)
+                setup = None
+            if setup is None and close_t % ONE_HOUR_MS == 0:
+                candidate = detect_breakout_1h(
+                    symbol, history, close_t, lookback=ONE_HOUR_FOUR_BAR_LOOKBACK,
+                )
+                if candidate and closed_4h_agrees(history, candidate.direction, close_t):
+                    self.setups_1h_four_bar[symbol] = setup = candidate
+                    log.info("BREAKOUT %s %s %s livello %s", FOUR_BAR_TIMEFRAME,
+                             symbol, setup.direction, price_string(setup.level))
+            if setup is None:
+                return
+            key = f"{FOUR_BAR_TIMEFRAME}:{symbol}:{setup.macro_close_ms}"
+            if key in self.sent:
+                self.setups_1h_four_bar.pop(symbol)
+                return
+            bias = btc_regime(self.recent("BTCUSDT"), close_t)
+            out, expired = evaluate_entry_1h(setup, history, bias, close_t, four_bar=True)
+            if expired:
+                self.setups_1h_four_bar.pop(symbol)
+                return
+            if not out or not closed_4h_agrees(history, setup.direction, close_t):
+                return
+            self.setups_1h_four_bar.pop(symbol)
+            if self.last_regular_signal.get((symbol, setup.direction)) == close_t:
+                return
+            self.sent.add(key)
+            self.outbox[key] = out
+            self.persist()
+        log.info("SEGNALE %s IN CODA %s %s %s volume %.2fx BTC %s",
+                 FOUR_BAR_TIMEFRAME, symbol, out["direction"], out["mode"], out["volume_ratio"], out["btc"])
     def telegram_loop(self) -> None:
         while self.running.is_set():
             with self.lock:
@@ -730,6 +791,10 @@ class SignalEngine:
                     finished = self.process(sym, bar_t)
                     if finished:
                         self.process_1h(sym, bar_t)
+                        try:
+                            self.process_1h_four_bar(sym, bar_t)
+                        except Exception:
+                            log.exception("Errore scansione %s %s", FOUR_BAR_TIMEFRAME, sym)
                 except Exception:
                     self.scan_errors += 1
                     self.checked_15m.pop(sym, None)
