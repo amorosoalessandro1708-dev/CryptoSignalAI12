@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 import json
 import logging
 import os
@@ -8,14 +9,16 @@ import sys
 import threading
 import time
 from collections import defaultdict
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from statistics import median
 from typing import Optional
 from zoneinfo import ZoneInfo
+
 import requests
 import websocket
+
 ORIGINAL_50 = [
     "SOLUSDT", "BTCUSDT", "ETHUSDT", "XRPUSDT", "BNBUSDT",
     "DOGEUSDT", "AVAXUSDT", "SUIUSDT", "LINKUSDT", "ADAUSDT",
@@ -34,22 +37,24 @@ ADDED_10 = [
 ]
 SYMBOLS = ORIGINAL_50 + ADDED_10
 assert len(SYMBOLS) == 60 and len(set(SYMBOLS)) == 60
+
+# Ramo 1H-4C eliminato. Sono attive 4H, 1H-48h e nuova M15.
+M15_SYMBOLS = {"BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"}
+assert M15_SYMBOLS <= set(SYMBOLS)
 BOT_NAME = "MOMENTUM 4H 60"
-BOT_VERSION = "1.4"
+BOT_VERSION = "1.5"
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+# Strategia 4H: breakout sulle 6 candele precedenti (24h)
 FOUR_HOUR_LOOKBACK = 6
 FOUR_HOUR_BODY_MIN = 0.55
 FOUR_HOUR_EACH_WICK_MAX = 0.225
+# Strategia 1H: breakout sulle 48 candele precedenti (48h)
 ONE_HOUR_LOOKBACK = 48
 ONE_HOUR_BODY_MIN = FOUR_HOUR_BODY_MIN
 ONE_HOUR_EACH_WICK_MAX = FOUR_HOUR_EACH_WICK_MAX
-ONE_HOUR_FOUR_BAR_LOOKBACK = 4
-FOUR_BAR_TIMEFRAME = "1H-4C"
-FOUR_BAR_BODY_MIN = 0.90
-FOUR_BAR_EACH_WICK_MAX = 0.05
-FOUR_BAR_RETEST_BOUNCE_VOLUME_MIN = 1.20
-FOUR_BAR_TAKE_PROFITS_PERCENT = (0.0025, 0.004, 0.005)
+# Conferma 15m, condivisa SOLO dalle due strategie di breakout macro.
 FIFTEEN_MIN_BODY_MIN = 0.85
 FIFTEEN_MIN_EACH_WICK_MAX = 0.075
 FIFTEEN_MIN_WICKS_SUM_MAX = 0.15
@@ -57,16 +62,34 @@ VOLUME_LOOKBACK = 20
 DIRECT_VOLUME_MIN = 1.50
 RETEST_TOUCH_VOLUME_MAX = 1.00
 RETEST_BOUNCE_VOLUME_MIN = 1.00
-SL_BUFFER_ATR4H = 0.50
-SL_BUFFER_ATR1H = 0.35
+# Stop strutturale macro: livello rotto +/- 1 ATR del rispettivo timeframe.
+SL_BUFFER_ATR4H = 1.00
+SL_BUFFER_ATR1H = 1.00
 ATR_PERIOD = 14
 TAKE_PROFITS_PERCENT = (0.02, 0.04, 0.06)
-TAKE_PROFITS_1H_PERCENT = (0.005, 0.02, 0.03)
+TAKE_PROFITS_1H_PERCENT = (0.005, 0.01, 0.015)
 BTC_STRUCTURE_HOURS = 6
 BTC_GROUP_SIZE = 3
 DIRECT_LIFETIME_HOURS = 1
 RETEST_LIFETIME_HOURS = 8
 RETEST_MAX_EXCURSION_ATR4H = 1.00
+
+# M15 indipendente: EMA200, RSI7, breakout6, volume SMA20, ATR14.
+M15_EMA_PERIOD = 200
+M15_RSI_PERIOD = 7
+M15_RSI_RESET_BARS = 5
+M15_RSI_LONG_RESET = 35.0
+M15_RSI_LONG_CONFIRM = 45.0
+M15_RSI_SHORT_RESET = 65.0
+M15_RSI_SHORT_CONFIRM = 55.0
+M15_BREAKOUT_BARS = 6
+M15_VOLUME_PERIOD = 20
+M15_VOLUME_MULTIPLIER = 1.20
+M15_ATR_PERIOD = 14
+M15_SL_ATR_MULTIPLIER = 1.50
+M15_TAKE_PROFITS_PERCENT = (0.004, 0.007, 0.01)
+M15_COOLDOWN_BARS = 8  # Per simbolo e direzione, dall'ultimo segnale M15 inviato.
+
 HISTORY_LIMIT = 420
 FIFTEEN_MIN_MS = 15 * 60 * 1000
 ONE_HOUR_MS = 60 * 60 * 1000
@@ -91,8 +114,12 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 log = logging.getLogger(BOT_NAME)
+
+
 def now_ms() -> int:
     return int(time.time() * 1000)
+
+
 def price_string(value: float) -> str:
     if value >= 1000:
         digits = 2
@@ -103,10 +130,16 @@ def price_string(value: float) -> str:
     else:
         digits = 8
     return f"{value:.{digits}f}"
+
+
 def is_bull(c: dict) -> bool:
     return c["c"] > c["o"]
+
+
 def is_bear(c: dict) -> bool:
     return c["c"] < c["o"]
+
+
 def ratios(c: dict) -> Optional[tuple[float, float, float]]:
     span = c["h"] - c["l"]
     if span <= 0:
@@ -115,7 +148,9 @@ def ratios(c: dict) -> Optional[tuple[float, float, float]]:
     upper = max(0.0, c["h"] - max(c["o"], c["c"])) / span
     lower = max(0.0, min(c["o"], c["c"]) - c["l"]) / span
     return body, upper, lower
-def candle_shape_ok(c: dict, direction: str, *, macro: bool, four_bar: bool = False) -> bool:
+
+
+def candle_shape_ok(c: dict, direction: str, *, macro: bool) -> bool:
     if not ((direction == "LONG" and is_bull(c)) or (direction == "SHORT" and is_bear(c))):
         return False
     r = ratios(c)
@@ -127,15 +162,14 @@ def candle_shape_ok(c: dict, direction: str, *, macro: bool, four_bar: bool = Fa
         return (body + eps >= FOUR_HOUR_BODY_MIN
                 and upper <= FOUR_HOUR_EACH_WICK_MAX + eps
                 and lower <= FOUR_HOUR_EACH_WICK_MAX + eps)
-    if four_bar:
-        return (body + eps >= FOUR_BAR_BODY_MIN
-                and upper <= FOUR_BAR_EACH_WICK_MAX + eps
-                and lower <= FOUR_BAR_EACH_WICK_MAX + eps)
     return (body + eps >= FIFTEEN_MIN_BODY_MIN
             and upper <= FIFTEEN_MIN_EACH_WICK_MAX + eps
             and lower <= FIFTEEN_MIN_EACH_WICK_MAX + eps
             and upper + lower <= FIFTEEN_MIN_WICKS_SUM_MAX + eps)
+
+
 def average_true_range(candles: list[dict], count: int = ATR_PERIOD) -> Optional[float]:
+    # Manteniamo ESATTAMENTE il calcolo ATR del codice 4H/1H originale.
     if len(candles) < count + 1:
         return None
     chosen = candles[-(count + 1):]
@@ -146,7 +180,10 @@ def average_true_range(candles: list[dict], count: int = ATR_PERIOD) -> Optional
                       abs(current["l"] - prev["c"])))
     value = sum(tr) / len(tr)
     return value if value > 0 else None
+
+
 def volume_ratio(history: list[dict], target_index: int) -> Optional[float]:
+    # Volume 4H/1H: mediana delle precedenti 20 chiuse (NON toccare).
     start = target_index - VOLUME_LOOKBACK
     if start < 0:
         return None
@@ -154,6 +191,8 @@ def volume_ratio(history: list[dict], target_index: int) -> Optional[float]:
     if base <= 0:
         return None
     return float(history[target_index]["v"]) / base
+
+
 def aggregate_closed(candles_15m: list[dict], period_ms: int) -> list[dict]:
     count = period_ms // FIFTEEN_MIN_MS
     groups: dict[int, list[dict]] = defaultdict(list)
@@ -172,6 +211,8 @@ def aggregate_closed(candles_15m: list[dict], period_ms: int) -> list[dict]:
             "c": bars[-1]["c"], "v": sum(b["v"] for b in bars),
         })
     return result
+
+
 def btc_regime(btc_15m: list[dict], close_time: int) -> str:
     hourly = [b for b in aggregate_closed(btc_15m, ONE_HOUR_MS)
               if b["t"] + ONE_HOUR_MS <= close_time]
@@ -198,12 +239,114 @@ def btc_regime(btc_15m: list[dict], close_time: int) -> str:
     if new_hi <= old_hi and last_close <= mid:
         return "LATERALE_RIBASSISTA"
     return "INCERTO"
+
+
 def btc_compatible(bias: str, direction: str, symbol: str) -> bool:
     if symbol == "BTCUSDT":
         return True
     favorable = ({"DIREZIONALE_RIALZISTA", "LATERALE_RIALZISTA"} if direction == "LONG"
                  else {"DIREZIONALE_RIBASSISTA", "LATERALE_RIBASSISTA"})
     return bias in favorable
+
+
+# Indicatori M15 indipendenti, con smoothing Wilder come ta.rsi/ta.atr di TradingView.
+def ema_series(closes: list[float], period: int) -> list[float]:
+    if not closes:
+        return []
+    alpha = 2.0 / (period + 1.0)
+    result = [closes[0]]
+    for close in closes[1:]:
+        result.append(alpha * close + (1.0 - alpha) * result[-1])
+    return result
+
+
+def rsi_series(closes: list[float], period: int) -> list[Optional[float]]:
+    result: list[Optional[float]] = [None] * len(closes)
+    if len(closes) <= period:
+        return result
+    changes = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+    avg_up = sum(max(d, 0.0) for d in changes[:period]) / period
+    avg_down = sum(max(-d, 0.0) for d in changes[:period]) / period
+
+    def value(up: float, down: float) -> float:
+        if down == 0:
+            return 100.0 if up > 0 else 50.0
+        if up == 0:
+            return 0.0
+        rs = up / down
+        return 100.0 - 100.0 / (1.0 + rs)
+
+    result[period] = value(avg_up, avg_down)
+    for i in range(period + 1, len(closes)):
+        change = changes[i - 1]
+        avg_up = (avg_up * (period - 1) + max(change, 0.0)) / period
+        avg_down = (avg_down * (period - 1) + max(-change, 0.0)) / period
+        result[i] = value(avg_up, avg_down)
+    return result
+
+
+def atr_wilder_last(candles: list[dict], period: int) -> Optional[float]:
+    if len(candles) < period:
+        return None
+    tr = [float(candles[0]["h"] - candles[0]["l"])]
+    for before, current in zip(candles[:-1], candles[1:]):
+        tr.append(max(current["h"] - current["l"],
+                      abs(current["h"] - before["c"]),
+                      abs(current["l"] - before["c"])))
+    average = sum(tr[:period]) / period
+    for item in tr[period:]:
+        average = (average * (period - 1) + item) / period
+    return average if average > 0 else None
+
+
+def evaluate_m15(symbol: str, candles: list[dict]) -> Optional[dict]:
+    """Valuta SOLO l'ultima candela M15 gia' chiusa; nessun segnale retroattivo."""
+    if symbol not in M15_SYMBOLS or len(candles) < M15_EMA_PERIOD + 1:
+        return None
+    bar = candles[-1]
+    closes = [float(c["c"]) for c in candles]
+    ema200 = ema_series(closes, M15_EMA_PERIOD)[-1]
+    rsi = rsi_series(closes, M15_RSI_PERIOD)
+    current_rsi = rsi[-1]
+    past5 = rsi[-(M15_RSI_RESET_BARS + 1):-1]
+    if current_rsi is None or any(v is None for v in past5):
+        return None
+    previous6 = candles[-(M15_BREAKOUT_BARS + 1):-1]
+    vol_sma20 = sum(float(c["v"]) for c in candles[-M15_VOLUME_PERIOD:]) / M15_VOLUME_PERIOD
+    if vol_sma20 <= 0 or not bar["v"] > vol_sma20 * M15_VOLUME_MULTIPLIER:
+        return None
+    direction: Optional[str] = None
+    level: Optional[float] = None
+    if (bar["c"] > ema200 and min(past5) < M15_RSI_LONG_RESET
+            and current_rsi > M15_RSI_LONG_CONFIRM
+            and bar["c"] > max(c["h"] for c in previous6)):
+        direction = "LONG"
+        level = max(c["h"] for c in previous6)
+    elif (bar["c"] < ema200 and max(past5) > M15_RSI_SHORT_RESET
+          and current_rsi < M15_RSI_SHORT_CONFIRM
+          and bar["c"] < min(c["l"] for c in previous6)):
+        direction = "SHORT"
+        level = min(c["l"] for c in previous6)
+    if direction is None or level is None:
+        return None
+    atr = atr_wilder_last(candles, M15_ATR_PERIOD)
+    if atr is None:
+        return None
+    entry = float(bar["c"])
+    sign = 1 if direction == "LONG" else -1
+    sl = entry - sign * M15_SL_ATR_MULTIPLIER * atr
+    targets = [entry * (1 + sign * p) for p in M15_TAKE_PROFITS_PERCENT]
+    return {
+        "symbol": symbol, "direction": direction, "mode": "EMA200 + RSI7 + BREAKOUT6",
+        "timeframe": "M15", "entry": entry, "sl": sl,
+        "tp1": targets[0], "tp2": targets[1], "tp3": targets[2],
+        "volume_ratio": float(bar["v"]) / vol_sma20,
+        "level": level, "confirm_time": bar["t"] + FIFTEEN_MIN_MS,
+        "breakout_time": bar["t"] + FIFTEEN_MIN_MS,
+        "ema200": ema200, "rsi7": current_rsi, "atr15": atr,
+    }
+
+
 @dataclass
 class Breakout:
     symbol: str
@@ -216,6 +359,8 @@ class Breakout:
     touched_at: int = 0
     sent: bool = False
     direct_valid: bool = True
+
+
 def detect_breakout(symbol: str, candles_15m: list[dict], close_time: int) -> Optional[Breakout]:
     macro = aggregate_closed(candles_15m, FOUR_HOURS_MS)
     if not macro or macro[-1]["t"] + FOUR_HOURS_MS != close_time:
@@ -239,18 +384,19 @@ def detect_breakout(symbol: str, candles_15m: list[dict], close_time: int) -> Op
         return None
     sl = level - SL_BUFFER_ATR4H * atr if direction == "LONG" else level + SL_BUFFER_ATR4H * atr
     return Breakout(symbol, direction, last["t"], close_time, level, atr, sl)
-def detect_breakout_1h(symbol: str, candles_15m: list[dict], close_time: int,
-                       *, lookback: int = ONE_HOUR_LOOKBACK) -> Optional[Breakout]:
+
+
+def detect_breakout_1h(symbol: str, candles_15m: list[dict], close_time: int) -> Optional[Breakout]:
     hourly = aggregate_closed(candles_15m, ONE_HOUR_MS)
     if not hourly or hourly[-1]["t"] + ONE_HOUR_MS != close_time:
         return None
-    if len(hourly) < max(lookback + 1, ATR_PERIOD + 2):
+    if len(hourly) < max(ONE_HOUR_LOOKBACK + 1, ATR_PERIOD + 2):
         return None
     last, prior = hourly[-1], hourly[:-1]
     atr = average_true_range(prior)
     if atr is None:
         return None
-    levels = prior[-lookback:]
+    levels = prior[-ONE_HOUR_LOOKBACK:]
     high, low = max(c["h"] for c in levels), min(c["l"] for c in levels)
     if last["c"] > high:
         direction, level = "LONG", high
@@ -264,36 +410,42 @@ def detect_breakout_1h(symbol: str, candles_15m: list[dict], close_time: int,
           else level + SL_BUFFER_ATR1H * atr)
     # Campo atr4h riutilizzato nel setup 1H con il valore ATR1H.
     return Breakout(symbol, direction, last["t"], close_time, level, atr, sl)
+
+
 def evaluate_entry_1h(setup: Breakout, candles: list[dict], btc_bias: str,
-                      close_time: int, *, four_bar: bool = False) -> tuple[Optional[dict], bool]:
+                      close_time: int) -> tuple[Optional[dict], bool]:
     # Stessa logica 15m/volumi/tempi/retest della strategia 4H, ma livelli 1H.
-    out, expired = evaluate_entry(setup, candles, btc_bias, close_time, four_bar=four_bar)
+    out, expired = evaluate_entry(setup, candles, btc_bias, close_time)
     if out:
         sign = 1 if out["direction"] == "LONG" else -1
         entry = out["entry"]
-        targets = FOUR_BAR_TAKE_PROFITS_PERCENT if four_bar else TAKE_PROFITS_1H_PERCENT
-        out.update(timeframe=FOUR_BAR_TIMEFRAME if four_bar else "1H",
-                   tp1=entry * (1 + sign * targets[0]),
-                   tp2=entry * (1 + sign * targets[1]),
-                   tp3=entry * (1 + sign * targets[2]))
+        out.update(timeframe="1H",
+                   tp1=entry * (1 + sign * TAKE_PROFITS_1H_PERCENT[0]),
+                   tp2=entry * (1 + sign * TAKE_PROFITS_1H_PERCENT[1]),
+                   tp3=entry * (1 + sign * TAKE_PROFITS_1H_PERCENT[2]))
     return out, expired
-def closed_4h_agrees(candles: list[dict], direction: str, close_time: int) -> bool:
-    end = close_time - close_time % FOUR_HOURS_MS
-    start = end - FOUR_HOURS_MS
-    last_4h = aggregate_closed([c for c in candles if start <= c["t"] < end], FOUR_HOURS_MS)
-    return bool(last_4h and candle_shape_ok(last_4h[0], direction, macro=True))
+
+
 def beyond_level(price: float, direction: str, level: float) -> bool:
     return price > level if direction == "LONG" else price < level
+
+
 def touched_level(bar: dict, level: float) -> bool:
     return bar["l"] <= level <= bar["h"]
+
+
 def invalidated(setup: Breakout, bar: dict) -> bool:
     return (bar["c"] <= setup.sl if setup.direction == "LONG"
             else bar["c"] >= setup.sl)
+
+
 def signal_levels(entry: float, sl: float, direction: str) -> tuple[float, float, float]:
     sign = 1 if direction == "LONG" else -1
     if (direction == "LONG" and not (sl < entry)) or (direction == "SHORT" and not (sl > entry)):
         raise ValueError("Stop Loss non dalla parte corretta dell'Entry")
     return tuple(entry * (1 + sign * value) for value in TAKE_PROFITS_PERCENT)
+
+
 def make_signal(setup: Breakout, bar: dict, mode: str, ratio: float, btc: str) -> dict:
     entry = bar["c"]
     targets = signal_levels(entry, setup.sl, setup.direction)
@@ -305,6 +457,8 @@ def make_signal(setup: Breakout, bar: dict, mode: str, ratio: float, btc: str) -
         "level": setup.level, "confirm_time": bar["t"] + FIFTEEN_MIN_MS,
         "breakout_time": setup.macro_close_ms,
     }
+
+
 def retest_excursion_exceeded(setup: Breakout, candles: list[dict], close_time: int) -> bool:
     limit = RETEST_MAX_EXCURSION_ATR4H * setup.atr4h
     return any(
@@ -313,8 +467,10 @@ def retest_excursion_exceeded(setup: Breakout, candles: list[dict], close_time: 
         for c in candles
         if setup.macro_close_ms <= c["t"] < close_time
     )
+
+
 def evaluate_entry(setup: Breakout, candles: list[dict], btc_bias: str,
-                   close_time: int, *, four_bar: bool = False) -> tuple[Optional[dict], bool]:
+                   close_time: int) -> tuple[Optional[dict], bool]:
     if setup.sent or not candles or close_time <= setup.macro_close_ms:
         return None, False
     elapsed = close_time - setup.macro_close_ms
@@ -336,11 +492,14 @@ def evaluate_entry(setup: Breakout, candles: list[dict], btc_bias: str,
     closed_beyond = beyond_level(bar["c"], direction, level)
     if not closed_beyond:
         setup.direct_valid = False
-    strong = closed_beyond and candle_shape_ok(bar, direction, macro=False, four_bar=four_bar)
+    # Evita errori se un breakout troppo esteso colloca lo SL strutturale
+    # dalla parte sbagliata dell'entry. L'originale sollevava ValueError.
+    if (direction == "LONG" and setup.sl >= bar["c"]) or (direction == "SHORT" and setup.sl <= bar["c"]):
+        return None, False
+    strong = closed_beyond and candle_shape_ok(bar, direction, macro=False)
     if setup.touched_at:
-        bounce_min = FOUR_BAR_RETEST_BOUNCE_VOLUME_MIN if four_bar else RETEST_BOUNCE_VOLUME_MIN
         if (close_time > setup.touched_at + FIFTEEN_MIN_MS and strong
-                and ratio > bounce_min
+                and ratio > RETEST_BOUNCE_VOLUME_MIN
                 and btc_compatible(btc_bias, direction, setup.symbol)):
             return make_signal(setup, bar, "RETEST", ratio, btc_bias), False
         return None, False
@@ -351,12 +510,16 @@ def evaluate_entry(setup: Breakout, candles: list[dict], btc_bias: str,
             and btc_compatible(btc_bias, direction, setup.symbol)):
         return make_signal(setup, bar, "BREAKOUT DIRETTO", ratio, btc_bias), False
     return None, False
+
+
 def load_state() -> dict:
     try:
         data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
         return data if isinstance(data, dict) else {}
     except (OSError, ValueError):
         return {}
+
+
 def save_state(data: dict) -> None:
     try:
         STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -365,6 +528,8 @@ def save_state(data: dict) -> None:
         os.replace(tmp, STATE_PATH)
     except OSError as exc:
         log.error("Impossibile salvare stato: %s", exc)
+
+
 def telegram_send(message: str, *, tries: int = 3) -> bool:
     if not TOKEN or not CHAT_ID:
         log.warning("Telegram non configurato: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID mancanti")
@@ -389,14 +554,28 @@ def telegram_send(message: str, *, tries: int = 3) -> bool:
         if i + 1 < tries:
             time.sleep(2 * (i + 1))
     return False
+
+
 def format_signal(s: dict) -> str:
     emoji = "🟢" if s["direction"] == "LONG" else "🔴"
     sym = s["symbol"].removesuffix("USDT") + "/USDT"
     when = datetime.fromtimestamp(s["confirm_time"] / 1000, ROME).strftime("%d/%m/%Y %H:%M")
     tf = s.get("timeframe", "4H")
-    labels = ("0.50", "2", "3") if tf == "1H" else ("2", "4", "6")
-    if tf == FOUR_BAR_TIMEFRAME:
-        labels = tuple(f"{value * 100:.2f}" for value in FOUR_BAR_TAKE_PROFITS_PERCENT)
+    if tf == "M15":
+        return (
+            f"{emoji} {s['direction']} | {sym} | M15 | {s['mode']}\n\n"
+            f"Entry: {price_string(s['entry'])}\n"
+            f"Stop Loss: {price_string(s['sl'])} (1.50 ATR15)\n"
+            f"TP1: {price_string(s['tp1'])} (+/-0.40%)\n"
+            f"TP2: {price_string(s['tp2'])} (+/-0.70%)\n"
+            f"TP3: {price_string(s['tp3'])} (+/-1.00%)\n\n"
+            f"Volume M15 / SMA20: {s['volume_ratio']:.2f}x\n"
+            f"RSI7: {s['rsi7']:.2f} | EMA200: {price_string(s['ema200'])}\n"
+            f"Livello M15: {price_string(s['level'])}\n"
+            f"Orario: {when} (Roma)\n"
+            "SOLO SEGNALE - nessun ordine automatico"
+        )
+    labels = ("0.50", "1.00", "1.50") if tf == "1H" else ("2", "4", "6")
     return (
         f"{emoji} {s['direction']} | {sym} | {tf} | {s['mode']}\n\n"
         f"Entry: {price_string(s['entry'])}\n"
@@ -410,10 +589,12 @@ def format_signal(s: dict) -> str:
         f"Orario: {when} (Roma)\n"
         "SOLO SEGNALE - nessun ordine automatico"
     )
+
 class BinanceREST:
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.last = 0.0
+
     def get(self, path: str, params: Optional[dict] = None) -> dict | list:
         for attempt in range(4):
             with self.lock:
@@ -436,6 +617,7 @@ class BinanceREST:
                 if attempt < 3:
                     time.sleep(min(12, 2 ** (attempt + 1)))
         raise RuntimeError(f"REST Binance non disponibile: {path}")
+
     def active_perpetuals(self) -> set[str]:
         result = self.get("/fapi/v1/exchangeInfo")
         return {
@@ -443,6 +625,7 @@ class BinanceREST:
             if s.get("status") == "TRADING" and s.get("quoteAsset") == "USDT"
             and s.get("contractType") == "PERPETUAL"
         }
+
     def recent_bars(self, symbol: str, limit: int) -> list[dict]:
         rows = self.get("/fapi/v1/klines", {"symbol": symbol, "interval": "15m", "limit": limit})
         current_ms = now_ms()
@@ -450,6 +633,8 @@ class BinanceREST:
             "t": int(c[0]), "o": float(c[1]), "h": float(c[2]),
             "l": float(c[3]), "c": float(c[4]), "v": float(c[5]),
         } for c in rows if int(c[0]) + FIFTEEN_MIN_MS <= current_ms]
+
+
 class SignalEngine:
     def __init__(self) -> None:
         self.rest = BinanceREST()
@@ -467,21 +652,67 @@ class SignalEngine:
         self.scan_errors = 0
         self.setups: dict[str, Breakout] = {}
         self.setups_1h: dict[str, Breakout] = {}
-        self.setups_1h_four_bar: dict[str, Breakout] = {}
-        self.last_regular_signal: dict[tuple[str, str], int] = {}
         self.pending: dict[str, tuple[int, float, float]] = {}
         self.events: queue.Queue[tuple[str, dict]] = queue.Queue(maxsize=4096)
         self.state = load_state()
         self.sent = set(self.state.get("sent", []))
+        self.sent_slots: set[str] = set(self.state.get("sent_slots", []))
+        self.m15_last_signal_bar: dict[str, int] = {
+            str(k): int(v) for k, v in self.state.get("m15_last_signal_bar", {}).items()
+        }
         self.outbox: dict[str, dict] = dict(self.state.get("outbox", {}))
+        # Migrazione coda vecchia: niente 1H-4C pendenti, niente due messaggi
+        # dello stesso simbolo/istante ancora in coda dal deploy precedente.
+        rank = {"4H": 0, "1H": 1, "M15": 2}
+        selected: dict[str, tuple[str, dict]] = {}
+        for old_key, payload in self.outbox.items():
+            if not isinstance(payload, dict):
+                continue
+            tf = payload.get("timeframe", "4H")
+            if tf not in rank or not {"symbol", "confirm_time"}.issubset(payload):
+                continue
+            slot = f"{payload['confirm_time']}:{payload['symbol']}"
+            prior = selected.get(slot)
+            if prior is None or rank[tf] < rank[prior[1].get("timeframe", "4H")]:
+                selected[slot] = (old_key, payload)
+        cleaned = {key: data for key, data in selected.values()}
+        if len(cleaned) < len(self.outbox):
+            log.info("Coda ripulita: %d vecchi segnali duplicati/1H-4C rimossi",
+                     len(self.outbox) - len(cleaned))
+        self.outbox = cleaned
+        self.sent_slots.update(selected)
         self.ws_last_message = 0.0
         self.ws = None
         self.last_recovery = defaultdict(float)
+
     def persist(self) -> None:
         recent = sorted(self.sent)[-5000:]
         self.state["sent"] = recent
+        self.state["sent_slots"] = sorted(self.sent_slots)[-5000:]
+        self.state["m15_last_signal_bar"] = self.m15_last_signal_bar
         self.state["outbox"] = self.outbox
         save_state(self.state)
+
+    def enqueue_unique(self, key: str, payload: dict) -> bool:
+        """Accoda al massimo 1 segnale per coppia e chiusura M15.
+
+        Chiamata dal singolo event_loop in ordine di priorita': 4H, 1H, M15.
+        Salva lo slot prima del thread Telegram e sopravvive ai riavvii SE
+        STATE_FILE punta a uno storage persistente.
+        """
+        slot = f"{payload['confirm_time']}:{payload['symbol']}"
+        if slot in self.sent_slots:
+            log.info("DUPLICATO SOPPRESSO %s %s: esiste gia' segnale alle %s",
+                     payload["symbol"], payload.get("timeframe", "4H"), payload["confirm_time"])
+            return False
+        if key in self.sent:
+            return False
+        self.sent.add(key)
+        self.sent_slots.add(slot)
+        self.outbox[key] = payload
+        self.persist()
+        return True
+
     def initialize(self) -> None:
         tradable = self.rest.active_perpetuals()
         self.active_symbols = [s for s in SYMBOLS if s in tradable]
@@ -518,15 +749,19 @@ class SignalEngine:
             "15m DIRETTO volume >=1.50x | RETEST tocco <1.00x + ripartenza >1.00x\n"
             "DIRETTO max 4 candele 15m (1h) | RETEST max 32 candele 15m (8h)\n"
             "RETEST annullato se il prezzo avanza oltre 1.00 ATR4H dal livello rotto\n"
-            "BTC1H favorevole/laterale | SL livello 4H +/-0.50 ATR4H\n"
-            "TP fissi 2% / 4% / 6% dall'Entry | nessun ordine automatico\n"
-            "NUOVA 1H: breakout 48 candele 1H (48h), conferma 15m | SL 0.35 ATR1H\n"
-            "1H TP dall'Entry: 0.50% / 2% / 3% | DIRETTO 1h, RETEST 8h"
+            "BTC1H favorevole/laterale | SL livello 4H +/-1.00 ATR4H\n"
+            "4H TP fissi 2% / 4% / 6% dall'Entry | nessun ordine automatico\n"
+            "1H: breakout 48 candele 1H (48h), conferma 15m | SL livello +/-1.00 ATR1H\n"
+            "1H TP dall'Entry: 0.50% / 1.00% / 1.50% | DIRETTO 1h, RETEST 8h\n"
+            "M15 BTC/ETH/SOL/BNB/XRP: EMA200 RSI7 breakout6, vol>SMA20*1.2\n"
+            "M15 SL 1.50 ATR15, TP 0.40% / 0.70% / 1.00%, cooldown 8 barre per direzione\n"
+            "ANTIDUPLICATI: 4H > 1H > M15, una notifica per coppia e chiusura 15m"
         )
         log.info("%s", status)
-        log.info("Ramo %s attivo: breakout 4 candele 1H, direzione 4H chiusa, conferma 15m", FOUR_BAR_TIMEFRAME)
+
     def recent(self, symbol: str) -> list[dict]:
         return [v for _, v in sorted(self.bars.get(symbol, {}).items())]
+
     def merge(self, symbol: str, additions: list[dict]) -> None:
         bucket = self.bars.setdefault(symbol, {})
         for c in additions:
@@ -534,16 +769,19 @@ class SignalEngine:
         if len(bucket) > HISTORY_LIMIT:
             for old in sorted(bucket)[:-HISTORY_LIMIT]:
                 bucket.pop(old, None)
+
     def websocket_loop(self) -> None:
         retry = 1
         while self.running.is_set():
             streams = "/".join(s.lower() + "@kline_15m" for s in self.active_symbols)
             url = BASE_WS + streams
+
             def on_open(_ws):
                 nonlocal retry
                 retry = 1
                 self.ws_last_message = time.monotonic()
                 log.info("WebSocket Binance connesso: %s stream 15m", len(self.active_symbols))
+
             def on_message(_ws, raw):
                 self.ws_last_message = time.monotonic()
                 try:
@@ -568,10 +806,13 @@ class SignalEngine:
                         log.error("Coda eventi piena: %s, necessaria ottimizzazione", sym)
                 except (KeyError, ValueError, TypeError, json.JSONDecodeError) as exc:
                     log.warning("Evento WS non valido: %s", exc)
+
             def on_error(_ws, error):
                 log.warning("WebSocket errore: %s", error)
+
             def on_close(_ws, code, message):
                 log.warning("WebSocket chiuso: %s %s", code, message)
+
             try:
                 self.ws = websocket.WebSocketApp(
                     url, on_open=on_open, on_message=on_message,
@@ -583,6 +824,7 @@ class SignalEngine:
             if self.running.is_set():
                 time.sleep(retry)
                 retry = min(retry * 2, 30)
+
     def fallback_loop(self) -> None:
         while self.running.is_set():
             t = now_ms()
@@ -612,6 +854,7 @@ class SignalEngine:
                     except Exception as exc:
                         log.warning("Fallback REST %s: %s", sym, exc)
             time.sleep(4)
+
     def schedule(self, symbol: str, bar_t: int) -> None:
         with self.lock:
             if bar_t <= self.last_processed.get(symbol, -1):
@@ -622,11 +865,14 @@ class SignalEngine:
                     bar_t, time.monotonic() + EVENT_DEBOUNCE_SECONDS,
                     time.monotonic() + EVENT_MAX_RETRY_SECONDS,
                 )
+
     def apply_new_close(self, sym: str, bar: dict) -> None:
         with self.lock:
             self.merge(sym, [bar])
         self.schedule(sym, bar["t"])
+
     def process(self, symbol: str, bar_t: int) -> bool:
+        """Ramo 4H: primo nell'ordine di priorita'."""
         close_t = bar_t + FIFTEEN_MIN_MS
         with self.lock:
             history = self.recent(symbol)
@@ -664,17 +910,16 @@ class SignalEngine:
                 self.setups.pop(symbol, None)
                 return True
             if out:
-                self.sent.add(dedup_key)
-                self.outbox[dedup_key] = out
-                self.persist()
-                self.last_regular_signal[(symbol, out["direction"])] = close_t
+                # 4H ha priorita' su 1H/M15 per stesso simbolo e stesso close_t.
+                accepted = self.enqueue_unique(dedup_key, out)
                 self.setups.pop(symbol, None)
-            else:
-                return True
-        log.info("SEGNALE IN CODA %s %s %s: volume %.2fx BTC %s",
-                 symbol, out["direction"], out["mode"], out["volume_ratio"], out["btc"])
-        return True
+                if accepted:
+                    log.info("SEGNALE IN CODA %s %s %s: volume %.2fx BTC %s",
+                             symbol, out["direction"], out["mode"], out["volume_ratio"], out["btc"])
+            return True
+
     def process_1h(self, symbol: str, bar_t: int) -> None:
+        """Ramo 1H 48h: secondo nell'ordine di priorita'."""
         close_t = bar_t + FIFTEEN_MIN_MS
         with self.lock:
             history = self.recent(symbol)
@@ -706,54 +951,39 @@ class SignalEngine:
                 self.setups_1h.pop(symbol, None)
                 return
             if out:
-                self.sent.add(key)
-                self.outbox[key] = out
-                self.persist()
-                self.last_regular_signal[(symbol, out["direction"])] = close_t
+                accepted = self.enqueue_unique(key, out)
+                # Se duplicato con 4H, consuma il setup: non lo rimanda 15m dopo.
                 self.setups_1h.pop(symbol, None)
-            else:
-                return
-        log.info("SEGNALE 1H IN CODA %s %s %s volume %.2fx BTC %s",
-                 symbol, out["direction"], out["mode"], out["volume_ratio"], out["btc"])
-    def process_1h_four_bar(self, symbol: str, bar_t: int) -> None:
+                if accepted:
+                    log.info("SEGNALE 1H IN CODA %s %s %s volume %.2fx BTC %s",
+                             symbol, out["direction"], out["mode"], out["volume_ratio"], out["btc"])
+
+    def process_m15(self, symbol: str, bar_t: int) -> None:
+        """M15 indipendente, terza priorita', solo BTC ETH SOL BNB XRP."""
+        if symbol not in M15_SYMBOLS:
+            return
         close_t = bar_t + FIFTEEN_MIN_MS
         with self.lock:
             history = self.recent(symbol)
             if not history or history[-1]["t"] != bar_t:
                 return
-            setup = self.setups_1h_four_bar.get(symbol)
-            if setup and close_t - setup.macro_close_ms > RETEST_LIFETIME_MS:
-                self.setups_1h_four_bar.pop(symbol)
-                setup = None
-            if setup is None and close_t % ONE_HOUR_MS == 0:
-                candidate = detect_breakout_1h(
-                    symbol, history, close_t, lookback=ONE_HOUR_FOUR_BAR_LOOKBACK,
-                )
-                if candidate and closed_4h_agrees(history, candidate.direction, close_t):
-                    self.setups_1h_four_bar[symbol] = setup = candidate
-                    log.info("BREAKOUT %s %s %s livello %s", FOUR_BAR_TIMEFRAME,
-                             symbol, setup.direction, price_string(setup.level))
-            if setup is None:
+            slot = f"{close_t}:{symbol}"
+            if slot in self.sent_slots:
                 return
-            key = f"{FOUR_BAR_TIMEFRAME}:{symbol}:{setup.macro_close_ms}"
-            if key in self.sent:
-                self.setups_1h_four_bar.pop(symbol)
+            out = evaluate_m15(symbol, history)
+            if not out:
                 return
-            bias = btc_regime(self.recent("BTCUSDT"), close_t)
-            out, expired = evaluate_entry_1h(setup, history, bias, close_t, four_bar=True)
-            if expired:
-                self.setups_1h_four_bar.pop(symbol)
+            cooldown_key = f"{symbol}:{out['direction']}"
+            prior_bar = self.m15_last_signal_bar.get(cooldown_key)
+            if prior_bar is not None and (bar_t - prior_bar) < M15_COOLDOWN_BARS * FIFTEEN_MIN_MS:
                 return
-            if not out or not closed_4h_agrees(history, setup.direction, close_t):
-                return
-            self.setups_1h_four_bar.pop(symbol)
-            if self.last_regular_signal.get((symbol, setup.direction)) == close_t:
-                return
-            self.sent.add(key)
-            self.outbox[key] = out
-            self.persist()
-        log.info("SEGNALE %s IN CODA %s %s %s volume %.2fx BTC %s",
-                 FOUR_BAR_TIMEFRAME, symbol, out["direction"], out["mode"], out["volume_ratio"], out["btc"])
+            key = f"M15:{symbol}:{close_t}"
+            if self.enqueue_unique(key, out):
+                self.m15_last_signal_bar[cooldown_key] = bar_t
+                self.persist()
+                log.info("SEGNALE M15 IN CODA %s %s RSI %.2f volume %.2fx",
+                         symbol, out["direction"], out["rsi7"], out["volume_ratio"])
+
     def telegram_loop(self) -> None:
         while self.running.is_set():
             with self.lock:
@@ -770,6 +1000,7 @@ class SignalEngine:
             else:
                 log.error("Telegram in attesa di nuovo invio: %s", key)
                 time.sleep(12)
+
     def event_loop(self) -> None:
         last_health = time.monotonic()
         while self.running.is_set():
@@ -791,10 +1022,12 @@ class SignalEngine:
                     finished = self.process(sym, bar_t)
                     if finished:
                         self.process_1h(sym, bar_t)
-                        try:
-                            self.process_1h_four_bar(sym, bar_t)
-                        except Exception:
-                            log.exception("Errore scansione %s %s", FOUR_BAR_TIMEFRAME, sym)
+                        self.process_m15(sym, bar_t)
+                    elif time.monotonic() >= deadline:
+                        # Il ramo M15 non dipende dal filtro BTC1H. Se il BTC
+                        # non risponde entro la scadenza, valutiamo comunque M15.
+                        # Nessun segnale macro puo' essere validato senza BTC.
+                        self.process_m15(sym, bar_t)
                 except Exception:
                     self.scan_errors += 1
                     self.checked_15m.pop(sym, None)
@@ -822,8 +1055,9 @@ class SignalEngine:
                              time.monotonic() - self.ws_last_message if self.ws_last_message else -1)
                     hour_end = (now_ms() // ONE_HOUR_MS) * ONE_HOUR_MS
                     checked_1h = sum(self.checked_1h.get(s) == hour_end for s in self.active_symbols)
-                    log.info("SCAN 1H | controllate %d/%d | setup 1H %d",
+                    log.info("SCAN 1H | controllate %d/%d | setup 1H %d | M15 5 crypto attivo",
                              checked_1h, total, len(self.setups_1h))
+
     def stop(self, *_args) -> None:
         log.info("Interruzione richiesta")
         self.running.clear()
@@ -832,6 +1066,7 @@ class SignalEngine:
                 self.ws.close()
             except Exception:
                 pass
+
     def run(self) -> None:
         self.initialize()
         signal.signal(signal.SIGTERM, self.stop)
@@ -843,11 +1078,16 @@ class SignalEngine:
         backup.start()
         sender.start()
         self.event_loop()
+
+
 def main() -> None:
-    log.info("AVVIO %s V%s: 60 crypto; 4H 6 candele; scan EVENT-DRIVEN; BTC1H", BOT_NAME, BOT_VERSION)
+    log.info("AVVIO %s V%s: 60 crypto; 4H + 1H-48h + M15(5); scan EVENT-DRIVEN; BTC1H",
+             BOT_NAME, BOT_VERSION)
     if not TOKEN or not CHAT_ID:
         raise RuntimeError("Imposta TELEGRAM_BOT_TOKEN e TELEGRAM_CHAT_ID nelle Variables di Railway")
     engine = SignalEngine()
     engine.run()
+
+
 if __name__ == "__main__":
     main()
