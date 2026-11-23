@@ -42,7 +42,7 @@ assert len(SYMBOLS) == 60 and len(set(SYMBOLS)) == 60
 M15_SYMBOLS = {"BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"}
 assert M15_SYMBOLS <= set(SYMBOLS)
 BOT_NAME = "MOMENTUM 4H 60"
-BOT_VERSION = "1.6"
+BOT_VERSION = "1.8"
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
@@ -74,16 +74,18 @@ DIRECT_LIFETIME_HOURS = 1
 RETEST_LIFETIME_HOURS = 8
 RETEST_MAX_EXCURSION_ATR4H = 1.00
 
-# M15 indipendente: breakout di 6 barre CHIUSE, SOLO retest, BTC 15m.
+# M15 indipendente: breakout di 24 barre CHIUSE, SOLO retest, BTC 15m.
 # Nessun EMA/RSI, nessun filtro volume sulla candela di breakout.
-M15_BREAKOUT_BARS = 6
+M15_BREAKOUT_BARS = 24
 M15_VOLUME_LOOKBACK = 20     # Mediana delle 20 barre precedenti, esclusa l'attuale.
 M15_RETEST_TOUCH_VOLUME_MAX = 1.00   # Strettamente inferiore.
 M15_RETEST_BOUNCE_VOLUME_MIN = 1.00  # Strettamente superiore.
 M15_BOUNCE_BODY_MIN = 0.60
-M15_BOUNCE_EACH_WICK_MAX = 0.20  # 20% PER LATO, non 20% totale.
-M15_RETEST_LIFETIME_BARS = 8    # 2 ore dalla chiusura del breakout.
+M15_BOUNCE_EACH_WICK_MAX = 0.20  # 20% massimo per ciascun lato: corpo 60% realmente consentito.
+M15_RETEST_LIFETIME_BARS = 16   # 4 ore dalla chiusura del breakout.
 M15_RETEST_MAX_EXCURSION_ATR = 1.00
+# Invalida i setup M15 precedenti al cambio delle condizioni (anche su volume persistente).
+M15_SETUP_STRATEGY_VERSION = "BREAKOUT24_RETEST16_WICK020"
 M15_ATR_PERIOD = 14
 M15_SL_ATR_MULTIPLIER = 1.50
 M15_TAKE_PROFITS_PERCENT = (0.004, 0.007, 0.01)
@@ -304,16 +306,23 @@ class M15RetestSetup:
 
 
 def detect_m15_breakout(symbol: str, candles: list[dict]) -> Optional[M15RetestSetup]:
-    """Breakout chiuso oltre il livello delle 6 PRECEDENTI, SENZA volume/EMA/RSI.
+    """Breakout chiuso oltre il livello delle 24 PRECEDENTI, SENZA volume/EMA/RSI.
 
     Il breakout crea soltanto un setup: NON invia un segnale diretto.
     """
-    if symbol not in M15_SYMBOLS or len(candles) < max(M15_VOLUME_LOOKBACK + 1, M15_ATR_PERIOD + 1):
+    required = max(M15_BREAKOUT_BARS + 1, M15_VOLUME_LOOKBACK + 1,
+                   M15_ATR_PERIOD + 1)
+    if symbol not in M15_SYMBOLS or len(candles) < required:
         return None
     bar = candles[-1]
-    past6 = candles[-(M15_BREAKOUT_BARS + 1):-1]
-    top = max(c["h"] for c in past6)
-    bottom = min(c["l"] for c in past6)
+    previous_bars = candles[-(M15_BREAKOUT_BARS + 1):-1]
+    # Servono esattamente 24 M15 chiuse consecutive prima della rottura.
+    if (previous_bars[-1]["t"] + FIFTEEN_MIN_MS != bar["t"]
+            or any(previous_bars[i + 1]["t"] != previous_bars[i]["t"] + FIFTEEN_MIN_MS
+                   for i in range(len(previous_bars) - 1))):
+        return None
+    top = max(c["h"] for c in previous_bars)
+    bottom = min(c["l"] for c in previous_bars)
     if bar["c"] > top:
         direction, level = "LONG", top
     elif bar["c"] < bottom:
@@ -323,11 +332,29 @@ def detect_m15_breakout(symbol: str, candles: list[dict]) -> Optional[M15RetestS
     atr = atr_wilder_last(candles, M15_ATR_PERIOD)
     if atr is None:
         return None
+    # Il limite di 1 ATR15 parte dalla candela che rompe il livello:
+    # anche la massima/minima escursione del breakout deve rispettarlo.
+    max_distance = M15_RETEST_MAX_EXCURSION_ATR * atr
+    if direction == "LONG" and bar["h"] > level + max_distance:
+        return None
+    if direction == "SHORT" and bar["l"] < level - max_distance:
+        return None
     return M15RetestSetup(symbol, direction, level, bar["t"] + FIFTEEN_MIN_MS, atr)
 
 
+def m15_volume_ratio(history: list[dict], target_index: int) -> Optional[float]:
+    """Mediana delle 20 M15 precedenti, separata dai parametri macro."""
+    start = target_index - M15_VOLUME_LOOKBACK
+    if start < 0:
+        return None
+    base = median(float(c["v"]) for c in history[start:target_index])
+    if base <= 0:
+        return None
+    return float(history[target_index]["v"]) / base
+
+
 def m15_bounce_shape_ok(bar: dict, direction: str) -> bool:
-    """Corpo >=60%, wick superiore <=20%, wick inferiore <=20%."""
+    """Corpo >=60%, wick superiore e inferiore <=20% ciascuna."""
     if not ((direction == "LONG" and is_bull(bar)) or
             (direction == "SHORT" and is_bear(bar))):
         return False
@@ -374,7 +401,7 @@ def evaluate_m15_retest(setup: M15RetestSetup, candles: list[dict],
         return None, True
     if m15_excursion_exceeded(setup, candles):
         return None, True
-    ratio = volume_ratio(candles, len(candles) - 1)
+    ratio = m15_volume_ratio(candles, len(candles) - 1)
     if ratio is None:
         return None, False
     direction, level = setup.direction, setup.level
@@ -393,7 +420,13 @@ def evaluate_m15_retest(setup: M15RetestSetup, candles: list[dict],
         return None, False
     if ratio <= M15_RETEST_BOUNCE_VOLUME_MIN:
         return None, False
-    if not btc_compatible(btc_bias, direction, setup.symbol):
+    # Nella sola M15 il BTC15m deve essere concorde anche per BTCUSDT.
+    # Non usare btc_compatible(): la funzione condivisa esenta BTCUSDT
+    # ed e' lasciata invariata per le strategie 4H e 1H.
+    favorable_btc = ({"DIREZIONALE_RIALZISTA", "LATERALE_RIALZISTA"}
+                     if direction == "LONG" else
+                     {"DIREZIONALE_RIBASSISTA", "LATERALE_RIBASSISTA"})
+    if btc_bias not in favorable_btc:
         return None, False
     atr = atr_wilder_last(candles, M15_ATR_PERIOD)
     if atr is None:
@@ -404,7 +437,7 @@ def evaluate_m15_retest(setup: M15RetestSetup, candles: list[dict],
     targets = [entry * (1 + sign * p) for p in M15_TAKE_PROFITS_PERCENT]
     return {
         "symbol": setup.symbol, "direction": direction,
-        "mode": "BREAKOUT6 + RETEST", "timeframe": "M15",
+        "mode": "BREAKOUT24 + RETEST", "timeframe": "M15",
         "entry": entry, "sl": sl,
         "tp1": targets[0], "tp2": targets[1], "tp3": targets[2],
         "volume_ratio": ratio, "level": level,
@@ -720,9 +753,16 @@ class SignalEngine:
         self.pending: dict[str, tuple[int, float, float]] = {}
         self.events: queue.Queue[tuple[str, dict]] = queue.Queue(maxsize=4096)
         self.state = load_state()
-        # Salva anche i setup M15 tra i riavvii quando STATE_FILE e' persistente.
+        # Conserva i setup M15 tra riavvii solo se appartengono alla
+        # configurazione corrente; non migrare breakout6 nella breakout24.
         self.m15_setups: dict[str, M15RetestSetup] = {}
-        for sym, raw_setup in self.state.get("m15_setups", {}).items():
+        saved_m15_setups = self.state.get("m15_setups", {})
+        if self.state.get("m15_setup_strategy_version") != M15_SETUP_STRATEGY_VERSION:
+            if saved_m15_setups:
+                log.info("Nuova strategia M15: annullati %d setup della configurazione precedente",
+                         len(saved_m15_setups))
+            saved_m15_setups = {}
+        for sym, raw_setup in saved_m15_setups.items():
             try:
                 if sym in M15_SYMBOLS and isinstance(raw_setup, dict):
                     setup = M15RetestSetup(**raw_setup)
@@ -748,7 +788,7 @@ class SignalEngine:
                 continue
             # I vecchi M15 breakout diretti non devono essere inviati
             # dopo il passaggio a M15 SOLO RETEST.
-            if tf == "M15" and payload.get("mode") != "BREAKOUT6 + RETEST":
+            if tf == "M15" and payload.get("mode") != "BREAKOUT24 + RETEST":
                 continue
             slot = f"{payload['confirm_time']}:{payload['symbol']}"
             prior = selected.get(slot)
@@ -769,6 +809,7 @@ class SignalEngine:
         self.state["sent"] = recent
         self.state["sent_slots"] = sorted(self.sent_slots)[-5000:]
         self.state["m15_last_signal_bar"] = self.m15_last_signal_bar
+        self.state["m15_setup_strategy_version"] = M15_SETUP_STRATEGY_VERSION
         self.state["m15_setups"] = {
             sym: {
                 "symbol": setup.symbol, "direction": setup.direction,
@@ -839,7 +880,7 @@ class SignalEngine:
             "4H TP fissi 2% / 4% / 6% dall'Entry | nessun ordine automatico\n"
             "1H: breakout 48 candele 1H (48h), conferma 15m | SL livello +/-1.00 ATR1H\n"
             "1H TP dall'Entry: 0.50% / 1.00% / 1.50% | DIRETTO 1h, RETEST 8h\n"
-            "M15 BTC/ETH/SOL/BNB/XRP: breakout 6x15m senza volume, SOLO RETEST entro 2h\n"
+            "M15 BTC/ETH/SOL/BNB/XRP: breakout 24x15m senza volume, SOLO RETEST entro 4h\n"
             "M15 tocco <1.00x mediana20, rimbalzo >1.00x; corpo >=60%, wick <=20% per lato\n"
             "M15 BTC15m concorde, escursione max 1 ATR15, SL 1.50 ATR15 da entry\n"
             "M15 TP 0.40% / 0.70% / 1.00%, cooldown 8 barre per direzione\n"
@@ -1047,7 +1088,7 @@ class SignalEngine:
                              symbol, out["direction"], out["mode"], out["volume_ratio"], out["btc"])
 
     def process_m15(self, symbol: str, bar_t: int) -> bool:
-        """M15: breakout6 -> tocco retest -> rimbalzo. Terza priorita'.
+        """M15: breakout24 -> tocco retest -> rimbalzo. Terza priorita'.
 
         False significa: BTC 15m non ancora chiuso/ricevuto, riprovare.
         """
