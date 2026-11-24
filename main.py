@@ -39,7 +39,8 @@ SYMBOLS = ORIGINAL_50 + ADDED_10
 assert len(SYMBOLS) == 60 and len(set(SYMBOLS)) == 60
 
 # Ramo 1H-4C eliminato. Sono attive 4H, 1H-48h e nuova M15.
-M15_SYMBOLS = {"BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"}
+M15_SYMBOLS = {"BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
+               "LINKUSDT", "AVAXUSDT", "LTCUSDT", "ADAUSDT", "DOGEUSDT"}
 assert M15_SYMBOLS <= set(SYMBOLS)
 BOT_NAME = "MOMENTUM 4H 60"
 BOT_VERSION = "1.8"
@@ -961,7 +962,7 @@ class SignalEngine:
             "4H TP fissi 2% / 4% / 6% dall'Entry | nessun ordine automatico\n"
             "1H: breakout 48 candele 1H (48h), conferma 15m | SL livello +/-1.00 ATR1H\n"
             "1H TP dall'Entry: 0.50% / 1.00% / 1.50% | DIRETTO 1h, RETEST 8h\n"
-            "M15 BTC/ETH/SOL/BNB/XRP: breakout delle 24 M15; DIRETTO oppure RETEST entro 4h\n"
+            "M15 10 crypto (BTC/ETH/SOL/BNB/XRP/LINK/AVAX/LTC/ADA/DOGE): breakout delle 24 M15; DIRETTO oppure RETEST entro 4h\n"
             "M15 DIRETTO: corpo >=70%, wick <=20% per lato, volume >1.50x mediana20, close oltre 0.20%\n"
             "M15 RETEST: tocco <1.00x, rimbalzo >1.00x mediana20; corpo >=60%, wick <=20% per lato\n"
             "M15 BTC15m concorde, escursione max 1 ATR15, SL livello rotto +/- 1 ATR15\n"
@@ -1335,7 +1336,7 @@ class SignalEngine:
                              time.monotonic() - self.ws_last_message if self.ws_last_message else -1)
                     hour_end = (now_ms() // ONE_HOUR_MS) * ONE_HOUR_MS
                     checked_1h = sum(self.checked_1h.get(s) == hour_end for s in self.active_symbols)
-                    log.info("SCAN 1H | controllate %d/%d | setup 1H %d | M15 5 crypto, setup retest %d",
+                    log.info("SCAN 1H | controllate %d/%d | setup 1H %d | M15 10 crypto, setup retest %d",
                              checked_1h, total, len(self.setups_1h), len(self.m15_setups))
 
     def stop(self, *_args) -> None:
@@ -1361,7 +1362,7 @@ class SignalEngine:
 
 
 def main() -> None:
-    log.info("AVVIO %s V%s: 60 crypto; 4H + 1H-48h + M15(5); scan EVENT-DRIVEN; BTC1H",
+    log.info("AVVIO %s V%s: 60 crypto; 4H + 1H-48h + M15(10); scan EVENT-DRIVEN; BTC1H",
              BOT_NAME, BOT_VERSION)
     if not TOKEN or not CHAT_ID:
         raise RuntimeError("Imposta TELEGRAM_BOT_TOKEN e TELEGRAM_CHAT_ID nelle Variables di Railway")
