@@ -87,7 +87,7 @@ M15_RETEST_MAX_EXCURSION_ATR = 1.00
 # Invalida i setup M15 precedenti al cambio delle condizioni (anche su volume persistente).
 M15_SETUP_STRATEGY_VERSION = "BREAKOUT24_RETEST16_WICK020"
 M15_ATR_PERIOD = 14
-M15_SL_ATR_MULTIPLIER = 1.50
+M15_SL_BUFFER_ATR_MULTIPLIER = 1.00  # Solo M15: livello rotto +/- 1 ATR15.
 M15_TAKE_PROFITS_PERCENT = (0.004, 0.007, 0.01)
 M15_COOLDOWN_BARS = 8  # Per simbolo e direzione, dall'ultimo segnale M15 inviato.
 
@@ -433,7 +433,7 @@ def evaluate_m15_retest(setup: M15RetestSetup, candles: list[dict],
         return None, False
     entry = float(bar["c"])
     sign = 1 if direction == "LONG" else -1
-    sl = entry - sign * M15_SL_ATR_MULTIPLIER * atr
+    sl = level - sign * M15_SL_BUFFER_ATR_MULTIPLIER * atr
     targets = [entry * (1 + sign * p) for p in M15_TAKE_PROFITS_PERCENT]
     return {
         "symbol": setup.symbol, "direction": direction,
@@ -882,7 +882,7 @@ class SignalEngine:
             "1H TP dall'Entry: 0.50% / 1.00% / 1.50% | DIRETTO 1h, RETEST 8h\n"
             "M15 BTC/ETH/SOL/BNB/XRP: breakout 24x15m senza volume, SOLO RETEST entro 4h\n"
             "M15 tocco <1.00x mediana20, rimbalzo >1.00x; corpo >=60%, wick <=20% per lato\n"
-            "M15 BTC15m concorde, escursione max 1 ATR15, SL 1.50 ATR15 da entry\n"
+            "M15 BTC15m concorde, escursione max 1 ATR15, SL livello rotto +/- 1 ATR15\n"
             "M15 TP 0.40% / 0.70% / 1.00%, cooldown 8 barre per direzione\n"
             "ANTIDUPLICATI: 4H > 1H > M15, una notifica per coppia e chiusura 15m"
         )
