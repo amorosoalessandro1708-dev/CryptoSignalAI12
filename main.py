@@ -74,10 +74,15 @@ DIRECT_LIFETIME_HOURS = 1
 RETEST_LIFETIME_HOURS = 8
 RETEST_MAX_EXCURSION_ATR4H = 1.00
 
-# M15 indipendente: breakout di 24 barre CHIUSE, SOLO retest, BTC 15m.
-# Nessun EMA/RSI, nessun filtro volume sulla candela di breakout.
+# M15 indipendente: breakout di 24 barre CHIUSE, DIRETTO oppure RETEST, BTC 15m.
+# Nessun EMA/RSI. Volume sul breakout richiesto SOLO per l'ingresso diretto.
 M15_BREAKOUT_BARS = 24
 M15_VOLUME_LOOKBACK = 20     # Mediana delle 20 barre precedenti, esclusa l'attuale.
+M15_DIRECT_BODY_MIN = 0.70
+M15_DIRECT_EACH_WICK_MAX = 0.20
+M15_DIRECT_WICKS_SUM_MAX = 0.30  # Con corpo >=70%, le due wick insieme <=30%.
+M15_DIRECT_VOLUME_MIN = 1.50     # Strettamente superiore alla mediana20.
+M15_DIRECT_CLOSE_BEYOND_PCT = 0.002  # >=0,20% oltre il livello delle 24 barre.
 M15_RETEST_TOUCH_VOLUME_MAX = 1.00   # Strettamente inferiore.
 M15_RETEST_BOUNCE_VOLUME_MIN = 1.00  # Strettamente superiore.
 M15_BOUNCE_BODY_MIN = 0.60
@@ -351,6 +356,81 @@ def m15_volume_ratio(history: list[dict], target_index: int) -> Optional[float]:
     if base <= 0:
         return None
     return float(history[target_index]["v"]) / base
+
+
+def m15_direct_shape_ok(bar: dict, direction: str) -> bool:
+    """Corpo >=70%; ogni wick <=20%; somma wick <=30% del range.
+
+    La somma delle wick e' necessariamente <=30% se il corpo e' >=70%,
+    ma il limite e' esplicitato per rendere controllabile la strategia.
+    """
+    if not ((direction == "LONG" and is_bull(bar)) or
+            (direction == "SHORT" and is_bear(bar))):
+        return False
+    parts = ratios(bar)
+    if parts is None:
+        return False
+    body, upper, lower = parts
+    eps = 1e-8
+    return (body + eps >= M15_DIRECT_BODY_MIN
+            and upper <= M15_DIRECT_EACH_WICK_MAX + eps
+            and lower <= M15_DIRECT_EACH_WICK_MAX + eps
+            and upper + lower <= M15_DIRECT_WICKS_SUM_MAX + eps)
+
+
+def evaluate_m15_direct(symbol: str, candles: list[dict], btc_bias: str) -> Optional[dict]:
+    """Segnale M15 DIRETTO solo alla chiusura di un breakout sulle 24 precedenti.
+
+    Regole indipendenti dal retest: nessun filtro di escursione 1 ATR del retest.
+    SL e TP sono gli stessi dell'attuale M15 retest.
+    """
+    required = max(M15_BREAKOUT_BARS + 1, M15_VOLUME_LOOKBACK + 1,
+                   M15_ATR_PERIOD + 1)
+    if symbol not in M15_SYMBOLS or len(candles) < required:
+        return None
+    bar = candles[-1]
+    previous_bars = candles[-(M15_BREAKOUT_BARS + 1):-1]
+    # Il massimo/minimo viene calcolato SOLO sulle 24 chiuse prima del breakout.
+    if (previous_bars[-1]["t"] + FIFTEEN_MIN_MS != bar["t"]
+            or any(previous_bars[i + 1]["t"] != previous_bars[i]["t"] + FIFTEEN_MIN_MS
+                   for i in range(len(previous_bars) - 1))):
+        return None
+    top = max(b["h"] for b in previous_bars)
+    bottom = min(b["l"] for b in previous_bars)
+    if bar["c"] >= top * (1 + M15_DIRECT_CLOSE_BEYOND_PCT):
+        direction, level = "LONG", top
+    elif bar["c"] <= bottom * (1 - M15_DIRECT_CLOSE_BEYOND_PCT):
+        direction, level = "SHORT", bottom
+    else:
+        return None
+    if not m15_direct_shape_ok(bar, direction):
+        return None
+    ratio = m15_volume_ratio(candles, len(candles) - 1)
+    if ratio is None or ratio <= M15_DIRECT_VOLUME_MIN:
+        return None
+    favorable_btc = ({"DIREZIONALE_RIALZISTA", "LATERALE_RIALZISTA"}
+                     if direction == "LONG" else
+                     {"DIREZIONALE_RIBASSISTA", "LATERALE_RIBASSISTA"})
+    # Concordanza obbligatoria anche quando il simbolo e' BTCUSDT.
+    if btc_bias not in favorable_btc:
+        return None
+    atr = atr_wilder_last(candles, M15_ATR_PERIOD)
+    if atr is None:
+        return None
+    entry = float(bar["c"])
+    sign = 1 if direction == "LONG" else -1
+    sl = level - sign * M15_SL_BUFFER_ATR_MULTIPLIER * atr
+    targets = [entry * (1 + sign * p) for p in M15_TAKE_PROFITS_PERCENT]
+    return {
+        "symbol": symbol, "direction": direction,
+        "mode": "BREAKOUT24 DIRETTO", "timeframe": "M15",
+        "entry": entry, "sl": sl,
+        "tp1": targets[0], "tp2": targets[1], "tp3": targets[2],
+        "volume_ratio": ratio, "level": level,
+        "confirm_time": bar["t"] + FIFTEEN_MIN_MS,
+        "breakout_time": bar["t"] + FIFTEEN_MIN_MS,
+        "atr15": atr, "btc": btc_bias,
+    }
 
 
 def m15_bounce_shape_ok(bar: dict, direction: str) -> bool:
@@ -663,11 +743,11 @@ def format_signal(s: dict) -> str:
         return (
             f"{emoji} {s['direction']} | {sym} | M15 | {s['mode']}\n\n"
             f"Entry: {price_string(s['entry'])}\n"
-            f"Stop Loss: {price_string(s['sl'])} (1.50 ATR15)\n"
+            f"Stop Loss: {price_string(s['sl'])} (livello rotto +/- 1 ATR15)\n"
             f"TP1: {price_string(s['tp1'])} (+/-0.40%)\n"
             f"TP2: {price_string(s['tp2'])} (+/-0.70%)\n"
             f"TP3: {price_string(s['tp3'])} (+/-1.00%)\n\n"
-            f"Volume rimbalzo / mediana20: {s['volume_ratio']:.2f}x\n"
+            f"Volume {'breakout' if s['mode'] == 'BREAKOUT24 DIRETTO' else 'rimbalzo'} / mediana20: {s['volume_ratio']:.2f}x\n"
             f"Livello M15: {price_string(s['level'])}\n"
             f"BTC 15m: {s['btc'].replace('_', ' ').lower()}\n"
             f"Orario: {when} (Roma)\n"
@@ -786,9 +866,10 @@ class SignalEngine:
             tf = payload.get("timeframe", "4H")
             if tf not in rank or not {"symbol", "confirm_time"}.issubset(payload):
                 continue
-            # I vecchi M15 breakout diretti non devono essere inviati
-            # dopo il passaggio a M15 SOLO RETEST.
-            if tf == "M15" and payload.get("mode") != "BREAKOUT24 + RETEST":
+            # Mantieni in coda i due tipi di M15 della strategia corrente.
+            # Escludi soltanto i segnali di vecchie strategie M15 non riconosciute.
+            if tf == "M15" and payload.get("mode") not in {
+                    "BREAKOUT24 + RETEST", "BREAKOUT24 DIRETTO"}:
                 continue
             slot = f"{payload['confirm_time']}:{payload['symbol']}"
             prior = selected.get(slot)
@@ -880,10 +961,11 @@ class SignalEngine:
             "4H TP fissi 2% / 4% / 6% dall'Entry | nessun ordine automatico\n"
             "1H: breakout 48 candele 1H (48h), conferma 15m | SL livello +/-1.00 ATR1H\n"
             "1H TP dall'Entry: 0.50% / 1.00% / 1.50% | DIRETTO 1h, RETEST 8h\n"
-            "M15 BTC/ETH/SOL/BNB/XRP: breakout 24x15m senza volume, SOLO RETEST entro 4h\n"
-            "M15 tocco <1.00x mediana20, rimbalzo >1.00x; corpo >=60%, wick <=20% per lato\n"
+            "M15 BTC/ETH/SOL/BNB/XRP: breakout delle 24 M15; DIRETTO oppure RETEST entro 4h\n"
+            "M15 DIRETTO: corpo >=70%, wick <=20% per lato, volume >1.50x mediana20, close oltre 0.20%\n"
+            "M15 RETEST: tocco <1.00x, rimbalzo >1.00x mediana20; corpo >=60%, wick <=20% per lato\n"
             "M15 BTC15m concorde, escursione max 1 ATR15, SL livello rotto +/- 1 ATR15\n"
-            "M15 TP 0.40% / 0.70% / 1.00%, cooldown 8 barre per direzione\n"
+            "M15 TP 0.40% / 0.70% / 1.00%, cooldown 8 barre per direzione; RETEST > DIRETTO\n"
             "ANTIDUPLICATI: 4H > 1H > M15, una notifica per coppia e chiusura 15m"
         )
         log.info("%s", status)
@@ -1088,9 +1170,13 @@ class SignalEngine:
                              symbol, out["direction"], out["mode"], out["volume_ratio"], out["btc"])
 
     def process_m15(self, symbol: str, bar_t: int) -> bool:
-        """M15: breakout24 -> tocco retest -> rimbalzo. Terza priorita'.
+        """M15: RETEST prioritario, DIRETTO come alternativa sulla stessa chiusura.
 
-        False significa: BTC 15m non ancora chiuso/ricevuto, riprovare.
+        Ogni nuovo breakout puo' dare un DIRETTO alla sua chiusura; se il
+        DIRETTO viene accodato, il setup RETEST viene consumato per evitare
+        un secondo segnale sul medesimo breakout. Se sulla stessa candela
+        si conferma un RETEST gia' aperto, questo ha la precedenza.
+        False: la candela BTC15m corrispondente non e' ancora disponibile.
         """
         if symbol not in M15_SYMBOLS:
             return True
@@ -1109,14 +1195,12 @@ class SignalEngine:
                 candidate = detect_m15_breakout(symbol, history)
                 if candidate:
                     self.m15_setups[symbol] = candidate
+                    setup = candidate
                     self.persist()
-                    log.info("M15 BREAKOUT %s %s livello %s | SOLO RETEST",
+                    log.info("M15 BREAKOUT %s %s livello %s | RETEST/DIRETTO",
                              symbol, candidate.direction, price_string(candidate.level))
-                # Mai un ingresso sulla stessa candela del breakout.
-                return True
 
-            # Dati BTC *della stessa candela* obbligatori per la concordanza,
-            # non utilizzare un BTC15m vecchio per la M15.
+            # Usa SOLO BTC15m chiuso nello stesso intervallo del segnale.
             btc_bars = self.recent("BTCUSDT")
             if not btc_bars or btc_bars[-1]["t"] != bar_t:
                 return False
@@ -1124,32 +1208,58 @@ class SignalEngine:
             if bias == "UNKNOWN":
                 return False
 
-            previous_touch = setup.touched_at
-            out, expired = evaluate_m15_retest(setup, history, bias)
-            if expired:
-                self.m15_setups.pop(symbol, None)
-                self.persist()
-                if out is None:
-                    log.info("M15 RETEST ANNULLATO %s (scadenza/escursione)", symbol)
-            elif setup.touched_at != previous_touch:
-                self.persist()
-                log.info("M15 RETEST TOCCO %s %s livello %s",
-                         symbol, setup.direction, price_string(setup.level))
+            # 1) RETEST per primo: se confermato, non valutare il DIRETTO.
+            # Sulla candela del breakout il retest non puo' ancora confermare.
+            if setup is not None and close_t > setup.breakout_close_ms:
+                previous_touch = setup.touched_at
+                out, expired = evaluate_m15_retest(setup, history, bias)
+                if expired:
+                    self.m15_setups.pop(symbol, None)
+                    self.persist()
+                    setup = None
+                    if out is None:
+                        log.info("M15 RETEST ANNULLATO %s (scadenza/escursione)", symbol)
+                elif setup.touched_at != previous_touch:
+                    self.persist()
+                    log.info("M15 RETEST TOCCO %s %s livello %s",
+                             symbol, setup.direction, price_string(setup.level))
+
+                if out is not None:
+                    # Consuma il setup anche se cooldown o 4H/1H
+                    # impediscono l'invio; non ripiegare sul DIRETTO.
+                    self.m15_setups.pop(symbol, None)
+                    self.persist()
+                    cooldown_key = f"{symbol}:{out['direction']}"
+                    prior_bar = self.m15_last_signal_bar.get(cooldown_key)
+                    if prior_bar is not None and (bar_t - prior_bar) < M15_COOLDOWN_BARS * FIFTEEN_MIN_MS:
+                        return True
+                    key = f"M15:{symbol}:{close_t}"
+                    if self.enqueue_unique(key, out):
+                        self.m15_last_signal_bar[cooldown_key] = bar_t
+                        self.persist()
+                        log.info("SEGNALE M15 IN CODA %s %s RETEST volume %.2fx BTC15 %s",
+                                 symbol, out["direction"], out["volume_ratio"], bias)
+                    return True
+
+            # 2) Solo se nessun RETEST e' stato confermato, prova il DIRETTO.
+            # Vale unicamente per la candela che rompe le 24 precedenti,
+            # senza attendere un eventuale retest futuro.
+            out = evaluate_m15_direct(symbol, history, bias)
             if out is None:
                 return True
-
-            # Dopo la conferma il setup si consuma anche se il segnale e'
-            # duplicato di un 4H/1H allo stesso orario.
             cooldown_key = f"{symbol}:{out['direction']}"
             prior_bar = self.m15_last_signal_bar.get(cooldown_key)
             if prior_bar is not None and (bar_t - prior_bar) < M15_COOLDOWN_BARS * FIFTEEN_MIN_MS:
-                self.persist()
                 return True
             key = f"M15:{symbol}:{close_t}"
             if self.enqueue_unique(key, out):
+                # Un DIRETTO effettivamente accodato chiude qualsiasi setup
+                # retest pendente per questo simbolo: niente doppio segnale.
+                if symbol in self.m15_setups:
+                    self.m15_setups.pop(symbol, None)
                 self.m15_last_signal_bar[cooldown_key] = bar_t
                 self.persist()
-                log.info("SEGNALE M15 IN CODA %s %s RETEST volume %.2fx BTC15 %s",
+                log.info("SEGNALE M15 IN CODA %s %s DIRETTO volume %.2fx BTC15 %s",
                          symbol, out["direction"], out["volume_ratio"], bias)
             return True
 
