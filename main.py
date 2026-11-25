@@ -43,7 +43,7 @@ M15_SYMBOLS = {"BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
                "LINKUSDT", "AVAXUSDT", "LTCUSDT", "ADAUSDT", "DOGEUSDT"}
 assert M15_SYMBOLS <= set(SYMBOLS)
 BOT_NAME = "MOMENTUM 4H 60"
-BOT_VERSION = "1.8"
+BOT_VERSION = "1.9"
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
@@ -83,6 +83,9 @@ M15_DIRECT_BODY_MIN = 0.70
 M15_DIRECT_EACH_WICK_MAX = 0.20
 M15_DIRECT_WICKS_SUM_MAX = 0.30  # Con corpo >=70%, le due wick insieme <=30%.
 M15_DIRECT_VOLUME_MIN = 1.50     # Strettamente superiore alla mediana20.
+M15_DIRECT_STRONG_BODY_MIN = 0.90  # Seconda modalita' di breakout diretto.
+M15_DIRECT_STRONG_VOLUME_MIN = 1.00  # Strettamente superiore alla mediana20.
+M15_DIRECT_STRONG_WICKS_SUM_MAX = 0.10  # Wick complessive <=10% del range.
 M15_DIRECT_CLOSE_BEYOND_PCT = 0.002  # >=0,20% oltre il livello delle 24 barre.
 M15_RETEST_TOUCH_VOLUME_MAX = 1.00   # Strettamente inferiore.
 M15_RETEST_BOUNCE_VOLUME_MIN = 1.00  # Strettamente superiore.
@@ -382,6 +385,8 @@ def m15_direct_shape_ok(bar: dict, direction: str) -> bool:
 def evaluate_m15_direct(symbol: str, candles: list[dict], btc_bias: str) -> Optional[dict]:
     """Segnale M15 DIRETTO solo alla chiusura di un breakout sulle 24 precedenti.
 
+    Due alternative: corpo >=70% e volume >1.50x, oppure corpo >=90%
+    e volume >1.00x. Se entrambe valide, prevale il DIRETTO originale.
     Regole indipendenti dal retest: nessun filtro di escursione 1 ATR del retest.
     SL e TP sono gli stessi dell'attuale M15 retest.
     """
@@ -407,8 +412,22 @@ def evaluate_m15_direct(symbol: str, candles: list[dict], btc_bias: str) -> Opti
     if not m15_direct_shape_ok(bar, direction):
         return None
     ratio = m15_volume_ratio(candles, len(candles) - 1)
-    if ratio is None or ratio <= M15_DIRECT_VOLUME_MIN:
+    if ratio is None:
         return None
+    mode = "BREAKOUT24 DIRETTO"
+    if ratio <= M15_DIRECT_VOLUME_MIN:
+        # Alternativa aggiuntiva, con gli stessi controlli di direzione,
+        # livello, BTC, SL/TP e cooldown del breakout diretto originale.
+        parts = ratios(bar)
+        if parts is None:
+            return None
+        body, upper, lower = parts
+        eps = 1e-8
+        if (ratio <= M15_DIRECT_STRONG_VOLUME_MIN
+                or body + eps < M15_DIRECT_STRONG_BODY_MIN
+                or upper + lower > M15_DIRECT_STRONG_WICKS_SUM_MAX + eps):
+            return None
+        mode = "BREAKOUT24 DIRETTO 90%"
     favorable_btc = ({"DIREZIONALE_RIALZISTA", "LATERALE_RIALZISTA"}
                      if direction == "LONG" else
                      {"DIREZIONALE_RIBASSISTA", "LATERALE_RIBASSISTA"})
@@ -424,7 +443,7 @@ def evaluate_m15_direct(symbol: str, candles: list[dict], btc_bias: str) -> Opti
     targets = [entry * (1 + sign * p) for p in M15_TAKE_PROFITS_PERCENT]
     return {
         "symbol": symbol, "direction": direction,
-        "mode": "BREAKOUT24 DIRETTO", "timeframe": "M15",
+        "mode": mode, "timeframe": "M15",
         "entry": entry, "sl": sl,
         "tp1": targets[0], "tp2": targets[1], "tp3": targets[2],
         "volume_ratio": ratio, "level": level,
@@ -748,7 +767,7 @@ def format_signal(s: dict) -> str:
             f"TP1: {price_string(s['tp1'])} (+/-0.40%)\n"
             f"TP2: {price_string(s['tp2'])} (+/-0.70%)\n"
             f"TP3: {price_string(s['tp3'])} (+/-1.00%)\n\n"
-            f"Volume {'breakout' if s['mode'] == 'BREAKOUT24 DIRETTO' else 'rimbalzo'} / mediana20: {s['volume_ratio']:.2f}x\n"
+            f"Volume {'breakout' if s['mode'] in ('BREAKOUT24 DIRETTO', 'BREAKOUT24 DIRETTO 90%') else 'rimbalzo'} / mediana20: {s['volume_ratio']:.2f}x\n"
             f"Livello M15: {price_string(s['level'])}\n"
             f"BTC 15m: {s['btc'].replace('_', ' ').lower()}\n"
             f"Orario: {when} (Roma)\n"
@@ -867,10 +886,10 @@ class SignalEngine:
             tf = payload.get("timeframe", "4H")
             if tf not in rank or not {"symbol", "confirm_time"}.issubset(payload):
                 continue
-            # Mantieni in coda i due tipi di M15 della strategia corrente.
+            # Mantieni in coda i tre tipi di M15 della strategia corrente.
             # Escludi soltanto i segnali di vecchie strategie M15 non riconosciute.
             if tf == "M15" and payload.get("mode") not in {
-                    "BREAKOUT24 + RETEST", "BREAKOUT24 DIRETTO"}:
+                    "BREAKOUT24 + RETEST", "BREAKOUT24 DIRETTO", "BREAKOUT24 DIRETTO 90%"}:
                 continue
             slot = f"{payload['confirm_time']}:{payload['symbol']}"
             prior = selected.get(slot)
@@ -964,6 +983,7 @@ class SignalEngine:
             "1H TP dall'Entry: 0.50% / 1.00% / 1.50% | DIRETTO 1h, RETEST 8h\n"
             "M15 10 crypto (BTC/ETH/SOL/BNB/XRP/LINK/AVAX/LTC/ADA/DOGE): breakout delle 24 M15; DIRETTO oppure RETEST entro 4h\n"
             "M15 DIRETTO: corpo >=70%, wick <=20% per lato, volume >1.50x mediana20, close oltre 0.20%\n"
+            "M15 DIRETTO 90%: corpo >=90%, wick totali <=10%, volume >1.00x mediana20, close oltre 0.20%\n"
             "M15 RETEST: tocco <1.00x, rimbalzo >1.00x mediana20; corpo >=60%, wick <=20% per lato\n"
             "M15 BTC15m concorde, escursione max 1 ATR15, SL livello rotto +/- 1 ATR15\n"
             "M15 TP 0.40% / 0.70% / 1.00%, cooldown 8 barre per direzione; RETEST > DIRETTO\n"
@@ -1260,8 +1280,8 @@ class SignalEngine:
                     self.m15_setups.pop(symbol, None)
                 self.m15_last_signal_bar[cooldown_key] = bar_t
                 self.persist()
-                log.info("SEGNALE M15 IN CODA %s %s DIRETTO volume %.2fx BTC15 %s",
-                         symbol, out["direction"], out["volume_ratio"], bias)
+                log.info("SEGNALE M15 IN CODA %s %s %s volume %.2fx BTC15 %s",
+                         symbol, out["direction"], out["mode"], out["volume_ratio"], bias)
             return True
 
     def telegram_loop(self) -> None:
