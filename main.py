@@ -82,6 +82,7 @@ REJECTION_LOOKBACK_1H = 24
 REJECTION_WICK_BODY_4H = 2.0
 REJECTION_WICK_BODY_1H = 3.0
 REJECTION_OPPOSITE_WICK_MAX = 0.05
+REJECTION_VOLUME_MIN = 1.20
 REJECTION_CONFIRM_BARS_4H = 2
 REJECTION_CONFIRM_BARS_1H = 1
 REJECTION_MAX_CONFIRM_BARS = 4
@@ -403,7 +404,7 @@ def detect_price_rejection(symbol: str, candles: list[dict], close_time: int,
     return None
   macro = [b for b in aggregate_closed(candles, period)
       if b["t"] + period <= close_time]
-  required = max(lookback, REJECTION_ATR_PERIOD + 1) + 1
+  required = max(lookback, REJECTION_ATR_PERIOD + 1, 20) + 1
   if len(macro) < required:
     return None
   macro = macro[-required:]
@@ -411,6 +412,9 @@ def detect_price_rejection(symbol: str, candles: list[dict], close_time: int,
       or any(b["t"] != a["t"] + period for a, b in zip(macro, macro[1:]))):
     return None
   bar, prior = macro[-1], macro[:-1]
+  base = median(float(b["v"]) for b in prior[-20:])
+  if base <= 0 or float(bar["v"]) / base < REJECTION_VOLUME_MIN:
+    return None
   parts = ratios(bar)
   if parts is None:
     return None
